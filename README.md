@@ -1,3 +1,11 @@
+![pr-review-bots: claude-pr-gh and codex-pr-gh reviewing a pull request](docs/assets/readme-header.webp)
+
+<p align="center">
+  <img alt="Runtime dependencies: Python standard library" src="https://img.shields.io/badge/runtime%20dependencies-standard%20library-0F172A?style=flat-square">
+  <img alt="Tests: unittest" src="https://img.shields.io/badge/tests-unittest-22C55E?style=flat-square">
+  <img alt="Bots: claude-pr-gh and codex-pr-gh" src="https://img.shields.io/badge/bots-claude--pr--gh%20%C2%B7%20codex--pr--gh-5F72F6?style=flat-square">
+</p>
+
 # pr-review-bots
 
 Two GitHub Apps that post PR feedback when Claude or Codex reviews code for
