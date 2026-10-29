@@ -11,6 +11,9 @@
   prbot review <pr> [-R owner/repo] [--reviewer claude|codex|both] [--dry-run|--route-only]
                                      review a PR with the other agent and post it as that agent's bot;
                                      exits 3 and asks when it can't tell who wrote the PR
+  prbot watch [--dry-run] [--limit N] [--baseline]
+                                     one pass: review new commits on open, non-draft PRs on every repo
+                                     the bots are installed on (launchd runs it every 5 minutes)
   prbot classify -- <gh args>        exit 0 if the gh call writes PR feedback
 
 Standard library plus the openssl and gh binaries. No token is printed or saved.
@@ -341,7 +344,7 @@ def gh_read(args):
     return r.stdout
 
 
-def cmd_review(target, repo=None, override=None, mode="post"):
+def cmd_review(target, repo=None, override=None, mode="post", only=None):
     repo = repo or repo_from_args([target]) or repo_from_git()
     if not repo:
         die("cannot tell which repository this PR is in; pass -R owner/repo")
@@ -355,6 +358,8 @@ def cmd_review(target, repo=None, override=None, mode="post"):
               f"Ask the user which agent should review it, then rerun with --reviewer claude|codex|both, "
               f"or add a review:claude or review:codex label to the PR.", file=sys.stderr)
         return 3
+    if only:  # the watcher asks for just the reviewers still missing on this commit
+        reviewers = [r for r in reviewers if r in only]
     print(f"PR #{pr['number']}: author {author or 'unknown'} ({why}); reviewer {' + '.join(reviewers)} ({reason})")
     if mode == "route":
         return 0
@@ -379,6 +384,115 @@ def cmd_review(target, repo=None, override=None, mode="post"):
         if r.returncode != 0:
             die(f"posting the {reviewer} review failed: {r.stderr.strip()[:300]}")
         print(f"posted {reviewer} review: {r.stdout.strip() or pr['url']}")
+    return 0
+
+# ---------- watch: review new commits on open PRs as they come in ----------
+
+WATCH_STATE = CONFIG_DIR / "watch-state.json"
+WATCH_LIMIT = 3          # model runs per pass, so a backlog can't start a burst of reviews
+RETRY_AFTER = 3600       # seconds before retrying a reviewer that failed (usage limit, outage)
+REVIEWED = re.compile(r"Reviewed commit `([0-9a-f]{7,40})`")
+
+
+def installed_repos(bot):
+    """owner/name of every repository the bot's App is installed on."""
+    cfg = bot_config(bot)
+    jwt = app_jwt(cfg.get("client_id") or cfg["app_id"], read_key(bot))
+    repos = set()
+    for inst in api("GET", "/app/installations", auth=jwt):
+        tok = api("POST", f"/app/installations/{inst['id']}/access_tokens", auth=jwt,
+                  body={"permissions": {"metadata": "read"}})["token"]
+        page = 1
+        while True:
+            batch = api("GET", f"/installation/repositories?per_page=100&page={page}", auth=tok)["repositories"]
+            repos.update(r["full_name"] for r in batch)
+            if len(batch) < 100:
+                break
+            page += 1
+    return repos
+
+
+def reviewed_by(repo, number, sha, slugs):
+    """Bots ({'claude', ...}) that already posted a review of this exact commit, read from the review footers."""
+    raw = gh_read(["api", f"repos/{repo}/pulls/{number}/reviews", "--paginate",
+                   "--jq", '.[] | [.user.login, (.body // "")] | @json'])
+    done = set()
+    for line in raw.splitlines():
+        login, body = json.loads(line)
+        m = REVIEWED.search(body)
+        if login in slugs and m and sha.startswith(m.group(1)):
+            done.add(slugs[login])
+    return done
+
+
+def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False):
+    """One pass over open PRs on every repo the bots are installed on. launchd runs this every 5 minutes.
+    --baseline marks the commits open right now as seen without reviewing them, so only new ones get reviews."""
+    log = lambda msg: print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+    state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
+    seen, runs = {}, 0
+    cfg = load_config()
+    bots = [b for b in AGENTS if b in cfg]
+    slugs = {cfg[b]["slug"] + "[bot]": b for b in bots}
+    installed = {b: installed_repos(b) for b in bots}
+    for repo in sorted(set().union(*installed.values())):
+        try:
+            prs = json.loads(gh_read(["pr", "list", "-R", repo, "--state", "open", "--limit", "100",
+                                      "--json", "number,isDraft,headRefOid"]))
+        except SystemExit:
+            log(f"{repo}: could not list PRs; skipping this pass")
+            continue
+        for p in prs:
+            if p["isDraft"]:
+                continue
+            n, sha = p["number"], p["headRefOid"]
+            key = f"{repo}#{n}@{sha[:10]}"
+            entry = seen[key] = state.get(key, {})
+            if baseline:
+                entry["baseline"] = True
+                log(f"{key}: marked as seen; it will not be reviewed unless new commits arrive")
+                continue
+            if entry.get("skipped") or entry.get("baseline"):
+                continue
+            try:
+                pr = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json", "labels,commits"]))
+                author, why = detect_author(pr)
+                reviewers, _ = choose_reviewers(author, [l["name"] for l in pr["labels"]])
+                if not reviewers:
+                    entry["skipped"] = why
+                    log(f"{key}: skipped, can't tell who wrote it ({why}). Label it agent:claude or "
+                        f"agent:codex, or run: prbot review {n} -R {repo} --reviewer claude|codex|both")
+                    continue
+                todo = [r for r in reviewers if r not in reviewed_by(repo, n, sha, slugs)]
+            except SystemExit:
+                log(f"{key}: could not read the PR; will retry")
+                continue
+            for r in todo:
+                if r not in installed:
+                    log(f"{key}: needs a {r} review, but the {r} bot is not registered")
+                    continue
+                if repo not in installed[r]:
+                    log(f"{key}: needs a {r} review, but the {r} bot is not installed on {repo}")
+                    continue
+                if time.time() - entry.get(f"failed_{r}", 0) < RETRY_AFTER:
+                    continue
+                if runs >= limit:
+                    log(f"{key}: {r} review waits for the next pass (limit {limit} per pass)")
+                    continue
+                runs += 1
+                if dry_run:
+                    log(f"{key}: would run a {r} review")
+                    continue
+                log(f"{key}: running a {r} review")
+                try:
+                    cmd_review(str(n), repo, mode="post", only=[r])
+                except SystemExit:
+                    entry[f"failed_{r}"] = time.time()
+                    log(f"{key}: {r} review failed; retrying in {RETRY_AFTER // 60} minutes")
+    if not dry_run:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        WATCH_STATE.write_text(json.dumps(seen, indent=1) + "\n")  # keeps only PRs still open
+    log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
     return 0
 
 # ---------- commands ----------
@@ -497,6 +611,11 @@ def main(argv):
         args = rest[1:] if rest[:1] == ["--"] else rest
         args = args[1:] if args[:1] == ["gh"] else args
         return 0 if is_feedback_write(args, load_config().get("codex_triggers_as_bot", False)) else 1
+    if cmd == "watch":
+        limit = WATCH_LIMIT
+        if "--limit" in rest:
+            limit = int(rest[rest.index("--limit") + 1])
+        return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest)
     if cmd == "review":
         opts = {"-R": None, "--repo": None, "--reviewer": None}
         flags, target, i = set(), None, 0

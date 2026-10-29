@@ -25,6 +25,8 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | `prbot review` with Codex reviewing | Built, but not yet seen end to end. The first run stopped at a Codex usage limit. |
 | Claude Code guard hook | Installed and blocking direct posts. |
 | Codex CLI `gh` shim | Built and tested locally; not yet used in a live Codex session. |
+| `prbot watch` (automatic reviews) | Built and dry-run against all repos. The launchd job is not installed yet. |
+| `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
 | CI (GitHub Actions) path | Not built. |
 
 ## Architecture
@@ -131,7 +133,36 @@ How the reviewer is chosen:
 
 If the author is unclear and nothing names a reviewer, prbot posts nothing and exits with code 3.
 
+### Review new commits automatically
+
+`prbot watch` makes one pass over every open, non-draft PR on every repository the bots are installed on. Each new commit gets a review from the other agent, once. A launchd job runs a pass every 5 minutes:
+
+```bash
+~/Documents/GitHub/pr-review-bots/integrations/launchd/install-watch.sh
+```
+
+How a pass behaves:
+
+- It finds earlier reviews from the "Reviewed commit" line in each bot review, so it never reviews the same commit twice, even after a restart.
+- It runs at most 3 reviews per pass; the rest wait for the next pass.
+- A PR it can't attribute is skipped and logged once, with the command to review it by hand.
+- A review that fails, for example on a usage limit, is retried an hour later.
+
+Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`. To see what a pass would do without posting, run `prbot watch --dry-run`. To start from now and skip the commits already open, run `prbot watch --baseline` once before installing the job. To remove the job, run `install-watch.sh --uninstall`.
+
 ## Make agents use the bots
+
+### The `cross-review` skill
+
+`skills/cross-review/SKILL.md` tells Claude Code and Codex how to review a PR, when to ask you, how to post replies through their own bot, and how to commit as themselves. Both agents read the same file through symlinks:
+
+```bash
+ln -s ~/Documents/GitHub/pr-review-bots/skills/cross-review ~/.claude/skills/cross-review
+```
+
+```bash
+ln -s ~/Documents/GitHub/pr-review-bots/skills/cross-review ~/.codex/skills/cross-review
+```
 
 ### Claude Code
 
@@ -178,6 +209,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `prbot whoami <bot>` | Shows the App and where it is installed. | 0, or 2 |
 | `prbot gh <bot> [-R owner/repo] -- <gh args>` | Runs `gh` with a one-repo App token. | `gh`'s own code, or 2 |
 | `prbot review <pr> [-R owner/repo] [--reviewer claude\|codex\|both] [--dry-run\|--route-only]` | Routes, runs and posts a cross-review. | 0, 2 on error, 3 when the author is unclear |
+| `prbot watch [--dry-run] [--limit N] [--baseline]` | One pass of automatic reviews over open PRs. | 0, or 2 |
 | `prbot classify -- <gh args>` | Used by the hook and shim. | 0 if the call posts PR feedback, else 1 |
 
 `<bot>` is `claude` or `codex`. `<pr>` is a number or a PR URL.
@@ -191,6 +223,9 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `logos/` | Bot logos: SVG sources and 512 px PNGs for GitHub. |
 | `integrations/claude-code/` | The PreToolUse guard hook. |
 | `integrations/codex/` | The `gh` shim and the `codex-as-bot` launcher. |
+| `integrations/launchd/` | Installer for the job that runs `prbot watch` every 5 minutes. |
+| `skills/cross-review/` | The PR review skill shared by Claude Code and Codex. |
+| `AGENTS.md`, `CLAUDE.md` | Instructions for agents working on this repository. |
 | `tests/` | Unit tests, including fixtures shaped like real PRs. |
 | `docs/assets/` | The README header (SVG source and WebP). |
 | [`DESIGN.md`](DESIGN.md) | Why it works this way. |

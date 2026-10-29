@@ -114,6 +114,23 @@ reviewer returns text; prbot posts it as a PR review comment through that
 agent's bot, with a line saying why that agent was chosen and which commit it
 reviewed.
 
+## Reviews as PRs come in
+
+`prbot watch` runs every 5 minutes from a launchd job on Kenny's Mac rather
+than in GitHub Actions. Running locally reuses the Claude and Codex logins
+Kenny already pays for; Actions would need API keys for both and bill
+separately. The cost is that reviews only happen while the Mac is awake.
+
+Each pass looks at open, non-draft PRs on every repository the Apps are
+installed on, and reviews each new head commit once with the agent the routing
+rules pick. Whether a commit was already reviewed comes from the
+"Reviewed commit" footer in the bots' own reviews, so a lost state file never
+causes duplicate reviews. The state file only remembers PRs it skipped as
+unclear (so they are logged once) and reviewers that failed (retried after an
+hour). A pass runs at most 3 reviews, so a backlog of open PRs cannot start a
+burst of model runs. `--baseline` marks the commits open at install time as
+seen, for starting from now instead of reviewing old PRs.
+
 ## What stays on Kenny's account
 
 - Merges, approvals that satisfy branch protection, and anything Kenny types

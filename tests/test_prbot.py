@@ -129,6 +129,92 @@ class Routing(unittest.TestCase):
         self.assertIn("Ask the user which agent should review it", err.getvalue())
 
 
+class Watch(unittest.TestCase):
+    """One fake repo with a PR for each case the watcher has to decide."""
+    SHA = {1: "a" * 40, 2: "b" * 40, 3: "c" * 40, 4: "d" * 40, 5: "e" * 40}
+    VIEW = {1: PR15, 2: PR15, 3: PR18, 4: PR13, 5: PR15}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {k: getattr(prbot, k) for k in ("installed_repos", "gh_read", "cmd_review", "load_config", "WATCH_STATE")}
+        prbot.WATCH_STATE = Path(self.tmp.name, "watch-state.json")
+        prbot.load_config = lambda: {"claude": {"slug": "claude-pr-gh"}, "codex": {"slug": "codex-pr-gh"}}
+        prbot.installed_repos = lambda bot: {"o/r"}
+        prbot.gh_read = self.fake_gh
+        self.reviews = {3: [["codex-pr-gh[bot]", "### Codex review\n<sub>Reviewed commit `" + "c" * 10 + "` · posted</sub>"]]}
+        self.runs, self.fail = [], False
+
+        def fake_review(n, repo, mode, only):
+            self.runs.append((int(n), only[0]))
+            if self.fail:
+                raise SystemExit(2)
+        prbot.cmd_review = fake_review
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(prbot, k, v)
+        self.tmp.cleanup()
+
+    def fake_gh(self, args):
+        if args[:2] == ["pr", "list"]:
+            return json.dumps([{"number": n, "isDraft": n == 1, "headRefOid": s} for n, s in self.SHA.items()])
+        if args[:2] == ["pr", "view"]:
+            return json.dumps(self.VIEW[int(args[2])])
+        if args[0] == "api":
+            n = int(args[1].split("/")[4])
+            return "\n".join(json.dumps(r) for r in self.reviews.get(n, []))
+        raise AssertionError(args)
+
+    def run_pass(self, **kw):
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            prbot.cmd_watch(**kw)
+        return out.getvalue()
+
+    def test_decisions(self):
+        log = self.run_pass(limit=1)
+        # draft 1 ignored; 2 (codex wrote it) gets a claude review; 3 already reviewed on this commit;
+        # 4 unclear and skipped; 5 waits because the limit of 1 per pass is used up
+        self.assertEqual(self.runs, [(2, "claude")])
+        self.assertIn("o/r#4@dddddddddd: skipped, can't tell who wrote it", log)
+        self.assertIn("o/r#5@eeeeeeeeee: claude review waits for the next pass", log)
+        self.assertNotIn("#1@", log)
+        # next pass: 2 now carries a claude review of its commit, 5 gets its turn, 4 is not logged again
+        self.reviews[2] = [["claude-pr-gh[bot]", "Reviewed commit `" + "b" * 10 + "`"]]
+        log = self.run_pass(limit=5)
+        self.assertNotIn("#4@", log)
+        self.assertEqual(self.runs, [(2, "claude"), (5, "claude")])
+
+    def test_new_commit_gets_a_new_review(self):
+        self.reviews[2] = [["claude-pr-gh[bot]", "Reviewed commit `" + "b" * 10 + "`"]]
+        self.SHA = {**self.SHA, 2: "f" * 40}  # someone pushed to PR 2
+        self.run_pass(limit=5)
+        self.assertIn((2, "claude"), self.runs)
+
+    def test_failed_review_waits_an_hour(self):
+        self.fail = True
+        self.run_pass(limit=5)
+        self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])
+        self.run_pass(limit=5)
+        self.assertEqual(len(self.runs), 2)  # not retried within RETRY_AFTER
+
+    def test_baseline_skips_open_commits_but_not_new_ones(self):
+        self.run_pass(baseline=True)
+        self.run_pass(limit=5)
+        self.assertEqual(self.runs, [])
+        self.SHA = {**self.SHA, 5: "9" * 40}  # a push after the baseline
+        self.run_pass(limit=5)
+        self.assertEqual(self.runs, [(5, "claude")])
+
+    def test_dry_run_posts_nothing_and_saves_nothing(self):
+        log = self.run_pass(dry_run=True)
+        self.assertEqual(self.runs, [])
+        self.assertIn("would run a claude review", log)
+        self.assertFalse(prbot.WATCH_STATE.exists())
+
+
 class Jwt(unittest.TestCase):
     def test_signature_verifies_with_public_key(self):
         with tempfile.TemporaryDirectory() as d:
