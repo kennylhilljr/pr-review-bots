@@ -27,28 +27,27 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | Codex CLI `gh` shim | Built and tested locally; not yet used in a live Codex session. |
 | `prbot watch` (automatic reviews) | Live: launchd runs it every 5 minutes across all 21 repos. |
 | `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
-| `prbot git` (push as a bot) | Live for `claude-pr-gh`, with Contents write. `codex-pr-gh` still has Contents read. |
+| `prbot git` (push as a bot) | Live for both bots, with Contents write. |
 | CI (GitHub Actions) path | Not built. |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    CC[Claude Code] -->|gh pr review / comment| GUARD[Guard hook]
-    CX[Codex CLI] -->|gh pr review / comment| SHIM[gh shim]
-    GUARD -->|denied: use prbot| CC
+    CC["Claude Code"] --> GUARD["Guard hook"]
+    CX["Codex CLI"] --> SHIM["gh shim"]
+    WATCH["prbot watch, every 5 minutes"] --> PRBOT["prbot"]
+    YOU["prbot review, run by you"] --> PRBOT
+    GUARD --> PRBOT
     SHIM --> PRBOT
-    CC -->|prbot gh claude ...| PRBOT[prbot]
-    USER[You] -->|prbot review N| PRBOT
 
-    PRBOT --> KEY[App private key<br/>macOS Keychain]
-    KEY --> JWT[Signed App login]
-    JWT --> TOK[One-hour token<br/>for one repo]
-    TOK --> GH[gh]
-    GH --> GITHUB[GitHub: posted as<br/>claude-pr-gh or codex-pr-gh]
+    PRBOT --> REVIEWER["Other agent, read-only review"]
+    REVIEWER --> PRBOT
 
-    PRBOT -->|review routing| REVIEWER[Other agent,<br/>read-only]
-    REVIEWER -->|review text| PRBOT
+    PRBOT --> KEY["App key in macOS Keychain"]
+    KEY --> TOK["One-hour token for one repo"]
+    TOK --> GH["gh and git"]
+    GH --> GITHUB["GitHub, as claude-pr-gh or codex-pr-gh"]
 ```
 
 Reads such as `gh pr view` and `gh pr diff` always use your normal `gh` login. Only posts go through a bot.
