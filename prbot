@@ -8,6 +8,8 @@
   prbot whoami <bot>                 show the App and where it is installed
   prbot gh <bot> [-R owner/repo] -- <gh args>
                                      run gh with a one-repo installation token
+  prbot git <bot> [-R owner/repo] -- <git args>
+                                     run git (push) as the bot with a one-repo contents-write token
   prbot review <pr> [-R owner/repo] [--reviewer claude|codex|both] [--dry-run|--route-only]
                                      review a PR with the other agent and post it as that agent's bot;
                                      exits 3 and asks when it can't tell who wrote the PR
@@ -72,8 +74,8 @@ def is_feedback_write(args, codex_triggers_as_bot=False):
     return False
 
 
-def gh_calls(command):
-    """Yield (argv_after_gh, routed_through_prbot) for each gh or prbot call in a shell command string."""
+def _commands(command):
+    """Yield (program, argv) for each simple command in a shell command string, skipping VAR=... and wrappers."""
     lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
     lex.whitespace_split = True
     lex.commenters = ""
@@ -84,23 +86,37 @@ def gh_calls(command):
     seg = []
     for tok in tokens + [";"]:
         if tok and set(tok) <= set(";&|()\n"):
-            yield from _call_in(seg)
+            i = 0
+            while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or seg[i] in ("command", "exec", "env", "time")):
+                i += 1
+            if i < len(seg):
+                yield os.path.basename(seg[i]), seg[i + 1:]
             seg = []
         else:
             seg.append(tok)
 
 
-def _call_in(seg):
-    i = 0
-    while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or seg[i] in ("command", "exec", "env", "time")):
-        i += 1
-    if i >= len(seg):
-        return
-    head = os.path.basename(seg[i])
-    if head == "prbot":
-        yield (seg[i + 1:], True)
-    elif head == "gh":
-        yield (seg[i + 1:], False)
+def gh_calls(command):
+    """Yield (argv_after_gh, routed_through_prbot) for each gh or prbot call in a shell command string."""
+    for prog, args in _commands(command):
+        if prog in ("gh", "prbot"):
+            yield args, prog == "prbot"
+
+
+def git_pushes(command):
+    """(argv_after_git, -C dir or None) for each plain `git push` in a shell command string."""
+    for prog, args in _commands(command):
+        if prog != "git":
+            continue
+        i, cdir = 0, None
+        while i < len(args) and args[i].startswith("-"):  # git's own options before the subcommand
+            if args[i] in ("-C", "-c") and i + 1 < len(args):
+                cdir = args[i + 1] if args[i] == "-C" else cdir
+                i += 2
+            else:
+                i += 1
+        if i < len(args) and args[i] == "push":
+            yield args, cdir
 
 
 def unrouted_writes(command, codex_triggers_as_bot=False):
@@ -204,13 +220,15 @@ def app_jwt(issuer, pem, now=None):
     return f"{header}.{payload}.{b64url(sig)}"
 
 
-def installation_token(bot, repo):
+def installation_token(bot, repo, permissions=None):
+    """One-hour token for one repo. Posting needs the default set; pushing asks for {"contents": "write"}."""
     cfg = bot_config(bot)
     jwt = app_jwt(cfg.get("client_id") or cfg["app_id"], read_key(bot))
     owner, name = repo.split("/", 1)
     inst = api("GET", f"/repos/{owner}/{name}/installation", auth=jwt)
+    perms = permissions or {k: v for k, v in PERMISSIONS.items() if k != "metadata"}
     tok = api("POST", f"/app/installations/{inst['id']}/access_tokens", auth=jwt,
-              body={"repositories": [name], "permissions": {k: v for k, v in PERMISSIONS.items() if k != "metadata"}})
+              body={"repositories": [name], "permissions": perms})
     return tok["token"]
 
 # ---------- repo resolution ----------
@@ -590,6 +608,34 @@ def split_gh_args(args):
     return repo_from_args(args[:i]), args[i + 1:]
 
 
+def git_env(token):
+    """Environment that makes git use this token for github.com, and nothing from the user's credential setup.
+    The helper reads the token from the environment, so it is never written to disk or to git config."""
+    helper = '!f() { echo username=x-access-token; echo "password=$PRBOT_GIT_TOKEN"; }; f'
+    pairs = [("credential.helper", ""), ("credential.https://github.com.helper", ""),
+             ("credential.https://github.com.helper", helper)]
+    env = dict(os.environ, PRBOT_GIT_TOKEN=token, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT=str(len(pairs)))
+    for i, (k, v) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, v
+    env.pop("GITHUB_TOKEN", None)
+    return env
+
+
+def cmd_git(bot, args, repo=None):
+    """Run git (push, usually) as the bot: a one-hour token with contents write, for this repo only."""
+    if not repo:
+        at = args.index("push") if "push" in args else len(args)
+        remote = next((a for a in args[at + 1:] if not a.startswith("-")), "origin")
+        # args[:at] keeps git's own options such as -C <dir>, so the lookup runs where the push would
+        r = subprocess.run(["git"] + args[:at] + ["remote", "get-url", remote], capture_output=True, text=True)
+        m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(\.git)?\s*$", r.stdout) if r.returncode == 0 else None
+        repo = f"{m.group(1)}/{m.group(2)}" if m else None
+    if not repo:
+        die("cannot tell which GitHub repository this pushes to; pass -R owner/repo")
+    env = git_env(installation_token(bot, repo, permissions={"contents": "write"}))
+    os.execvpe("git", ["git"] + args, env)
+
+
 def cmd_gh(bot, args, repo=None):
     repo = repo or repo_from_args(args) or repo_from_git()
     if not repo:
@@ -664,6 +710,9 @@ def main(argv):
     elif cmd == "gh":
         repo, args = split_gh_args(rest[1:])
         cmd_gh(bot, args, repo)
+    elif cmd == "git":
+        repo, args = split_gh_args(rest[1:])
+        cmd_git(bot, args, repo)
     else:
         die(f"unknown command '{cmd}'")
     return 0
