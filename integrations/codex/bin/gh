@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# gh shim for Codex sessions. Feedback writes go through prbot as the review bot;
+# every other gh call runs the real gh unchanged.
+set -euo pipefail
+shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+prbot="$shim_dir/../../../prbot"
+bot="${PRBOT_BOT:-codex}"
+
+if [ -z "${PRBOT_ACTIVE:-}" ] && "$prbot" classify -- "$@"; then
+  exec "$prbot" gh "$bot" -- "$@"
+fi
+
+clean_path=""
+IFS=':' read -r -a parts <<< "$PATH"
+for p in "${parts[@]}"; do
+  [ -d "$p" ] && [ "$(cd "$p" && pwd -P)" = "$shim_dir" ] && continue
+  clean_path="${clean_path:+$clean_path:}$p"
+done
+real_gh="$(PATH="$clean_path" command -v gh)" || { echo "gh shim: real gh not found" >&2; exit 127; }
+exec "$real_gh" "$@"

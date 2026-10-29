@@ -1,0 +1,213 @@
+"""Tests for prbot, the Claude Code guard hook and the Codex gh shim. Run: python3 -m unittest -v"""
+import base64, importlib.util, json, os, subprocess, sys, tempfile, unittest
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load(name, path):
+    loader = SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+prbot = load("prbot", ROOT / "prbot")
+
+
+class Classify(unittest.TestCase):
+    cases = [
+        (["pr", "review", "15", "--comment", "-b", "Looks off"], True),
+        (["pr", "review", "15", "--approve"], True),
+        (["pr", "comment", "15", "--body-file", "review.md"], True),
+        (["issue", "comment", "9", "-b", "note"], True),
+        (["pr", "comment", "15", "-b", "@codex review"], False),
+        (["pr", "comment", "15", "--body=@codex address that feedback"], False),
+        (["pr", "view", "15", "--json", "reviews"], False),
+        (["pr", "diff", "15"], False),
+        (["api", "repos/o/r/pulls/15/comments"], False),
+        (["api", "repos/o/r/pulls/15/reviews", "-f", "event=COMMENT", "-f", "body=x"], True),
+        (["api", "-X", "POST", "repos/o/r/issues/15/comments", "--input", "c.json"], True),
+        (["api", "--method=PATCH", "repos/o/r/issues/comments/7", "-f", "body=y"], True),
+        (["api", "repos/o/r/pulls/comments/123/replies", "-f", "body=x"], True),
+        (["api", "repos/o/r/labels", "-f", "name=bug"], False),
+        (["api", "graphql", "-f", "query=mutation { addPullRequestReview(input:{}) { clientMutationId } }"], True),
+        (["api", "graphql", "-f", "query=query { viewer { login } }"], False),
+    ]
+
+    def test_cases(self):
+        for args, want in self.cases:
+            with self.subTest(args=args):
+                self.assertEqual(prbot.is_feedback_write(args), want)
+
+    def test_codex_trigger_moves_to_bot_when_enabled(self):
+        self.assertTrue(prbot.is_feedback_write(["pr", "comment", "1", "-b", "@codex review"], codex_triggers_as_bot=True))
+
+
+class ShellCommands(unittest.TestCase):
+    def count(self, cmd):
+        return len(prbot.unrouted_writes(cmd))
+
+    def test_shell_forms(self):
+        self.assertEqual(self.count('cd repo && gh pr comment 1 -b "hi there" | cat'), 1)
+        self.assertEqual(self.count("GH_DEBUG=1 gh pr review 1 --approve"), 1)
+        self.assertEqual(self.count("/opt/homebrew/bin/gh pr comment 1 -b x; gh pr view 1"), 1)
+        self.assertEqual(self.count("prbot gh claude -- pr comment 1 -b hi"), 0)
+        self.assertEqual(self.count("/x/pr-review-bots/prbot gh claude -- pr review 1 --comment -b ok"), 0)
+        self.assertEqual(self.count('echo "gh pr comment 1 -b x"'), 0)
+        self.assertEqual(self.count("gh pr view 15 --comments"), 0)
+        self.assertEqual(self.count('gh pr comment 1 -b "unbalanced'), 1)
+
+
+class Repo(unittest.TestCase):
+    def test_repo_from_args(self):
+        self.assertEqual(prbot.repo_from_args(["pr", "comment", "1", "-R", "a/b"]), "a/b")
+        self.assertEqual(prbot.repo_from_args(["pr", "comment", "1", "--repo=a/b"]), "a/b")
+        self.assertEqual(prbot.repo_from_args(["api", "repos/o/r/pulls/1/reviews"]), "o/r")
+        self.assertEqual(prbot.repo_from_args(["pr", "review", "https://github.com/o/r/pull/15"]), "o/r")
+        self.assertIsNone(prbot.repo_from_args(["pr", "comment", "1"]))
+
+    def test_repo_option_before_separator_is_not_passed_to_gh(self):
+        # regression: `prbot gh claude -R o/r -- api ...` handed -R to gh api, which has no -R flag
+        self.assertEqual(prbot.split_gh_args(["-R", "o/r", "--", "api", "/installation/repositories"]),
+                         ("o/r", ["api", "/installation/repositories"]))
+        self.assertEqual(prbot.split_gh_args(["--", "pr", "comment", "1", "-R", "o/r"]),
+                         (None, ["pr", "comment", "1", "-R", "o/r"]))
+        self.assertEqual(prbot.split_gh_args(["pr", "view", "1"]), (None, ["pr", "view", "1"]))
+
+
+def commit(login, email, body=""):
+    return {"authors": [{"login": login, "email": email}], "messageBody": body}
+
+
+# shapes taken from kennylhilljr/openclaw-ecc-orchestrator PRs 15, 18 and 13
+PR15 = {"labels": [{"name": "agent:codex"}], "commits": [commit("codex", "codex@openai.com")]}
+PR18 = {"labels": [], "commits": [commit("claude", "noreply@anthropic.com")]}
+PR13 = {"labels": [], "commits": [commit("openclaw-ops-assist[bot]", "349299589+openclaw-ops-assist[bot]@users.noreply.github.com")]}
+
+
+class Routing(unittest.TestCase):
+    def test_detect_author(self):
+        self.assertEqual(prbot.detect_author(PR15), ("codex", "label agent:codex"))
+        self.assertEqual(prbot.detect_author(PR18), ("claude", "commits by claude"))
+        self.assertIsNone(prbot.detect_author(PR13)[0])
+        mixed = {"labels": [], "commits": [commit("claude", "noreply@anthropic.com"), commit("codex", "codex@openai.com")]}
+        self.assertEqual(prbot.detect_author(mixed), (None, "it has commits by both claude and codex"))
+        both_labels = {"labels": [{"name": "agent:claude"}, {"name": "agent:codex"}], "commits": []}
+        self.assertIsNone(prbot.detect_author(both_labels)[0])
+        # a human commit co-authored by Claude counts as Claude's; the human co-author does not make it unclear
+        trailer = {"labels": [], "commits": [commit("kennylhilljr", "kenny@example.com",
+                                                    "fix\n\nCo-Authored-By: Claude <noreply@anthropic.com>")]}
+        self.assertEqual(prbot.detect_author(trailer)[0], "claude")
+        # the label beats the commits
+        relabeled = {"labels": [{"name": "agent:claude"}], "commits": [commit("codex", "codex@openai.com")]}
+        self.assertEqual(prbot.detect_author(relabeled)[0], "claude")
+
+    def test_choose_reviewers(self):
+        self.assertEqual(prbot.choose_reviewers("claude", [])[0], ["codex"])
+        self.assertEqual(prbot.choose_reviewers("codex", ["agent:codex"])[0], ["claude"])
+        self.assertEqual(prbot.choose_reviewers("codex", ["review:codex"])[0], ["codex"])
+        self.assertEqual(prbot.choose_reviewers("claude", ["review:claude", "review:codex"])[0], ["claude", "codex"])
+        self.assertEqual(prbot.choose_reviewers("claude", ["review:codex"], override="claude")[0], ["claude"])
+        self.assertEqual(prbot.choose_reviewers(None, [], override="both")[0], ["claude", "codex"])
+        self.assertEqual(prbot.choose_reviewers(None, []), ([], None))
+        self.assertEqual(prbot.choose_reviewers(None, ["review:claude"])[0], ["claude"])
+
+    def test_unclear_author_exits_3_and_asks(self):
+        import io
+        from contextlib import redirect_stderr
+        orig = prbot.gh_read
+        prbot.gh_read = lambda args: json.dumps(dict(PR13, number=13, title="t", url="u", headRefOid="abc"))
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                code = prbot.cmd_review("13", repo="o/r", mode="route")
+        finally:
+            prbot.gh_read = orig
+        self.assertEqual(code, 3)
+        self.assertIn("Ask the user which agent should review it", err.getvalue())
+
+
+class Jwt(unittest.TestCase):
+    def test_signature_verifies_with_public_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            key, pub = Path(d, "k.pem"), Path(d, "p.pem")
+            subprocess.run(["openssl", "genrsa", "-out", key, "2048"], check=True, capture_output=True)
+            subprocess.run(["openssl", "rsa", "-in", key, "-pubout", "-out", pub], check=True, capture_output=True)
+            token = prbot.app_jwt("Iv23liTEST", key.read_text(), now=1_800_000_000)
+            h, p, s = token.split(".")
+            claims = json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+            self.assertEqual(claims, {"iat": 1_799_999_940, "exp": 1_800_000_540, "iss": "Iv23liTEST"})
+            Path(d, "msg").write_bytes(f"{h}.{p}".encode())
+            Path(d, "sig").write_bytes(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)))
+            r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pub, "-signature", Path(d, "sig"), Path(d, "msg")],
+                               capture_output=True, text=True)
+            self.assertIn("Verified OK", r.stdout)
+
+    def test_manifest_has_no_webhook_and_least_permissions(self):
+        m = prbot.manifest(prbot.load_bot_spec("claude"), "http://127.0.0.1:1/callback")
+        self.assertFalse(m["hook_attributes"]["active"])
+        self.assertEqual(m["default_events"], [])
+        self.assertEqual(m["default_permissions"]["contents"], "read")
+
+
+class Hook(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = dict(os.environ, PRBOT_CONFIG_DIR=self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_hook(self, command):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+        r = subprocess.run([sys.executable, ROOT / "integrations/claude-code/guard_gh_identity.py"],
+                           input=payload, capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def test_denies_write_with_fix(self):
+        out = self.run_hook('gh pr review 15 --comment -b "Two P2 issues"')
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("gh claude -- pr review 15 --comment -b 'Two P2 issues'", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def run_tool(self, tool):
+        r = subprocess.run([sys.executable, ROOT / "integrations/claude-code/guard_gh_identity.py"],
+                           input=json.dumps({"tool_name": tool, "tool_input": {}}), capture_output=True, text=True, env=self.env)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def test_mcp_github_feedback_writes_denied(self):
+        for tool in ("mcp__github__create_pull_request_review", "mcp__github__add_issue_comment",
+                     "mcp__a202bf68-1247-4951-b92e-08a04ad5c797__Github_SubmitPullRequestReview",
+                     "mcp__a202bf68-1247-4951-b92e-08a04ad5c797__Github_CreateReplyForReviewComment"):
+            with self.subTest(tool=tool):
+                self.assertEqual(self.run_tool(tool)["hookSpecificOutput"]["permissionDecision"], "deny")
+        for tool in ("mcp__github__get_pull_request_comments", "mcp__github__list_pull_requests",
+                     "mcp__a202bf68-1247-4951-b92e-08a04ad5c797__Github_ListReviewCommentsOnPullRequest",
+                     "mcp__memory__create_entities"):
+            with self.subTest(tool=tool):
+                self.assertIsNone(self.run_tool(tool))
+
+    def test_allows_reads_and_routed_writes(self):
+        self.assertIsNone(self.run_hook("gh pr view 15 --json reviews"))
+        self.assertIsNone(self.run_hook("prbot gh claude -- pr comment 15 -b ok"))
+
+
+class CodexShim(unittest.TestCase):
+    def test_routes_writes_and_passes_reads(self):
+        with tempfile.TemporaryDirectory() as cfg:
+            env = dict(os.environ, PRBOT_CONFIG_DIR=cfg,
+                       PATH=f"{ROOT / 'integrations/codex/bin'}{os.pathsep}{os.environ['PATH']}")
+            env.pop("PRBOT_ACTIVE", None)
+            read = subprocess.run(["gh", "--version"], capture_output=True, text=True, env=env)
+            self.assertEqual(read.returncode, 0, read.stderr)
+            self.assertIn("gh version", read.stdout)
+            # with no registered bot, a routed write stops inside prbot instead of posting as the user
+            write = subprocess.run(["gh", "pr", "comment", "1", "-R", "o/r", "-b", "x"], capture_output=True, text=True, env=env)
+            self.assertNotEqual(write.returncode, 0)
+            self.assertIn("bot 'codex' is not registered", write.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

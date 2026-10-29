@@ -1,0 +1,7 @@
+{
+  "bot": "claude",
+  "name": "claude-pr-gh",
+  "description": "Posts PR reviews that Claude writes on behalf of kennylhilljr.",
+  "url": "https://github.com/kennylhilljr",
+  "logo": "logos/claude-reviewer.png"
+}

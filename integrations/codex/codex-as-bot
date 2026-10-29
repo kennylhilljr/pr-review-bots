@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Start Codex CLI with the gh shim first on PATH, so PR feedback posts as the Codex review bot.
+# Usage: codex-as-bot [codex args...]
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PRBOT_BOT="${PRBOT_BOT:-codex}"
+export PATH="$here/bin:$PATH"
+exec codex "$@"
