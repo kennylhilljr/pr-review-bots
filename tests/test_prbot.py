@@ -261,6 +261,24 @@ class Jwt(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertIn("Verified OK", r.stdout)
 
+    def test_worker_spec_from_another_repo(self):
+        # issue worker bots keep their specs and logos in their own repo and need contents write
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "claude-dev.json").write_text(json.dumps({
+                "name": "claude-dev-gh", "url": "https://github.com/kennylhilljr", "description": "worker",
+                "logo": "logos/claude-dev.png",
+                "permissions": {"contents": "write", "pull_requests": "write", "issues": "write"}}))
+            spec = prbot.load_bot_spec("claude-dev", str(Path(d, "claude-dev.json")))
+            self.assertEqual(spec["logo_path"], str(Path(d).resolve() / "logos/claude-dev.png"))
+            perms = prbot.manifest(spec, "http://127.0.0.1:1/callback")["default_permissions"]
+            self.assertEqual(perms, {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read"})
+
+    def test_worker_bot_prs_route_to_the_other_agent(self):
+        pr = {"labels": [], "commits": [commit("claude-dev-gh[bot]", "1+claude-dev-gh[bot]@users.noreply.github.com")]}
+        self.assertEqual(prbot.detect_author(pr)[0], "claude")
+        self.assertEqual(prbot.choose_reviewers("claude", [])[0], ["codex"])
+        self.assertEqual(prbot.agent_of(email="2+codex-dev-gh[bot]@users.noreply.github.com"), "codex")
+
     def test_manifest_has_no_webhook_and_least_permissions(self):
         m = prbot.manifest(prbot.load_bot_spec("claude"), "http://127.0.0.1:1/callback")
         self.assertFalse(m["hook_attributes"]["active"])

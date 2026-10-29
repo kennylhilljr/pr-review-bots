@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """prbot: post PR feedback as a GitHub App bot instead of your own account.
 
-  prbot register <bot> [--org ORG]   create the GitHub App from bots/<bot>.json
+  prbot register <bot> [--org ORG] [--spec FILE]
+                                     create the GitHub App from bots/<bot>.json, or from FILE
   prbot import-key <bot> <pem> [<app_id> <owner>]
                                      store (or rotate) the App private key
   prbot install-url <bot>            print the page that installs the App on repos
@@ -254,8 +255,11 @@ def repo_from_git(cwd=None):
 
 AGENTS = ("claude", "codex")
 AGENT_IDS = {
-    "claude": {"logins": {"claude", "claude[bot]", "claude-pr-gh[bot]"}, "emails": {"noreply@anthropic.com"}},
-    "codex": {"logins": {"codex", "codex-pr-gh[bot]", "chatgpt-codex-connector[bot]"}, "emails": {"codex@openai.com"}},
+    # review bots (claude-pr-gh, codex-pr-gh) and issue worker bots (claude-dev-gh, codex-dev-gh)
+    "claude": {"logins": {"claude", "claude[bot]", "claude-pr-gh[bot]", "claude-dev-gh[bot]"},
+               "emails": {"noreply@anthropic.com"}},
+    "codex": {"logins": {"codex", "codex-pr-gh[bot]", "codex-dev-gh[bot]", "chatgpt-codex-connector[bot]"},
+              "emails": {"codex@openai.com"}},
 }
 CO_AUTHOR = re.compile(r"(?im)^co-authored-by:.*<([^>]+)>")
 
@@ -522,14 +526,18 @@ def die(msg, code=2):
     sys.exit(code)
 
 
-def load_bot_spec(bot):
-    path = ROOT / "bots" / f"{bot}.json"
+def load_bot_spec(bot, spec_path=None):
+    """A bot spec from bots/<bot>.json, or from another repo with --spec. Its logo path is relative to the spec."""
+    path = Path(spec_path).expanduser().resolve() if spec_path else ROOT / "bots" / f"{bot}.json"
     if not path.exists():
         die(f"unknown bot '{bot}' (no {path})")
-    return json.loads(path.read_text())
+    spec = json.loads(path.read_text())
+    spec["logo_path"] = str(path.parent / spec["logo"]) if spec.get("logo") else None
+    return spec
 
 
 def manifest(spec, redirect_url):
+    """App manifest. A spec may set its own permissions (workers need contents write); metadata read is required."""
     return {
         "name": spec["name"],
         "url": spec["url"],
@@ -537,14 +545,14 @@ def manifest(spec, redirect_url):
         "public": False,
         "redirect_url": redirect_url,
         "hook_attributes": {"url": spec["url"], "active": False},
-        "default_permissions": PERMISSIONS,
+        "default_permissions": {**spec.get("permissions", PERMISSIONS), "metadata": "read"},
         "default_events": [],
     }
 
 
-def cmd_register(bot, org=None):
+def cmd_register(bot, org=None, spec_path=None):
     """GitHub App manifest flow: a local page posts the manifest, GitHub redirects back with a one-hour code."""
-    spec = load_bot_spec(bot)
+    spec = load_bot_spec(bot, spec_path)
     state = secrets.token_urlsafe(16)
     result = {}
 
@@ -583,7 +591,7 @@ def cmd_register(bot, org=None):
                 install = f"https://github.com/apps/{app['slug']}/installations/new"
                 self._send(f"<p>Created <b>{html.escape(app['slug'])}</b>. Private key stored in {html.escape(where)}.</p>"
                            f'<p>Next: <a href="{install}">install it on your repos</a>, then upload '
-                           f"<code>{html.escape(spec['logo'])}</code> under the App's Display information.</p>")
+                           f"<code>{html.escape(spec['logo_path'] or 'the logo')}</code> under the App's Display information.</p>")
             else:
                 self._send("not found", 404)
 
@@ -593,7 +601,7 @@ def cmd_register(bot, org=None):
         srv.handle_request()
     print(f"Registered {result['slug']}. Key stored in {result['where']}.")
     print(f"Install it:      https://github.com/apps/{result['slug']}/installations/new")
-    print(f"Upload the logo: https://github.com/settings/apps/{result['slug']}  ({ROOT / spec['logo']})")
+    print(f"Upload the logo: https://github.com/settings/apps/{result['slug']}  ({spec['logo_path']})")
 
 
 def _path_without_shims():
@@ -719,7 +727,8 @@ def main(argv):
         die(f"{cmd}: missing bot name")
     bot = rest[0]
     if cmd == "register":
-        cmd_register(bot, rest[rest.index("--org") + 1] if "--org" in rest else None)
+        cmd_register(bot, rest[rest.index("--org") + 1] if "--org" in rest else None,
+                     rest[rest.index("--spec") + 1] if "--spec" in rest else None)
     elif cmd == "import-key":
         cfg = load_config()
         if bot not in cfg:

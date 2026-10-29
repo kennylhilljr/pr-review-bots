@@ -217,7 +217,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 
 | Command | What it does | Exit codes |
 | --- | --- | --- |
-| `prbot register <bot> [--org ORG]` | Creates the App from `bots/<bot>.json` and stores its key. | 0, or 2 on error |
+| `prbot register <bot> [--org ORG] [--spec FILE]` | Creates the App from `bots/<bot>.json`, or from a spec in another repo, and stores its key. A spec can set its own `permissions`. | 0, or 2 on error |
 | `prbot import-key <bot> <pem> [<app_id> <owner>]` | Stores or rotates a private key. | 0, or 2 |
 | `prbot install-url <bot>` | Prints the page that installs the App. | 0, or 2 |
 | `prbot whoami <bot>` | Shows the App and where it is installed. | 0, or 2 |
