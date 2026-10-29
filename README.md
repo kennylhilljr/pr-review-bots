@@ -117,6 +117,20 @@ prbot gh claude -R kennylhilljr/openclaw-ecc-orchestrator -- pr comment 15 --bod
 
 Without `-R`, prbot uses the `origin` remote of the current directory.
 
+### Push as a bot
+
+Agent commits should carry the agent's identity, and the push should come from its bot. This needs the App's **Contents** permission set to read and write.
+
+```bash
+git -c user.name="Claude" -c user.email="noreply@anthropic.com" commit -m "Fix the thing"
+```
+
+```bash
+prbot git claude -- push origin main
+```
+
+The token reaches `git` through a credential helper that reads it from the environment, so it never lands in git config or on disk.
+
 ### Review a PR with the other agent
 
 ```bash
@@ -187,7 +201,7 @@ Add a PreToolUse hook to `~/.claude/settings.json`:
 }
 ```
 
-The hook denies `gh pr review`, `gh pr comment`, `gh issue comment`, `gh api` writes to reviews or comments, and GitHub MCP tools that create reviews or comments, whenever they would post under your account. The denial gives Claude the exact `prbot gh claude -- ...` command to run instead. Reads pass through. If the file is missing, the hook does nothing, so it can never block every tool call; keep the path current if you move the folder.
+The hook denies `gh pr review`, `gh pr comment`, `gh issue comment`, `gh api` writes to reviews or comments, and GitHub MCP tools that create reviews or comments, whenever they would post under your account. It also denies a plain `git push` to any repository owned by the bots' owner and points Claude at `prbot git claude -- push`; pushes to other people's repositories pass through. The denial gives Claude the exact `prbot gh claude -- ...` command to run instead. Reads pass through. If the file is missing, the hook does nothing, so it can never block every tool call; keep the path current if you move the folder.
 
 ### Codex CLI
 
@@ -208,6 +222,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `prbot install-url <bot>` | Prints the page that installs the App. | 0, or 2 |
 | `prbot whoami <bot>` | Shows the App and where it is installed. | 0, or 2 |
 | `prbot gh <bot> [-R owner/repo] -- <gh args>` | Runs `gh` with a one-repo App token. | `gh`'s own code, or 2 |
+| `prbot git <bot> [-R owner/repo] -- <git args>` | Runs `git` (push) with a one-repo contents-write token. | `git`'s own code, or 2 |
 | `prbot review <pr> [-R owner/repo] [--reviewer claude\|codex\|both] [--dry-run\|--route-only]` | Routes, runs and posts a cross-review. | 0, 2 on error, 3 when the author is unclear |
 | `prbot watch [--dry-run] [--limit N] [--baseline]` | One pass of automatic reviews over open PRs. | 0, or 2 |
 | `prbot classify -- <gh args>` | Used by the hook and shim. | 0 if the call posts PR feedback, else 1 |

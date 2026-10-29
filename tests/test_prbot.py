@@ -60,6 +60,25 @@ class ShellCommands(unittest.TestCase):
         self.assertEqual(self.count('gh pr comment 1 -b "unbalanced'), 1)
 
 
+class GitPush(unittest.TestCase):
+    def test_git_env_uses_only_the_bot_token(self):
+        # git sees exactly one github.com helper: ours, which reads the token from the environment
+        env = prbot.git_env("TEST-TOKEN")
+        r = subprocess.run(["git", "config", "--get-urlmatch", "credential.helper", "https://github.com/o/r.git"],
+                           env=env, capture_output=True, text=True)
+        self.assertIn("PRBOT_GIT_TOKEN", r.stdout)
+        self.assertNotIn("gh auth", r.stdout)
+        self.assertNotIn("osxkeychain", r.stdout)
+        self.assertEqual(env["PRBOT_GIT_TOKEN"], "TEST-TOKEN")
+        self.assertNotIn("TEST-TOKEN", r.stdout)  # the token is never written into git config
+
+    def test_git_pushes_parsing(self):
+        found = list(prbot.git_pushes("git add . && git commit -m x && git -C repo push origin main; git status"))
+        self.assertEqual(found, [(["-C", "repo", "push", "origin", "main"], "repo")])
+        self.assertEqual(list(prbot.git_pushes("prbot git claude -- push")), [])
+        self.assertEqual(list(prbot.git_pushes('echo "git push"')), [])
+
+
 class Repo(unittest.TestCase):
     def test_repo_from_args(self):
         self.assertEqual(prbot.repo_from_args(["pr", "comment", "1", "-R", "a/b"]), "a/b")
@@ -274,6 +293,31 @@ class Hook(unittest.TestCase):
                      "mcp__memory__create_entities"):
             with self.subTest(tool=tool):
                 self.assertIsNone(self.run_tool(tool))
+
+    def make_repo(self, owner):
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        subprocess.run(["git", "init", "-q", d], check=True)
+        subprocess.run(["git", "-C", d, "remote", "add", "origin", f"https://github.com/{owner}/demo.git"], check=True)
+        return d
+
+    def run_hook_in(self, command, cwd):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd})
+        r = subprocess.run([sys.executable, ROOT / "integrations/claude-code/guard_gh_identity.py"],
+                           input=payload, capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def test_git_push_to_bot_repos_goes_through_prbot(self):
+        Path(self.tmp.name, "config.json").write_text(json.dumps({"claude": {"owner": "kennylhilljr", "slug": "claude-pr-gh"}}))
+        mine, theirs = self.make_repo("kennylhilljr"), self.make_repo("someone-else")
+        out = self.run_hook_in("git push origin main", mine)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("git claude -- push origin main", out["hookSpecificOutput"]["permissionDecisionReason"])
+        out = self.run_hook_in(f"git -C {mine} push", self.tmp.name)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.run_hook_in("git push origin main", theirs))
+        self.assertIsNone(self.run_hook_in("prbot git claude -- push origin main", mine))
+        self.assertIsNone(self.run_hook_in("git status && git log -1", mine))
 
     def test_allows_reads_and_routed_writes(self):
         self.assertIsNone(self.run_hook("gh pr view 15 --json reviews"))

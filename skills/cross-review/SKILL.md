@@ -64,6 +64,12 @@ So the right agent reviews it, and so GitHub credits the work to you:
 
   Codex uses `-c user.name="Codex" -c user.email="codex@openai.com"`.
 
+- Push through your bot, so GitHub records the push as the bot rather than Kenny:
+
+  ```bash
+  prbot git <your-bot> -- push origin <branch>
+  ```
+
 - Add the label `agent:claude` or `agent:codex` to the PR.
 
 New commits on open, non-draft PRs are picked up by `prbot watch` every 5 minutes, so you do not need to request a review for them. Run `prbot review` yourself only when the user wants one now.
@@ -71,6 +77,7 @@ New commits on open, non-draft PRs are picked up by `prbot watch` every 5 minute
 ## Rules
 
 - Never post PR feedback with plain `gh`, `gh api` writes, or GitHub MCP tools.
+- Never push to Kenny's repos with plain `git push`; use `prbot git <your-bot> -- push`.
 - Never print, log or save a token. prbot handles tokens.
 - Never approve or merge on Kenny's behalf unless he asks in this conversation.
 - The rules and their reasons are in `DESIGN.md` in the `pr-review-bots` repo.

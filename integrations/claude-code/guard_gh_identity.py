@@ -5,7 +5,7 @@ Denies gh commands that post PR feedback on the user's own account and tells
 Claude the prbot command that posts the same thing as the Claude review bot.
 Everything else passes through untouched.
 """
-import importlib.util, json, re, shlex, sys
+import importlib.util, json, os, re, shlex, sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -42,7 +42,19 @@ def decide(payload):
         return None
     prbot = load_prbot()
     command = (payload.get("tool_input") or {}).get("command", "")
-    offending = prbot.unrouted_writes(command, prbot.load_config().get("codex_triggers_as_bot", False))
+    cfg = prbot.load_config()
+    owners = {cfg[b]["owner"] for b in prbot.AGENTS if b in cfg and cfg[b].get("owner")}
+    cwd = payload.get("cwd") or os.getcwd()
+    pushes = []
+    for args, cdir in prbot.git_pushes(command):
+        repo = prbot.repo_from_git(os.path.join(cwd, cdir) if cdir else cwd)
+        if repo and repo.split("/")[0] in owners:  # only repos the bots are installed on
+            pushes.append(args)
+    if pushes:
+        fixes = "\n".join(f"  {shlex.quote(str(PRBOT))} git {BOT} -- {shlex.join(a)}" for a in pushes)
+        return deny("Pushes to Kenny's repos must come from the Claude bot, not his account. "
+                    f"Commit as Claude <noreply@anthropic.com> and push through prbot instead:\n{fixes}")
+    offending = prbot.unrouted_writes(command, cfg.get("codex_triggers_as_bot", False))
     if not offending:
         return None
     fixes = "\n".join(f"  {shlex.quote(str(PRBOT))} gh {BOT} -- {shlex.join(a)}" for a in offending)
