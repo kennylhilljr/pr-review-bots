@@ -25,8 +25,9 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | `prbot review` with Codex reviewing | Built, but not yet seen end to end. The first run stopped at a Codex usage limit. |
 | Claude Code guard hook | Installed and blocking direct posts. |
 | Codex CLI `gh` shim | Built and tested locally; not yet used in a live Codex session. |
-| `prbot watch` (automatic reviews) | Built and dry-run against all repos. The launchd job is not installed yet. |
+| `prbot watch` (automatic reviews) | Live: launchd runs it every 5 minutes across all 21 repos. |
 | `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
+| `prbot git` (push as a bot) | Live for `claude-pr-gh`, with Contents write. `codex-pr-gh` still has Contents read. |
 | CI (GitHub Actions) path | Not built. |
 
 ## Architecture
