@@ -90,6 +90,58 @@ class GitPush(unittest.TestCase):
         self.assertEqual(prbot.agent_of(email="349558466+codex-pr-gh[bot]@users.noreply.github.com"), "codex")
 
 
+class OpenClaw(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = (prbot.OPENCLAW_EVENTS, prbot.OPENCLAW_RUNTIME)
+        prbot.OPENCLAW_EVENTS = Path(self.tmp.name, "openclaw-events.jsonl")
+
+    def tearDown(self):
+        prbot.OPENCLAW_EVENTS, prbot.OPENCLAW_RUNTIME = self.saved
+        self.tmp.cleanup()
+
+    @unittest.skipUnless(Path.home().joinpath(".local/share/openclaw-ecc-orchestrator/runtime/src").is_dir(),
+                         "OpenClaw runtime not installed")
+    def test_event_lands_through_the_runtime_writer(self):
+        ok = prbot.openclaw_attention("review findings: kennylhilljr/demo#20",
+                                      {"url": "https://github.com/x", "token": "ghp_" + "a" * 36})
+        self.assertTrue(ok)
+        prbot.openclaw_attention("plan ready: kennylhilljr/demo#1", {"url": "https://github.com/y"})
+        lines = [json.loads(l) for l in prbot.OPENCLAW_EVENTS.read_text().splitlines()]
+        self.assertEqual([e["seq"] for e in lines], [1, 2])
+        e = lines[0]
+        self.assertEqual((e["type"], e["run_id"], e["unit_id"]), ("attention.required", "github", None))
+        self.assertEqual(e["data"]["reason"], "review findings: kennylhilljr/demo#20")
+        self.assertEqual(e["data"]["detail"]["token"], "[REDACTED]")   # the runtime's redaction applies
+
+    def test_missing_or_broken_runtime_never_raises(self):
+        prbot.OPENCLAW_RUNTIME = Path(self.tmp.name, "no-runtime")
+        self.assertFalse(prbot.openclaw_attention("x", {}))
+        broken = Path(self.tmp.name, "broken")
+        (broken / "openclaw_ecc_orchestrator" / "plugin").mkdir(parents=True)
+        (broken / "openclaw_ecc_orchestrator" / "__init__.py").write_text("")
+        (broken / "openclaw_ecc_orchestrator" / "plugin" / "__init__.py").write_text("")
+        (broken / "openclaw_ecc_orchestrator" / "plugin" / "events.py").write_text("raise RuntimeError('broken')")
+        prbot.OPENCLAW_RUNTIME = broken
+        cached = {m: sys.modules.pop(m) for m in list(sys.modules) if m.startswith("openclaw_ecc_orchestrator")}
+        import io
+        from contextlib import redirect_stderr
+        try:
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(prbot.openclaw_attention("x", {}))
+        finally:
+            if str(broken) in sys.path:
+                sys.path.remove(str(broken))
+            for m in [m for m in sys.modules if m.startswith("openclaw_ecc_orchestrator")]:
+                sys.modules.pop(m)
+            sys.modules.update(cached)
+
+    def test_count_findings(self):
+        review = "### P1: crash on empty input\n...\n### P2: slow path\n### P3: naming\nCP2 is not a priority."
+        self.assertEqual(prbot.count_findings(review), 2)
+        self.assertEqual(prbot.count_findings("Nothing worth reporting."), 0)
+
+
 class Repo(unittest.TestCase):
     def test_repo_from_args(self):
         self.assertEqual(prbot.repo_from_args(["pr", "comment", "1", "-R", "a/b"]), "a/b")

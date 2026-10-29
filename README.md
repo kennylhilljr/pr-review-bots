@@ -28,6 +28,7 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | `prbot watch` (automatic reviews) | Live: launchd runs it every 5 minutes across all 21 repos. |
 | `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
 | `prbot git` (push as a bot) | Live for both bots, with Contents write. |
+| OpenClaw | Reviews with P1 or P2 findings appear in OpenClaw as `attention.required` under the `github` run, written through the orchestrator runtime's event writer. Skipped quietly if the runtime is not installed. |
 | CI (GitHub Actions) path | Not built. |
 
 ## Architecture

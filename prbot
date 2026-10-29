@@ -406,8 +406,44 @@ def cmd_review(target, repo=None, override=None, mode="post", only=None):
             os.unlink(path)
         if r.returncode != 0:
             die(f"posting the {reviewer} review failed: {r.stderr.strip()[:300]}")
-        print(f"posted {reviewer} review: {r.stdout.strip() or pr['url']}")
+        url = r.stdout.strip() or pr["url"]
+        print(f"posted {reviewer} review: {url}")
+        findings = count_findings(body)
+        if findings:
+            openclaw_attention(f"review findings: {repo}#{pr['number']}",
+                               {"url": url, "title": pr["title"], "reviewer": f"{reviewer}-pr-gh",
+                                "p1_p2_findings": findings, "commit": pr["headRefOid"][:10]})
     return 0
+
+# ---------- OpenClaw: tell it when something needs Kenny ----------
+
+OPENCLAW_RUNTIME = Path(os.environ.get("PRBOT_OPENCLAW_RUNTIME",
+                                       Path.home() / ".local/share/openclaw-ecc-orchestrator/runtime/src"))
+OPENCLAW_EVENTS = Path(os.environ.get("PRBOT_OPENCLAW_EVENTS",
+                                      Path.home() / ".local/state/openclaw-ecc-orchestrator/openclaw-events.jsonl"))
+OPENCLAW_RUN = "github"   # one pseudo-run for all GitHub activity, so OpenClaw's run list gets one entry, not one per issue
+
+
+def openclaw_attention(reason, detail):
+    """Append an attention.required event to OpenClaw's event log through the runtime's own writer, which locks,
+    orders, redacts and truncates. Never raises and never blocks GitHub work: returns False if it couldn't."""
+    try:
+        if not OPENCLAW_EVENTS.parent.is_dir() or not OPENCLAW_RUNTIME.is_dir():
+            return False
+        if str(OPENCLAW_RUNTIME) not in sys.path:
+            sys.path.insert(0, str(OPENCLAW_RUNTIME))
+        from openclaw_ecc_orchestrator.plugin.events import JsonlEventSink
+        JsonlEventSink(str(OPENCLAW_EVENTS)).emit("attention.required", OPENCLAW_RUN, None,
+                                                  {"reason": reason[:100], "state": "needs-kenny", "detail": detail})
+        return True
+    except Exception as e:  # OpenClaw being absent or broken must not stop a review or an issue pass
+        print(f"prbot: could not tell OpenClaw: {e}", file=sys.stderr)
+        return False
+
+
+def count_findings(review_text):
+    """P1 and P2 findings in a review, by the priority labels the review prompt asks for."""
+    return len(re.findall(r"\bP[12]\b", review_text))
 
 # ---------- watch: review new commits on open PRs as they come in ----------
 
