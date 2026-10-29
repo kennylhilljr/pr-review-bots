@@ -35,7 +35,7 @@ The tests make no network calls. To try a change against real repos without post
 - Keep `prbot` to the Python standard library plus the `gh` and `openssl` binaries. No pip packages.
 - Add a regression test for every bug you fix, built from the real input that broke it.
 - Update `README.md` and `DESIGN.md` in the same change when behavior or a command changes.
-- Commit as yourself, not as Kenny: `git -c user.name="Claude" -c user.email="noreply@anthropic.com" commit`, or `Codex <codex@openai.com>` for Codex.
+- Commit and push through your bot, not as Kenny: `./prbot git claude -- commit -m "..."` and `./prbot git claude -- push origin main` (Codex uses `codex`). This makes GitHub show `claude-pr-gh[bot]` or `codex-pr-gh[bot]` as author and pusher.
 - Follow the writing rules in Kenny's global instructions for docs and commit messages: plain words, sentence-case headings, no em dashes.
 
 ## Safety

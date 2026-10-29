@@ -119,17 +119,17 @@ Without `-R`, prbot uses the `origin` remote of the current directory.
 
 ### Push as a bot
 
-Agent commits should carry the agent's identity, and the push should come from its bot. This needs the App's **Contents** permission set to read and write.
+Agent commits and pushes should show the bot, not you. `prbot git` sets the bot as author and committer (`claude-pr-gh[bot] <349557468+claude-pr-gh[bot]@users.noreply.github.com>`), which is what makes GitHub show the bot and its logo on the commit. For push, fetch and pull it also supplies a one-hour token with contents write, which needs the App's **Contents** permission set to read and write.
 
 ```bash
-git -c user.name="Claude" -c user.email="noreply@anthropic.com" commit -m "Fix the thing"
+prbot git claude -- commit -m "Fix the thing"
 ```
 
 ```bash
 prbot git claude -- push origin main
 ```
 
-The token reaches `git` through a credential helper that reads it from the environment, so it never lands in git config or on disk.
+The token reaches `git` through a credential helper that reads it from the environment, so it never lands in git config or on disk. Do not use `Claude <noreply@anthropic.com>` as the author: GitHub links that email to Anthropic's own `claude` account.
 
 ### Review a PR with the other agent
 
@@ -201,7 +201,7 @@ Add a PreToolUse hook to `~/.claude/settings.json`:
 }
 ```
 
-The hook denies `gh pr review`, `gh pr comment`, `gh issue comment`, `gh api` writes to reviews or comments, and GitHub MCP tools that create reviews or comments, whenever they would post under your account. It also denies a plain `git push` to any repository owned by the bots' owner and points Claude at `prbot git claude -- push`; pushes to other people's repositories pass through. The denial gives Claude the exact `prbot gh claude -- ...` command to run instead. Reads pass through. If the file is missing, the hook does nothing, so it can never block every tool call; keep the path current if you move the folder.
+The hook denies `gh pr review`, `gh pr comment`, `gh issue comment`, `gh api` writes to reviews or comments, and GitHub MCP tools that create reviews or comments, whenever they would post under your account. It also denies a plain `git commit` or `git push` in any repository owned by the bots' owner and points Claude at `prbot git claude -- commit` or `-- push`; other people's repositories pass through. The denial gives Claude the exact `prbot gh claude -- ...` command to run instead. Reads pass through. If the file is missing, the hook does nothing, so it can never block every tool call; keep the path current if you move the folder.
 
 ### Codex CLI
 
@@ -281,4 +281,4 @@ Post it from your own terminal; the hook only applies inside Claude Code.
 
 ## Contributing
 
-Run the tests before every change and add a regression test for every bug found; `tests/test_prbot.py` has examples built from real PR data. Keep `prbot` to the standard library. Commits written by an agent should carry that agent's identity, for example `Claude <noreply@anthropic.com>`, so GitHub attributes them to the agent rather than to you.
+Run the tests before every change and add a regression test for every bug found; `tests/test_prbot.py` has examples built from real PR data. Keep `prbot` to the standard library. Agents commit and push with `prbot git <bot> -- commit` and `-- push`, so GitHub attributes the work to `claude-pr-gh[bot]` or `codex-pr-gh[bot]` rather than to you.

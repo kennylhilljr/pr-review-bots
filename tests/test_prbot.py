@@ -63,7 +63,7 @@ class ShellCommands(unittest.TestCase):
 class GitPush(unittest.TestCase):
     def test_git_env_uses_only_the_bot_token(self):
         # git sees exactly one github.com helper: ours, which reads the token from the environment
-        env = prbot.git_env("TEST-TOKEN")
+        env = prbot.git_env(token="TEST-TOKEN")
         r = subprocess.run(["git", "config", "--get-urlmatch", "credential.helper", "https://github.com/o/r.git"],
                            env=env, capture_output=True, text=True)
         self.assertIn("PRBOT_GIT_TOKEN", r.stdout)
@@ -72,11 +72,22 @@ class GitPush(unittest.TestCase):
         self.assertEqual(env["PRBOT_GIT_TOKEN"], "TEST-TOKEN")
         self.assertNotIn("TEST-TOKEN", r.stdout)  # the token is never written into git config
 
-    def test_git_pushes_parsing(self):
-        found = list(prbot.git_pushes("git add . && git commit -m x && git -C repo push origin main; git status"))
-        self.assertEqual(found, [(["-C", "repo", "push", "origin", "main"], "repo")])
-        self.assertEqual(list(prbot.git_pushes("prbot git claude -- push")), [])
-        self.assertEqual(list(prbot.git_pushes('echo "git push"')), [])
+    def test_git_writes_parsing(self):
+        found = list(prbot.git_writes("git add . && git commit -m x && git -C repo push origin main; git status"))
+        self.assertEqual(found, [(["commit", "-m", "x"], None), (["-C", "repo", "push", "origin", "main"], "repo")])
+        self.assertEqual(list(prbot.git_writes("prbot git claude -- commit -m x && prbot git claude -- push")), [])
+        self.assertEqual(list(prbot.git_writes('echo "git push"')), [])
+
+    def test_commits_get_the_bot_identity(self):
+        # regression: commits authored as Claude <noreply@anthropic.com> showed Anthropic's claude account on
+        # GitHub, not claude-pr-gh[bot]; the bot's own noreply email is what links a commit to the bot
+        email = "349557468+claude-pr-gh[bot]@users.noreply.github.com"
+        env = prbot.git_env(identity=("claude-pr-gh[bot]", email))
+        for var in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+            out = subprocess.run(["git", "var", var], env=env, capture_output=True, text=True).stdout
+            self.assertTrue(out.startswith(f"claude-pr-gh[bot] <{email}>"), out)
+        self.assertEqual(prbot.agent_of(email=email), "claude")
+        self.assertEqual(prbot.agent_of(email="349558466+codex-pr-gh[bot]@users.noreply.github.com"), "codex")
 
 
 class Repo(unittest.TestCase):
@@ -318,6 +329,8 @@ class Hook(unittest.TestCase):
         self.assertIsNone(self.run_hook_in("git push origin main", theirs))
         self.assertIsNone(self.run_hook_in("prbot git claude -- push origin main", mine))
         self.assertIsNone(self.run_hook_in("git status && git log -1", mine))
+        out = self.run_hook_in('git commit -m "fix"', mine)
+        self.assertIn("git claude -- commit -m fix", out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_allows_reads_and_routed_writes(self):
         self.assertIsNone(self.run_hook("gh pr view 15 --json reviews"))

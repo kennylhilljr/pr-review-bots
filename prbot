@@ -103,19 +103,17 @@ def gh_calls(command):
             yield args, prog == "prbot"
 
 
-def git_pushes(command):
-    """(argv_after_git, -C dir or None) for each plain `git push` in a shell command string."""
+GUARDED_GIT = ("commit", "push")
+
+
+def git_writes(command):
+    """(argv_after_git, -C dir or None) for each plain `git commit` or `git push` in a shell command string."""
     for prog, args in _commands(command):
         if prog != "git":
             continue
-        i, cdir = 0, None
-        while i < len(args) and args[i].startswith("-"):  # git's own options before the subcommand
-            if args[i] in ("-C", "-c") and i + 1 < len(args):
-                cdir = args[i + 1] if args[i] == "-C" else cdir
-                i += 2
-            else:
-                i += 1
-        if i < len(args) and args[i] == "push":
+        _, sub = git_subcommand(args)
+        if sub in GUARDED_GIT:
+            cdir = args[args.index("-C") + 1] if "-C" in args[:args.index(sub)] else None
             yield args, cdir
 
 
@@ -266,6 +264,9 @@ def agent_of(login="", email=""):
     login, email = (login or "").lower(), (email or "").lower()
     for agent, ids in AGENT_IDS.items():
         if login in ids["logins"] or email in ids["emails"]:
+            return agent
+        # bot commit emails look like 349557468+claude-pr-gh[bot]@users.noreply.github.com
+        if any(email.endswith(f"+{l}@users.noreply.github.com") for l in ids["logins"] if l.endswith("[bot]")):
             return agent
     return None
 
@@ -608,23 +609,52 @@ def split_gh_args(args):
     return repo_from_args(args[:i]), args[i + 1:]
 
 
-def git_env(token):
-    """Environment that makes git use this token for github.com, and nothing from the user's credential setup.
-    The helper reads the token from the environment, so it is never written to disk or to git config."""
-    helper = '!f() { echo username=x-access-token; echo "password=$PRBOT_GIT_TOKEN"; }; f'
-    pairs = [("credential.helper", ""), ("credential.https://github.com.helper", ""),
-             ("credential.https://github.com.helper", helper)]
-    env = dict(os.environ, PRBOT_GIT_TOKEN=token, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT=str(len(pairs)))
-    for i, (k, v) in enumerate(pairs):
-        env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, v
+def bot_identity(bot):
+    """(name, email) that make GitHub show a commit as the bot, with its logo. The id is looked up once."""
+    cfg = load_config()
+    slug = bot_config(bot)["slug"]
+    if not cfg[bot].get("user_id"):
+        cfg[bot]["user_id"] = json.loads(gh_read(["api", f"users/{slug}%5Bbot%5D"]))["id"]
+        save_config(cfg)
+    return f"{slug}[bot]", f"{cfg[bot]['user_id']}+{slug}[bot]@users.noreply.github.com"
+
+
+def git_env(token=None, identity=None):
+    """Environment for git as the bot. identity sets author and committer. token, when given, is the only
+    credential git uses for github.com; the helper reads it from the environment, so it never reaches disk."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     env.pop("GITHUB_TOKEN", None)
+    if identity:
+        env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = identity[0]
+        env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = identity[1]
+    if token:
+        helper = '!f() { echo username=x-access-token; echo "password=$PRBOT_GIT_TOKEN"; }; f'
+        pairs = [("credential.helper", ""), ("credential.https://github.com.helper", ""),
+                 ("credential.https://github.com.helper", helper)]
+        env.update(PRBOT_GIT_TOKEN=token, GIT_CONFIG_COUNT=str(len(pairs)))
+        for i, (k, v) in enumerate(pairs):
+            env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, v
     return env
 
 
+REMOTE_SUBCOMMANDS = ("push", "fetch", "pull")
+
+
+def git_subcommand(args):
+    """(index, name) of git's subcommand, skipping git's own options such as -C <dir> and -c k=v."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in ("-C", "-c") else 1
+    return (i, args[i]) if i < len(args) else (len(args), None)
+
+
 def cmd_git(bot, args, repo=None):
-    """Run git (push, usually) as the bot: a one-hour token with contents write, for this repo only."""
+    """Run git as the bot. Commits get the bot as author and committer; push, fetch and pull get a
+    one-hour token with contents write for this repo only."""
+    at, sub = git_subcommand(args)
+    if sub not in REMOTE_SUBCOMMANDS:
+        os.execvpe("git", ["git"] + args, git_env(identity=bot_identity(bot)))
     if not repo:
-        at = args.index("push") if "push" in args else len(args)
         remote = next((a for a in args[at + 1:] if not a.startswith("-")), "origin")
         # args[:at] keeps git's own options such as -C <dir>, so the lookup runs where the push would
         r = subprocess.run(["git"] + args[:at] + ["remote", "get-url", remote], capture_output=True, text=True)
@@ -632,7 +662,7 @@ def cmd_git(bot, args, repo=None):
         repo = f"{m.group(1)}/{m.group(2)}" if m else None
     if not repo:
         die("cannot tell which GitHub repository this pushes to; pass -R owner/repo")
-    env = git_env(installation_token(bot, repo, permissions={"contents": "write"}))
+    env = git_env(installation_token(bot, repo, permissions={"contents": "write"}), bot_identity(bot))
     os.execvpe("git", ["git"] + args, env)
 
 

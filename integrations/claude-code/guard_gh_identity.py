@@ -46,14 +46,14 @@ def decide(payload):
     owners = {cfg[b]["owner"] for b in prbot.AGENTS if b in cfg and cfg[b].get("owner")}
     cwd = payload.get("cwd") or os.getcwd()
     pushes = []
-    for args, cdir in prbot.git_pushes(command):
+    for args, cdir in prbot.git_writes(command):
         repo = prbot.repo_from_git(os.path.join(cwd, cdir) if cdir else cwd)
         if repo and repo.split("/")[0] in owners:  # only repos the bots are installed on
             pushes.append(args)
     if pushes:
         fixes = "\n".join(f"  {shlex.quote(str(PRBOT))} git {BOT} -- {shlex.join(a)}" for a in pushes)
-        return deny("Pushes to Kenny's repos must come from the Claude bot, not his account. "
-                    f"Commit as Claude <noreply@anthropic.com> and push through prbot instead:\n{fixes}")
+        return deny("Commits and pushes in Kenny's repos must come from the Claude bot (claude-pr-gh[bot]), "
+                    f"not his account. Run them through prbot, which sets the bot identity and token:\n{fixes}")
     offending = prbot.unrouted_writes(command, cfg.get("codex_triggers_as_bot", False))
     if not offending:
         return None
