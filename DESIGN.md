@@ -155,7 +155,14 @@ finished file into the queue, but a file that is not valid JSON still gets 30
 seconds to settle before it is rejected, in case some other writer is
 mid-write. The state file is written through a temp file and `os.replace`,
 and a damaged one is moved aside with a timestamp rather than crashing every
-run. The two jobs can overlap, so every watch run
+run; single malformed entries are dropped with a log line each.
+
+Because a queue run moves everything it can't use out of the directory, it
+first checks that the directory really is an event queue: the default path,
+or a directory whose parent holds the router's `.github-events-queue` marker
+file. A symlinked or non-directory path is refused too. Without that check,
+`prbot watch --from-queue .` in a checkout would move `.git` and the sources
+into a `-rejected` directory. The two jobs can overlap, so every watch run
 takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
 when another run holds it.
 
