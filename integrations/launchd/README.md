@@ -9,12 +9,12 @@ Two jobs review PRs on Kenny's Mac:
 
 Both write to `~/Library/Logs/prbot-watch.log`. They share a lock file next to the watch state, so when they overlap the second one logs that the lock is held and exits; queue files stay for its next run.
 
-launchd restarts the queue job for as long as anything is in the queue directory, so every queue run empties it. Three directories sit side by side in `~/.local/state/github-events/`:
+launchd restarts the queue job for as long as anything is in the queue directory, so a queue run leaves only the files of PRs held back by its per-run limit. Each run reviews at least one PR, so a burst drains with one relaunch about every minute. Three directories sit side by side in `~/.local/state/github-events/`:
 
 | Directory | Holds |
 | --- | --- |
-| `prbot/` | New event files. A PR's files are deleted once nothing is left to do on it. |
-| `prbot-deferred/` | Event files for PRs whose review failed, timed out, waits out the one-hour retry delay, or waits on the per-run limit. Each move adds 1 to an `attempts` field in the file. The hourly pass moves them back into `prbot/` after it finishes. |
+| `prbot/` | New event files, and files of PRs waiting only on the per-run limit, left untouched. A PR's files are deleted once nothing is left to do on it. |
+| `prbot-deferred/` | Event files for PRs whose review failed, timed out, or waits out the one-hour retry delay, and every event file when the lookup of the bots' repositories fails. Each move adds 1 to an `attempts` field in the file. The hourly pass moves them back into `prbot/` after it finishes. |
 | `prbot-rejected/` | Anything that can never be handled: bad JSON, events that are not `pull_request`, repositories the bots don't cover, dotfiles such as `.DS_Store`, other file names, directories and symlinks, and events deferred 24 times. Kept as evidence; nothing reads or removes them, so clear this directory by hand now and then. |
 
 The hourly pass finds the queue directory through `PRBOT_QUEUE_DIR`, which defaults to `~/.local/state/github-events/prbot`. If you point the queue job at another directory, set `PRBOT_QUEUE_DIR` to the same path in the backstop plist.

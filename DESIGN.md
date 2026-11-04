@@ -140,9 +140,11 @@ the same function, for only the PRs named in the files. The full pass stays as
 an hourly backstop for events that never arrive.
 
 launchd keeps restarting a `QueueDirectories` job while the directory has
-any entry in it, so a queue run always leaves the directory empty. A PR's
-files are deleted once nothing is left to do on it. When its review fails or
-has to wait, the files move to a sibling `prbot-deferred/` with an `attempts`
+any entry in it, so a queue run leaves only the files of PRs held back by its
+per-run limit. Each run reviews at least one PR, so those relaunches always
+make progress and drain a burst about a minute apart. A PR's files are
+deleted once nothing is left to do on it. When its review fails or has to
+wait out the retry delay, the files move to a sibling `prbot-deferred/` with an `attempts`
 count, and the hourly pass moves them back after it finishes; the pass has
 already looked at those PRs, so the queue job's recheck finds the reviewed
 commit and costs only GitHub reads. Entries that can never succeed (bad JSON,

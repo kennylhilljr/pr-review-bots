@@ -445,11 +445,38 @@ class WatchQueue(unittest.TestCase):
         self.assertEqual((code, len(self.runs), self.left()), (0, 2, []))
         self.assertEqual(self.read("deferred", moved[0])["attempts"], 2)
 
-    def test_review_over_the_limit_is_deferred_without_failing(self):
+    def test_review_over_the_limit_stays_in_the_queue_untouched(self):
         self.event(2)
-        wait = self.event(5).name
+        wait = self.event(5)
+        before = wait.read_text()
         code, log = self.run_queue(limit=1)
-        self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [(2, "claude")], [], [wait]))
+        self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [(2, "claude")], [wait.name], []))
+        self.assertEqual(wait.read_text(), before)
+        self.assertNotIn("attempts", json.loads(wait.read_text()))
+        self.assertIn("o/r#5: over this run's limit; leaving 1 file in the queue", log)
+
+    def test_limit_bound_runs_always_make_progress(self):
+        # PR 2 fails and PR 5 succeeds; each relaunch must take at least one PR out of the queue, even at limit 0
+        self.fail_on = {2}
+        self.event(2)
+        self.event(5)
+        code, _ = self.run_queue(limit=0)
+        self.assertEqual((code, self.runs, len(self.left()), len(self.names("deferred"))), (2, [(2, "claude")], 1, 1))
+        code, _ = self.run_queue(limit=0)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude"), (5, "claude")], []))
+
+    def test_repository_lookup_failure_defers_everything(self):
+        names = [self.event(2).name, self.event(2, repo="someone/else").name]
+        Path(self.queue, "bad.json").write_text("{oops")
+        def lookup_fails(bot):
+            prbot.die("GitHub GET /app/installations failed: HTTP 502")
+        prbot.installed_repos = lookup_fails
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (2, [], []))
+        self.assertEqual(self.names("deferred"), sorted(names))
+        self.assertEqual(self.names("rejected"), ["bad.json"])  # malformed needs no lookup to reject
+        self.assertEqual(self.read("deferred", names[1])["attempts"], 1)
+        self.assertIn("could not look up the repositories", log)
 
     def test_event_is_rejected_after_too_many_attempts(self):
         self.fail_on = {2}

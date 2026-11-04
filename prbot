@@ -535,9 +535,9 @@ def watch_setup(dry_run, limit, baseline):
 
 def watch_pr(repo, p, state, seen, ctx):
     """The watcher's decision for one PR. p has number, isDraft and headRefOid, plus state when it comes from
-    `gh pr view`. Returns "done" when nothing is left to do on this commit, "later" when a review waits for a
-    later run (limit reached, or retry delay after a failure), and "failed" when the PR could not be read or a
-    review failed."""
+    `gh pr view`. Returns "done" when nothing is left to do on this commit, "limit" when a review only waits
+    because this run used up its limit, "later" when a review waits out the retry delay after a failure, and
+    "failed" when the PR could not be read or a review failed. With several reviewers the worst one wins."""
     if p["isDraft"] or p.get("state", "OPEN") != "OPEN":
         return "done"
     log, installed = watch_log, ctx["installed"]
@@ -566,7 +566,7 @@ def watch_pr(repo, p, state, seen, ctx):
     except SystemExit:
         log(f"{key}: could not read the PR; will retry")
         return "failed"
-    result = "done"
+    result, rank = "done", ("done", "limit", "later", "failed").index
     for r in todo:
         if r not in installed:
             log(f"{key}: needs a {r} review, but the {r} bot is not registered")
@@ -575,11 +575,11 @@ def watch_pr(repo, p, state, seen, ctx):
             log(f"{key}: needs a {r} review, but the {r} bot is not installed on {repo}")
             continue
         if time.time() - entry.get(f"failed_{r}", 0) < RETRY_AFTER:
-            result = "failed" if result == "failed" else "later"
+            result = max(result, "later", key=rank)
             continue
         if ctx["runs"] >= ctx["limit"]:
             log(f"{key}: {r} review waits for the next pass (limit {ctx['limit']} per pass)")
-            result = "failed" if result == "failed" else "later"
+            result = max(result, "limit", key=rank)
             continue
         ctx["runs"] += 1
         if ctx["dry_run"]:
@@ -707,10 +707,11 @@ def parse_queue_event(path):
 
 def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
     """Handle each PR named in the event queue once, with the same decisions as a full pass. launchd relaunches
-    the job for as long as the directory has anything in it, so every entry leaves it: a PR's files are deleted
-    when nothing is left to do on it, moved to <queue>-deferred (with an attempts count) when a review waits or
-    fails, and anything that can never be handled is moved to <queue>-rejected. The hourly full pass moves the
-    deferred files back. Returns 2 if any PR failed."""
+    the job for as long as the directory has anything in it, so only PRs held back by this run's limit stay (each
+    run reviews at least one PR, so a burst drains a run at a time). A PR's files are deleted when nothing is
+    left to do on it, moved to <queue>-deferred (with an attempts count) when a review fails or waits out the
+    retry delay, and anything that can never be handled is moved to <queue>-rejected. The hourly full pass
+    moves the deferred files back. Returns 2 if any PR failed or the repository lookup failed."""
     if not any(queue_entries(qdir)):
         return 0
     lock = watch_lock()
@@ -747,11 +748,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
         files, unsupported = queue_entries(qdir)
         for path in unsupported:
             reject(path, "not an event file")
-        if not files:
-            return 0
-        ctx = watch_setup(dry_run, limit, baseline)
-        covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
-        groups = {}
+        events = []
         for path in files:
             try:
                 ev = parse_queue_event(path)
@@ -759,10 +756,25 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
                 continue
             if ev is None:
                 reject(path, "not a pull_request event with a valid repo and number")
-            elif ev[0].lower() not in covered:
-                reject(path, f"{ev[0]} is not a repository the bots are installed on")
             else:
-                groups.setdefault((covered[ev[0].lower()], ev[1]), []).append(path)
+                events.append((path, ev))
+        if not events:
+            return 0
+        try:
+            # at least one review per run, so files held back by the limit drain one launchd relaunch at a time
+            ctx = watch_setup(dry_run, max(limit, 1), baseline)
+        except (SystemExit, Exception) as e:  # can't tell which repos are covered: retry later, never reject
+            watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
+            for path, _ in events:
+                defer(path, "repository lookup failed")
+            return 2
+        covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
+        groups = {}
+        for path, (repo, n) in events:
+            if repo.lower() not in covered:
+                reject(path, f"{repo} is not a repository the bots are installed on")
+            else:
+                groups.setdefault((covered[repo.lower()], n), []).append(path)
         state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
         seen, failed = {}, 0
         for (repo, n), paths in groups.items():
@@ -773,11 +785,15 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
             except (SystemExit, Exception) as e:
                 watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
                 result = "failed"
+            if result == "limit":  # untouched: launchd starts another run after ThrottleInterval
+                watch_log(f"{repo}#{n}: over this run's limit; leaving {len(paths)} file"
+                          f"{'s' if len(paths) != 1 else ''} in the queue for the next run")
+                continue
             for path in paths:
                 if result == "done":
                     act("delete", path, f"{repo}#{n} handled", path.unlink)
                 else:
-                    defer(path, f"{repo}#{n} {'failed' if result == 'failed' else 'waits'}")
+                    defer(path, f"{repo}#{n} {'failed' if result == 'failed' else 'waits out the retry delay'}")
             failed += result == "failed"
         if not dry_run:
             state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest
