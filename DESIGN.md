@@ -179,7 +179,9 @@ repository missing from an incomplete inventory may belong to the missing
 bot, so its events are deferred, not rejected, and the full pass keeps all
 state rather than pruning entries for repositories it never looked at. The two jobs can overlap, so every watch run
 takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
-when another run holds it.
+when another run holds it. The lock covers every check on the queue
+directories and every move that follows, including the hourly pass moving
+deferred files back, so no run acts on a check another run has made stale.
 
 Each reviewer CLI runs in its own process group with a 900 second limit
 (`PRBOT_REVIEW_TIMEOUT`). A hung Codex review once held the whole watch queue.

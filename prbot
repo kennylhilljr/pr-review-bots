@@ -738,17 +738,20 @@ def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
     """One pass over open PRs on every repo the bots are installed on. launchd runs this every hour as a backstop
     for the event queue. --baseline marks the commits open right now as seen without reviewing them, so only new
     ones get reviews. With queue, only the PRs named in that event queue directory are handled."""
-    if queue is not None:
-        qdir, why = checked_queue_dir(queue)
-        if qdir is None:
-            print(f"prbot: refusing --from-queue: {why}. Nothing was moved.", file=sys.stderr)
-            return 2
-        return cmd_watch_queue(qdir, dry_run, limit, baseline)
+    # the lock is held from before the queue directory is checked until the last file has moved, so another
+    # watch run can't change the queue or the deferred directory between a check and the action it allows
     lock = watch_lock()
     if lock is None:
-        watch_log("another watch run holds the lock; skipping this pass")
+        watch_log("another watch run holds the lock; " +
+                  ("leaving the queue for the next run" if queue is not None else "skipping this pass"))
         return 0
     with lock:
+        if queue is not None:
+            qdir, why = checked_queue_dir(queue)
+            if qdir is None:
+                print(f"prbot: refusing --from-queue: {why}. Nothing was moved.", file=sys.stderr)
+                return 2
+            return cmd_watch_queue(qdir, dry_run, limit, baseline)
         state = load_watch_state(dry_run)
         seen = {}
         ctx = watch_setup(dry_run, limit, baseline)
@@ -762,13 +765,14 @@ def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
             save_watch_state(seen)
         runs = ctx["runs"]
         watch_log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
-    code = 2 if ctx["lookup_failed"] else 0
-    if not dry_run:
-        qdir, why = checked_queue_dir(QUEUE_DIR)
-        if qdir is None:  # the pass itself still ran; only the requeue is refused
-            print(f"prbot: not moving deferred events back: {why}. Check PRBOT_QUEUE_DIR.", file=sys.stderr)
-            return 2
-        requeue_deferred(qdir)
+        code = 2 if ctx["lookup_failed"] else 0
+        if not dry_run:
+            qdir, why = checked_queue_dir(QUEUE_DIR)
+            if qdir is None:  # the pass itself still ran; only the requeue is refused
+                print(f"prbot: not moving deferred events back: {why}. Check PRBOT_QUEUE_DIR.", file=sys.stderr)
+                return 2
+            # still under the lock: a queue job launched by the first file moved back waits for the next relaunch
+            requeue_deferred(qdir)
     return code
 
 # ---------- watch --from-queue: handle PRs named in GitHub event files ----------
@@ -890,12 +894,9 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
     run reviews at least one PR, so a burst drains a run at a time). A PR's files are deleted when nothing is
     left to do on it, moved to <queue>-deferred (with an attempts count) when a review fails or waits out the
     retry delay, and anything that can never be handled is moved to <queue>-rejected. The hourly full pass
-    moves the deferred files back. Returns 2 if any PR failed or the repository lookup failed."""
+    moves the deferred files back. Returns 2 if any PR failed or the repository lookup failed. The caller holds
+    the watch lock and has already checked qdir with checked_queue_dir."""
     if not any(queue_entries(qdir)):
-        return 0
-    lock = watch_lock()
-    if lock is None:
-        watch_log("another watch run holds the lock; leaving the queue for the next run")
         return 0
     rejected, deferred = queue_sibling(qdir, "rejected"), queue_sibling(qdir, "deferred")
 
@@ -916,127 +917,130 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
         except FileNotFoundError:
             return
         attempts = ev.get("attempts", 0)
-        ev["attempts"] = (attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0) + 1
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+            # a negative count would put off rejection almost forever; anything but a whole number >= 0 is invalid
+            watch_log(f"queue: {path.name} has an invalid attempts value {attempts!r}; counting from 0")
+            attempts = 0
+        ev["attempts"] = attempts + 1
         if ev["attempts"] >= MAX_ATTEMPTS:
             act(f"move to {rejected}", path, f"{why}; giving up after {ev['attempts']} attempts",
                 lambda: move_into(path, rejected, ev))
         else:
             act(f"move to {deferred}", path, f"{why}; attempt {ev['attempts']}", lambda: move_into(path, deferred, ev))
 
-    with lock:
-        files, unsupported = queue_entries(qdir)
-        for path in unsupported:  # os.replace moves the entry itself: a directory whole, a symlink as a link
-            kind = "a directory" if os.path.isdir(path) and not os.path.islink(path) else "not an event file"
-            reject(path, kind)
-        events, sweeps = [], []
-        for path in files:
+    files, unsupported = queue_entries(qdir)
+    for path in unsupported:  # os.replace moves the entry itself: a directory whole, a symlink as a link
+        kind = "a directory" if os.path.isdir(path) and not os.path.islink(path) else "not an event file"
+        reject(path, kind)
+    events, sweeps = [], []
+    for path in files:
+        try:
+            ev = parse_queue_event(path)
+        except FileNotFoundError:
+            continue
+        except ValueError:
             try:
-                ev = parse_queue_event(path)
+                age = time.time() - path.stat().st_mtime
             except FileNotFoundError:
                 continue
-            except ValueError:
-                try:
-                    age = time.time() - path.stat().st_mtime
-                except FileNotFoundError:
-                    continue
-                # may still be mid-write; ThrottleInterval (60s) brings the next run after it settles. An mtime
-                # further ahead than clock skew explains counts as settled, so it can't hold the queue open for long.
-                if -CLOCK_SKEW <= age < QUEUE_SETTLE:
-                    watch_log(f"queue: leaving {path.name} for now: not valid JSON yet, written {age:.0f}s ago")
-                    continue
-                reject(path, f"not valid JSON, written {age:.0f}s ago")
+            # may still be mid-write; ThrottleInterval (60s) brings the next run after it settles. An mtime
+            # further ahead than clock skew explains counts as settled, so it can't hold the queue open for long.
+            if -CLOCK_SKEW <= age < QUEUE_SETTLE:
+                watch_log(f"queue: leaving {path.name} for now: not valid JSON yet, written {age:.0f}s ago")
                 continue
-            if ev is None:
-                reject(path, "not a pull_request event with a valid repo and number, nor a sweep")
-            else:
-                (sweeps if ev[0] == "sweep" else events).append((path, ev))
-        if not events and not sweeps:
-            return 0
+            reject(path, f"not valid JSON, written {age:.0f}s ago")
+            continue
+        if ev is None:
+            reject(path, "not a pull_request event with a valid repo and number, nor a sweep")
+        else:
+            (sweeps if ev[0] == "sweep" else events).append((path, ev))
+    if not events and not sweeps:
+        return 0
+    try:
+        # at least one review per run, so files held back by the limit drain one launchd relaunch at a time
+        ctx = watch_setup(dry_run, max(limit, 1), baseline)
+    except (SystemExit, Exception) as e:  # can't tell which repos are covered: retry later, never reject
+        watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
+        for path, _ in events + sweeps:
+            defer(path, "repository lookup failed")
+        return 2
+    covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
+    complete = not ctx["gaps"]  # only a full inventory of every bot can call a repository unknown
+    failed = 1 if ctx["lookup_failed"] else 0
+    uncovered = 0
+
+    def not_covered(path, repo, label=""):
+        nonlocal uncovered
+        if complete:
+            reject(path, f"{label}{repo}: {repo} is not a repository the bots are installed on")
+        else:
+            uncovered += 1
+            defer(path, f"{label}{repo}: {repo} is not in the bot inventory, which is incomplete")
+
+    groups = {}
+    for path, (_, repo, n) in events:
+        if repo.lower() not in covered:
+            not_covered(path, repo, "event for ")
+        else:
+            groups.setdefault((covered[repo.lower()], n), []).append(path)
+    sweep_paths, sweep_repos = [], set()  # None in sweep_repos means every covered repository
+    for path, (_, repo, _) in sweeps:
+        if repo is not None and repo.lower() not in covered:
+            not_covered(path, repo, "sweep of ")
+            continue
+        sweep_paths.append(path)
+        sweep_repos.add(covered[repo.lower()] if repo is not None else None)
+    if uncovered and not failed:
+        failed = 1  # events can't be placed until the configuration is fixed: say so with the exit code
+    state = load_watch_state(dry_run)
+    seen = {}
+    for (repo, n), paths in groups.items():
         try:
-            # at least one review per run, so files held back by the limit drain one launchd relaunch at a time
-            ctx = watch_setup(dry_run, max(limit, 1), baseline)
-        except (SystemExit, Exception) as e:  # can't tell which repos are covered: retry later, never reject
-            watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
-            for path, _ in events + sweeps:
-                defer(path, "repository lookup failed")
-            return 2
-        covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
-        complete = not ctx["gaps"]  # only a full inventory of every bot can call a repository unknown
-        failed = 1 if ctx["lookup_failed"] else 0
-        uncovered = 0
-
-        def not_covered(path, repo, label=""):
-            nonlocal uncovered
-            if complete:
-                reject(path, f"{label}{repo}: {repo} is not a repository the bots are installed on")
+            p = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json",
+                                    "number,state,isDraft,headRefOid"]))
+            result = watch_pr(repo, p, state, seen, ctx)
+        except (SystemExit, Exception) as e:
+            watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
+            result = "failed"
+        if result == "limit":  # untouched: launchd starts another run after ThrottleInterval
+            watch_log(f"{repo}#{n}: over this run's limit; leaving {len(paths)} file"
+                      f"{'s' if len(paths) != 1 else ''} in the queue for the next run")
+            continue
+        for path in paths:
+            if result == "done":
+                act("delete", path, f"{repo}#{n} handled", path.unlink)
             else:
-                uncovered += 1
-                defer(path, f"{label}{repo}: {repo} is not in the bot inventory, which is incomplete")
-
-        groups = {}
-        for path, (_, repo, n) in events:
-            if repo.lower() not in covered:
-                not_covered(path, repo, "event for ")
-            else:
-                groups.setdefault((covered[repo.lower()], n), []).append(path)
-        sweep_paths, sweep_repos = [], set()  # None in sweep_repos means every covered repository
-        for path, (_, repo, _) in sweeps:
-            if repo is not None and repo.lower() not in covered:
-                not_covered(path, repo, "sweep of ")
-                continue
-            sweep_paths.append(path)
-            sweep_repos.add(covered[repo.lower()] if repo is not None else None)
-        if uncovered and not failed:
-            failed = 1  # events can't be placed until the configuration is fixed: say so with the exit code
-        state = load_watch_state(dry_run)
-        seen = {}
-        for (repo, n), paths in groups.items():
-            try:
-                p = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json",
-                                        "number,state,isDraft,headRefOid"]))
-                result = watch_pr(repo, p, state, seen, ctx)
-            except (SystemExit, Exception) as e:
-                watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
-                result = "failed"
-            if result == "limit":  # untouched: launchd starts another run after ThrottleInterval
-                watch_log(f"{repo}#{n}: over this run's limit; leaving {len(paths)} file"
-                          f"{'s' if len(paths) != 1 else ''} in the queue for the next run")
-                continue
-            for path in paths:
-                if result == "done":
-                    act("delete", path, f"{repo}#{n} handled", path.unlink)
-                else:
-                    defer(path, f"{repo}#{n} {'failed' if result == 'failed' else 'has to wait'}")
-            failed += result == "failed"
-        if sweep_paths:  # after the PR events, which are more precise; PRs they just handled are skipped
-            repos = set(covered.values()) if None in sweep_repos else sweep_repos
-            watch_log(f"queue: sweep of {'every covered repository' if None in sweep_repos else ', '.join(sorted(repos))}")
-            try:
-                outcomes, unlisted = watch_repos(repos, state, seen, ctx, skip=set(groups))
-            except (SystemExit, Exception) as e:
-                watch_log(f"queue: sweep failed ({e!r})")
-                outcomes, unlisted = {"failed"}, set()
-            # each outcome is checked on its own, so one PR's success or wait can't hide another PR's limit block.
-            # Retry-delay waits and unavailable bots are owned by the hourly pass, so they don't hold the sweep.
-            sweep_failed = "failed" in outcomes or bool(unlisted)
-            if None in sweep_repos and not complete:
-                watch_log("queue: sweep could not reach repositories missing from the incomplete bot inventory")
-                sweep_failed = True
-            failed += sweep_failed
-            if "limit" in outcomes:  # a review ran this run, so leaving the sweep in place still makes progress
-                watch_log("queue: sweep is over this run's limit; leaving it in the queue for the next run")
-            elif sweep_failed:
-                for path in sweep_paths:
-                    defer(path, "sweep failed or was incomplete")
-            else:
-                for path in sweep_paths:  # only the files listed at the start; a sweep written since waits its turn
-                    act("delete", path, "sweep done", path.unlink)
-        if not dry_run:
-            state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest
-            save_watch_state(state)
-        runs = ctx["runs"]
-        watch_log(f"queue done: {len(groups)} PR{'s' if len(groups) != 1 else ''}, {runs} review"
-                  f"{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}, {failed} failed")
+                defer(path, f"{repo}#{n} {'failed' if result == 'failed' else 'has to wait'}")
+        failed += result == "failed"
+    if sweep_paths:  # after the PR events, which are more precise; PRs they just handled are skipped
+        repos = set(covered.values()) if None in sweep_repos else sweep_repos
+        watch_log(f"queue: sweep of {'every covered repository' if None in sweep_repos else ', '.join(sorted(repos))}")
+        try:
+            outcomes, unlisted = watch_repos(repos, state, seen, ctx, skip=set(groups))
+        except (SystemExit, Exception) as e:
+            watch_log(f"queue: sweep failed ({e!r})")
+            outcomes, unlisted = {"failed"}, set()
+        # each outcome is checked on its own, so one PR's success or wait can't hide another PR's limit block.
+        # Retry-delay waits and unavailable bots are owned by the hourly pass, so they don't hold the sweep.
+        sweep_failed = "failed" in outcomes or bool(unlisted)
+        if None in sweep_repos and not complete:
+            watch_log("queue: sweep could not reach repositories missing from the incomplete bot inventory")
+            sweep_failed = True
+        failed += sweep_failed
+        if "limit" in outcomes:  # a review ran this run, so leaving the sweep in place still makes progress
+            watch_log("queue: sweep is over this run's limit; leaving it in the queue for the next run")
+        elif sweep_failed:
+            for path in sweep_paths:
+                defer(path, "sweep failed or was incomplete")
+        else:
+            for path in sweep_paths:  # only the files listed at the start; a sweep written since waits its turn
+                act("delete", path, "sweep done", path.unlink)
+    if not dry_run:
+        state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest
+        save_watch_state(state)
+    runs = ctx["runs"]
+    watch_log(f"queue done: {len(groups)} PR{'s' if len(groups) != 1 else ''}, {runs} review"
+              f"{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}, {failed} failed")
     return 2 if failed else 0
 
 # ---------- commands ----------

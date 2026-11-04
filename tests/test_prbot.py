@@ -1014,6 +1014,84 @@ class WatchQueue(unittest.TestCase):
         prbot.queue_sibling(self.queue, "deferred").rmdir()
         self.assertNotIn("deferred", Watch.run_pass(self, limit=5))
 
+    LOCK_PROBE = ("import fcntl, sys\nf = open(sys.argv[1], 'w')\ntry:\n    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                  "    print('free')\nexcept BlockingIOError:\n    print('held')\n")
+
+    def lock_state(self):
+        """'held' or 'free', as another process sees the watch lock right now."""
+        r = subprocess.run([sys.executable, "-c", self.LOCK_PROBE, str(prbot.WATCH_STATE.with_name("watch.lock"))],
+                           capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def test_lock_held_by_another_process_means_nothing_is_touched(self):
+        # Codex review of PR 1: the queue had to be checked and moved only under the lock
+        keep = self.event(2).name
+        Path(self.queue, ".DS_Store").write_text("")
+        deferred = prbot.queue_sibling(self.queue, "deferred")
+        deferred.mkdir()
+        Path(deferred, "old.json").write_text("{}")
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\nf = open(sys.argv[1], 'w')\n"
+                                   "fcntl.flock(f, fcntl.LOCK_EX)\nprint('locked', flush=True)\ntime.sleep(60)\n",
+                                   str(prbot.WATCH_STATE.with_name("watch.lock"))], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            def no_check(*a):
+                raise AssertionError("the queue must not be checked or read without the lock")
+            saved, prbot.checked_queue_dir = prbot.checked_queue_dir, no_check
+            try:
+                code, log = self.run_queue(limit=5)
+                self.assertEqual(code, 0)
+                import io
+                from contextlib import redirect_stdout
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(prbot.cmd_watch(limit=5), 0)
+            finally:
+                prbot.checked_queue_dir = saved
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+        self.assertEqual((self.runs, self.left(), self.names("deferred")), ([], sorted([keep, ".DS_Store"]), ["old.json"]))
+        self.assertFalse(prbot.queue_sibling(self.queue, "rejected").exists())
+
+    def test_lock_is_held_through_queue_checks_and_the_requeue(self):
+        # Codex review of PR 1: the hourly pass released the lock before moving deferred files back
+        seen = []
+        real_check, real_requeue = prbot.checked_queue_dir, prbot.requeue_deferred
+        def check(q):
+            seen.append(("check", self.lock_state()))
+            return real_check(q)
+        def requeue(q):
+            seen.append(("requeue", self.lock_state()))
+            return real_requeue(q)
+        prbot.checked_queue_dir, prbot.requeue_deferred = check, requeue
+        try:
+            self.event(2)
+            self.run_queue(limit=5)
+            Watch.run_pass(self, limit=5)
+        finally:
+            prbot.checked_queue_dir, prbot.requeue_deferred = real_check, real_requeue
+        self.assertEqual(seen, [("check", "held"), ("check", "held"), ("requeue", "held")])
+        self.assertEqual(self.lock_state(), "free")
+
+    def test_invalid_attempt_counts_start_again_from_zero(self):
+        # Codex review of PR 1: "attempts": -1000000 would have put off rejection about a million retries
+        self.fail_on = {2}
+        deferred = prbot.queue_sibling(self.queue, "deferred")
+        for bad in (-1000000, "7", 2.5, True, None):
+            with self.subTest(bad=bad):
+                for p in (deferred.glob("*") if deferred.is_dir() else []):
+                    p.unlink()
+                name = self.event(2, attempts=bad).name
+                code, log = self.run_queue(limit=5)
+                self.assertEqual((code, self.names("deferred")), (2, [name]))
+                self.assertEqual(self.read("deferred", name)["attempts"], 1)
+                self.assertIn(f"invalid attempts value {bad!r}; counting from 0", log)
+                prbot.WATCH_STATE.unlink()   # forget the failure, so the next case fails afresh instead of waiting
+        name = self.event(2, attempts=prbot.MAX_ATTEMPTS - 1).name  # a valid count is still honored
+        self.run_queue(limit=5)
+        self.assertIn(name, self.names("rejected"))
+
     def test_queue_waits_while_another_run_holds_the_lock(self):
         import fcntl
         keep = self.event(2).name
