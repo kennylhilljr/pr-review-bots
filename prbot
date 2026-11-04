@@ -617,12 +617,33 @@ def watch_lock():
 
 
 def watch_setup(dry_run, limit, baseline):
-    """What every watch run needs: the registered bots, where they are installed, and the review budget."""
+    """What every watch run needs: the registered bots, where they are installed, and the review budget.
+    "installed" holds only inventories that were read and are not empty. "gaps" says why any bot's inventory
+    is missing (not registered, lookup failed, installed nowhere); with a gap, a repository missing from the
+    inventory may still be covered, so it must not be treated as unknown and state must not be pruned.
+    "lookup_failed" is true when a lookup raised, which is worth a nonzero exit."""
     cfg = load_config()
     bots = [b for b in AGENTS if b in cfg]
+    installed, gaps, lookup_failed = {}, [], False
+    for b in AGENTS:
+        if b not in cfg:
+            gaps.append(f"the {b} bot is not registered")
+            continue
+        try:
+            repos = installed_repos(b)
+        except (SystemExit, Exception) as e:
+            gaps.append(f"could not read where the {b} bot is installed ({e!r})")
+            lookup_failed = True
+            continue
+        if not repos:
+            gaps.append(f"the {b} bot is installed on no repositories")
+            continue
+        installed[b] = repos
+    if gaps:
+        watch_log("bot inventory is incomplete: " + "; ".join(gaps))
     return {"dry_run": dry_run, "limit": limit, "baseline": baseline, "runs": 0,
             "slugs": {cfg[b]["slug"] + "[bot]": b for b in bots},
-            "installed": {b: installed_repos(b) for b in bots}}
+            "installed": installed, "gaps": gaps, "lookup_failed": lookup_failed}
 
 
 RESULT_RANK = ("done", "limit", "later", "failed").index   # for max(): the worst result of several wins
@@ -666,7 +687,7 @@ def watch_pr(repo, p, state, seen, ctx):
     for r in todo:
         # an unavailable reviewer bot leaves the review owed, so a queue run defers the event instead of dropping it
         if r not in installed:
-            log(f"{key}: needs a {r} review, but the {r} bot is not registered")
+            log(f"{key}: needs a {r} review, but the {r} bot is not registered or its installations are unknown")
             result = max(result, "later", key=rank)
             continue
         if repo not in installed[r]:
@@ -695,21 +716,22 @@ def watch_pr(repo, p, state, seen, ctx):
 
 
 def watch_repos(repos, state, seen, ctx, skip=()):
-    """The full pass over the open PRs of repos, skipping (repo, number) pairs in skip. Returns the worst
-    watch_pr result, and "failed" when a repository's PRs could not be listed."""
-    result = "done"
+    """The full pass over the open PRs of repos, skipping (repo, number) pairs in skip. Returns (outcomes,
+    unlisted): the set of every watch_pr result seen, so a caller can test each kind on its own instead of a
+    single worst one hiding the rest, and the repositories whose PRs could not be listed."""
+    outcomes, unlisted = set(), set()
     for repo in sorted(repos):
         try:
             prs = json.loads(gh_read(["pr", "list", "-R", repo, "--state", "open", "--limit", "100",
                                       "--json", "number,isDraft,headRefOid"]))
         except SystemExit:
             watch_log(f"{repo}: could not list PRs; skipping this pass")
-            result = "failed"
+            unlisted.add(repo)
             continue
         for p in prs:
             if (repo, p["number"]) not in skip:
-                result = max(result, watch_pr(repo, p, state, seen, ctx), key=RESULT_RANK)
-    return result
+                outcomes.add(watch_pr(repo, p, state, seen, ctx))
+    return outcomes, unlisted
 
 
 def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
@@ -730,18 +752,24 @@ def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
         state = load_watch_state(dry_run)
         seen = {}
         ctx = watch_setup(dry_run, limit, baseline)
-        watch_repos(set().union(*ctx["installed"].values()), state, seen, ctx)
+        _, unlisted = watch_repos(set().union(*ctx["installed"].values()), state, seen, ctx)
         if not dry_run:
-            save_watch_state(seen)  # keeps only PRs still open
+            if ctx["gaps"]:  # some repos were never looked at, so nothing can be called closed: merge, don't prune
+                state.update(seen)
+                seen = state
+            else:  # keep entries of repos that could not be listed; prune the rest to PRs still open
+                seen.update({k: v for k, v in state.items() if k.split("#", 1)[0] in unlisted and k not in seen})
+            save_watch_state(seen)
         runs = ctx["runs"]
         watch_log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
+    code = 2 if ctx["lookup_failed"] else 0
     if not dry_run:
         qdir, why = checked_queue_dir(QUEUE_DIR)
         if qdir is None:  # the pass itself still ran; only the requeue is refused
             print(f"prbot: not moving deferred events back: {why}. Check PRBOT_QUEUE_DIR.", file=sys.stderr)
             return 2
         requeue_deferred(qdir)
-    return 0
+    return code
 
 # ---------- watch --from-queue: handle PRs named in GitHub event files ----------
 
@@ -933,21 +961,35 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
                 defer(path, "repository lookup failed")
             return 2
         covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
+        complete = not ctx["gaps"]  # only a full inventory of every bot can call a repository unknown
+        failed = 1 if ctx["lookup_failed"] else 0
+        uncovered = 0
+
+        def not_covered(path, repo, label=""):
+            nonlocal uncovered
+            if complete:
+                reject(path, f"{label}{repo}: {repo} is not a repository the bots are installed on")
+            else:
+                uncovered += 1
+                defer(path, f"{label}{repo}: {repo} is not in the bot inventory, which is incomplete")
+
         groups = {}
         for path, (_, repo, n) in events:
             if repo.lower() not in covered:
-                reject(path, f"{repo} is not a repository the bots are installed on")
+                not_covered(path, repo, "event for ")
             else:
                 groups.setdefault((covered[repo.lower()], n), []).append(path)
         sweep_paths, sweep_repos = [], set()  # None in sweep_repos means every covered repository
         for path, (_, repo, _) in sweeps:
             if repo is not None and repo.lower() not in covered:
-                reject(path, f"sweep of {repo}, which is not a repository the bots are installed on")
+                not_covered(path, repo, "sweep of ")
                 continue
             sweep_paths.append(path)
             sweep_repos.add(covered[repo.lower()] if repo is not None else None)
+        if uncovered and not failed:
+            failed = 1  # events can't be placed until the configuration is fixed: say so with the exit code
         state = load_watch_state(dry_run)
-        seen, failed = {}, 0
+        seen = {}
         for (repo, n), paths in groups.items():
             try:
                 p = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json",
@@ -970,19 +1012,24 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
             repos = set(covered.values()) if None in sweep_repos else sweep_repos
             watch_log(f"queue: sweep of {'every covered repository' if None in sweep_repos else ', '.join(sorted(repos))}")
             try:
-                result = watch_repos(repos, state, seen, ctx, skip=set(groups))
+                outcomes, unlisted = watch_repos(repos, state, seen, ctx, skip=set(groups))
             except (SystemExit, Exception) as e:
                 watch_log(f"queue: sweep failed ({e!r})")
-                result = "failed"
-            # retry-delay waits and unavailable bots are owned by the hourly pass, so they don't hold the sweep
-            if result == "limit":  # a review ran this run, so leaving the sweep in place still makes progress
-                watch_log(f"queue: sweep is over this run's limit; leaving it in the queue for the next run")
-            elif result == "failed":
-                failed += 1
+                outcomes, unlisted = {"failed"}, set()
+            # each outcome is checked on its own, so one PR's success or wait can't hide another PR's limit block.
+            # Retry-delay waits and unavailable bots are owned by the hourly pass, so they don't hold the sweep.
+            sweep_failed = "failed" in outcomes or bool(unlisted)
+            if None in sweep_repos and not complete:
+                watch_log("queue: sweep could not reach repositories missing from the incomplete bot inventory")
+                sweep_failed = True
+            failed += sweep_failed
+            if "limit" in outcomes:  # a review ran this run, so leaving the sweep in place still makes progress
+                watch_log("queue: sweep is over this run's limit; leaving it in the queue for the next run")
+            elif sweep_failed:
                 for path in sweep_paths:
-                    defer(path, "sweep failed")
+                    defer(path, "sweep failed or was incomplete")
             else:
-                for path in sweep_paths:
+                for path in sweep_paths:  # only the files listed at the start; a sweep written since waits its turn
                     act("delete", path, "sweep done", path.unlink)
         if not dry_run:
             state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest

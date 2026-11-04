@@ -316,6 +316,45 @@ class Watch(unittest.TestCase):
         self.run_pass(limit=5)  # released: the next pass runs normally
         self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])
 
+    def test_failed_listing_keeps_that_repos_state(self):
+        # Codex review of PR 1: a 502 on one repo's PR list dropped its baseline and retry-delay entries
+        import time
+        prbot.installed_repos = lambda bot: {"o/r", "o/down"}
+        down = {"o/down#7@" + "7" * 10: {"baseline": True}, "o/down#8@" + "8" * 10: {"failed_claude": time.time()}}
+        gone = "o/r#99@" + "9" * 10   # o/r was listed and #99 is no longer open: pruned as before
+        prbot.WATCH_STATE.write_text(json.dumps({**down, gone: {"skipped": "x"}}))
+        real_gh = self.fake_gh
+        def gh(args):
+            if args[:2] == ["pr", "list"] and args[3] == "o/down":
+                prbot.die("gh pr list failed: HTTP 502")
+            return real_gh(args)
+        prbot.gh_read = gh
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            log = self.run_pass(limit=5)
+        self.assertIn("o/down: could not list PRs", log)
+        state = json.loads(prbot.WATCH_STATE.read_text())
+        self.assertEqual({k: state[k] for k in down}, down)
+        self.assertNotIn(gone, state)
+
+    def test_incomplete_inventory_never_prunes_state(self):
+        gone = "o/r#99@" + "9" * 10
+        prbot.WATCH_STATE.write_text(json.dumps({gone: {"skipped": "x"}}))
+        def lookup(bot):
+            if bot == "codex":
+                prbot.die("GitHub GET /app/installations failed: HTTP 502")
+            return {"o/r"}
+        prbot.installed_repos = lookup
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            code = prbot.cmd_watch(limit=5)
+        self.assertEqual(code, 2)
+        self.assertIn("bot inventory is incomplete", out.getvalue())
+        self.assertIn(gone, json.loads(prbot.WATCH_STATE.read_text()))
+        self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])  # the known repos are still reviewed
+
     def test_malformed_state_entries_are_dropped(self):
         # Codex review of PR 1: {"o/r#2@bbbbbbbbbb": null} crashed every full pass at entry.get(...)
         import time
@@ -582,7 +621,8 @@ class WatchQueue(unittest.TestCase):
         self.assertEqual(self.names("deferred"), sorted(names))
         self.assertEqual(self.names("rejected"), ["bad.json"])  # malformed needs no lookup to reject
         self.assertEqual(self.read("deferred", names[1])["attempts"], 1)
-        self.assertIn("could not look up the repositories", log)
+        self.assertIn("could not read where the claude bot is installed", log)
+        self.assertIn("someone/else is not in the bot inventory, which is incomplete", log)
 
     def test_event_is_rejected_after_too_many_attempts(self):
         self.fail_on = {2}
@@ -726,11 +766,109 @@ class WatchQueue(unittest.TestCase):
 
     def test_pr_needing_an_unavailable_bot_is_deferred_not_dropped(self):
         # Codex review of PR 1: with only the codex bot on the repo, a codex-written PR's event was deleted unreviewed
-        prbot.installed_repos = lambda bot: {"o/r"} if bot == "codex" else set()
+        prbot.installed_repos = lambda bot: {"o/r"} if bot == "codex" else {"o/elsewhere"}
         name = self.event(2).name
         code, log = self.run_queue(limit=5)
         self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [], [], [name]))
         self.assertIn("needs a claude review, but the claude bot is not installed on o/r", log)
+        # the claude bot's inventory is empty: same outcome
+        prbot.installed_repos = lambda bot: {"o/r"} if bot == "codex" else set()
+        Path(prbot.queue_sibling(self.queue, "deferred"), name).rename(Path(self.queue, name))
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [], [], [name]))
+        self.assertIn("the claude bot is not registered or its installations are unknown", log)
+
+    def test_incomplete_inventory_defers_instead_of_rejecting(self):
+        # Codex review of PR 1: a missing config or a missing bot inventory made every repo look unknown
+        saved = prbot.load_config
+        try:
+            for case, setup in (("no config", lambda: setattr(prbot, "load_config", lambda: {})),
+                                ("one bot unregistered",
+                                 lambda: setattr(prbot, "load_config", lambda: {"codex": {"slug": "codex-pr-gh"}})),
+                                ("one lookup fails", lambda: setattr(prbot, "installed_repos", self.claude_lookup_fails)),
+                                ("one inventory empty", lambda: setattr(prbot, "installed_repos",
+                                                                         lambda b: set() if b == "claude" else {"o/r"}))):
+                with self.subTest(case=case):
+                    prbot.load_config, prbot.installed_repos = saved, (lambda bot: {"o/r"})
+                    for d in ("deferred", "rejected"):
+                        for p in Path(prbot.queue_sibling(self.queue, d)).glob("*") if prbot.queue_sibling(self.queue, d).is_dir() else []:
+                            p.unlink()
+                    setup()
+                    other = self.event(2, repo="o/maybe").name
+                    sweep = self.sweep("o/maybe", name="sweep-20261103T150000000Z-aaaaaa.json")
+                    code, log = self.run_queue(limit=5)
+                    self.assertEqual(code, 2)
+                    self.assertEqual((self.left(), self.names("rejected")), ([], []))
+                    self.assertEqual(self.names("deferred"), sorted([other, sweep]))
+                    self.assertIn("bot inventory is incomplete", log)
+        finally:
+            prbot.load_config = saved
+        # with every inventory read, the same repo is rejected as unknown
+        prbot.installed_repos = lambda bot: {"o/r"}
+        name = self.event(2, repo="o/maybe").name
+        self.run_queue(limit=5)
+        self.assertEqual(self.names("rejected"), [name])
+
+    @staticmethod
+    def claude_lookup_fails(bot):
+        if bot == "claude":
+            prbot.die("GitHub GET /app/installations failed: HTTP 502")
+        return {"o/r"}
+
+    def test_null_sweep_with_incomplete_inventory_is_deferred_after_its_pass(self):
+        prbot.installed_repos = self.claude_lookup_fails
+        name = self.sweep(None, name="sweep-20261103T150000000Z-bbbbbb.json")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("deferred")), (2, [], [name]))
+        self.assertIn("could not reach repositories missing from the incomplete bot inventory", log)
+
+    def test_sweep_kept_when_any_pr_hit_the_limit(self):
+        # Codex review of PR 1: PR 2 needs an unavailable bot ("later"), PR 3 and PR 5 need reviews and the limit
+        # is 1. The worst-result ranking said "later" and the sweep was deleted with PR 5 never reviewed
+        self.VIEW = {**self.VIEW, 2: PR18, 3: PR15}   # 2 needs codex, 3 and 5 need claude
+        self.reviews = {}
+        prbot.installed_repos = lambda bot: {"o/r"} if bot == "claude" else {"o/elsewhere"}
+        name = self.sweep("o/r", name="sweep-20261103T150000000Z-cccccc.json")
+        code, log = self.run_queue(limit=1)
+        self.assertIn("needs a codex review, but the codex bot is not installed on o/r", log)
+        self.assertEqual(self.runs, [(3, "claude")])
+        self.assertEqual((code, self.left()), (0, [name]))
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [(3, "claude"), (5, "claude")], []))
+
+    def test_sweep_with_an_unlistable_repo_is_deferred_and_keeps_its_state(self):
+        prbot.installed_repos = lambda bot: {"o/r", "o/down"}
+        kept = {"o/down#7@" + "7" * 10: {"baseline": True}}
+        prbot.WATCH_STATE.write_text(json.dumps(kept))
+        real_gh = prbot.gh_read
+        def gh(args):
+            if args[:2] == ["pr", "list"] and args[3] == "o/down":
+                prbot.die("gh pr list failed: HTTP 502")
+            return real_gh(args)
+        prbot.gh_read = gh
+        name = self.sweep(None, name="sweep-20261103T150000000Z-dddddd.json")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("deferred")), (2, [], [name]))
+        self.assertEqual(json.loads(prbot.WATCH_STATE.read_text())["o/down#7@" + "7" * 10], {"baseline": True})
+
+    def test_unique_sweeps_are_claimed_and_a_new_one_survives(self):
+        # the router names sweeps sweep-<UTC>-<hex>.json; a run deletes only the ones it listed at the start
+        first = self.sweep("o/r", name="sweep-20261103T150000000Z-3fa9c1.json")
+        second = self.sweep(None, name="sweep-20261103T150001000Z-0b12de.json")
+        late = "sweep-20261103T150002000Z-77aa01.json"
+        real_gh = prbot.gh_read
+        def gh_and_new_sweep(args):
+            if args[:2] == ["pr", "list"] and not Path(self.queue, late).exists():
+                self.sweep(None, name=late)  # the router publishes a new sweep while the pass runs
+            return real_gh(args)
+        prbot.gh_read = gh_and_new_sweep
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left()), (0, [late]))
+        self.assertIn("queue: delete " + first, log)
+        self.assertIn("queue: delete " + second, log)
+        prbot.gh_read = real_gh
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left()), (0, []))
 
     def test_deferral_moves_the_event_before_rewriting_it(self):
         # Codex review of PR 1: writing the copy first and unlinking after could leave the event in two places

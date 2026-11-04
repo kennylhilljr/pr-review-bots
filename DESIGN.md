@@ -166,11 +166,18 @@ check, `prbot watch --from-queue .` in a checkout would move `.git` and the
 sources into a `-rejected` directory.
 
 When the router sees GitHub activity it can't pin to one PR, it writes a
-single `sweep.json` naming a repository, or null for all of them. A queue run
-handles it after the PR events by running the full pass's loop over those
-repositories. A sweep that hits the limit stays in the queue; a review ran in
-that run, and each review either posts or records a failure, so the next run
-starts further along. The two jobs can overlap, so every watch run
+uniquely named sweep file naming a repository, or null for all of them. A
+queue run handles the sweeps it listed at the start after the PR events, by
+running the full pass's loop over those repositories. The loop reports each
+kind of PR outcome separately, so a sweep stays in the queue whenever any PR
+hit the limit; a review ran in that run, and each review either posts or
+records a failure, so the next run starts further along.
+
+The bots' installation lists decide which repositories are covered. An empty
+or unreadable list for either bot makes the inventory incomplete. A
+repository missing from an incomplete inventory may belong to the missing
+bot, so its events are deferred, not rejected, and the full pass keeps all
+state rather than pruning entries for repositories it never looked at. The two jobs can overlap, so every watch run
 takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
 when another run holds it.
 
