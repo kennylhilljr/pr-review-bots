@@ -177,10 +177,11 @@ How a queue run treats the files:
 - When a review fails, times out, or waits out the one-hour retry delay, the PR's files move to `DIR-deferred`, each rewritten with its `attempts` field raised by 1. After 24 attempts a file goes to `DIR-rejected` instead. A failure makes the run exit 2, and the other PRs in the same run still go ahead. If the lookup of the bots' repositories fails, every event file is deferred and the run exits 2.
 - The hourly `prbot watch` moves every file in the deferred directory back into the queue after its pass, so the queue job checks those PRs again. It finds the queue through `PRBOT_QUEUE_DIR`, default `~/.local/state/github-events/prbot`.
 - Files that are not JSON, are not `pull_request` events, lack a valid `repo` and `number`, or name a repository the bots are not installed on are logged and moved to `DIR-rejected`, and so is every other entry: dotfiles such as `.DS_Store`, names not ending in `.json`, directories and symlinks. Nothing cleans `DIR-rejected`; empty it by hand now and then.
+- A file that is not valid JSON is left alone for its first 30 seconds, in case it is still being written, and rejected only if it is still unparsable after that. launchd's 60-second `ThrottleInterval` means the next run finds it settled.
 - A missing or empty directory exits 0 without output.
 - `--dry-run` moves and deletes nothing and saves no state; `--limit` and `--baseline` work as in a full pass.
 
-Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`. To see what a pass would do without posting, run `prbot watch --dry-run`. To start from now and skip the commits already open, run `prbot watch --baseline` once before installing the job. To remove the 5-minute job, run `install-watch.sh --uninstall`.
+Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`, always written through a temp file and a rename; a damaged state file is moved to `watch-state.json.corrupt-<UTC time>`, logged, and replaced by an empty state. To see what a pass would do without posting, run `prbot watch --dry-run`. To start from now and skip the commits already open, run `prbot watch --baseline` once before installing the job. To remove the 5-minute job, run `install-watch.sh --uninstall`.
 
 ## Make agents use the bots
 

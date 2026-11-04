@@ -150,7 +150,12 @@ already looked at those PRs, so the queue job's recheck finds the reviewed
 commit and costs only GitHub reads. Entries that can never succeed (bad JSON,
 other event kinds, repositories the bots don't cover, stray files such as
 `.DS_Store`, and events deferred 24 times) move to `prbot-rejected/` and stay
-there as evidence until someone clears it. The two jobs can overlap, so every watch run
+there as evidence until someone clears it. The router publishes by renaming a
+finished file into the queue, but a file that is not valid JSON still gets 30
+seconds to settle before it is rejected, in case some other writer is
+mid-write. The state file is written through a temp file and `os.replace`,
+and a damaged one is moved aside with a timestamp rather than crashing every
+run. The two jobs can overlap, so every watch run
 takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
 when another run holds it.
 

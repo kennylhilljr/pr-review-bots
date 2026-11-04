@@ -132,8 +132,21 @@ def load_config():
 
 
 def save_config(cfg):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    write_json_atomic(CONFIG, cfg)
+
+
+def write_json_atomic(path, data, indent=2):
+    """Write JSON through a temp file in the same directory and a rename, so a crash or a full disk never leaves
+    a half-written file. The temp name starts with a dot and ends in .tmp, so queue readers skip it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=indent) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def bot_config(bot):
@@ -475,6 +488,30 @@ RETRY_AFTER = 3600       # seconds before retrying a reviewer that failed (usage
 REVIEWED = re.compile(r"Reviewed commit `([0-9a-f]{7,40})`")
 
 
+def load_watch_state(dry_run=False):
+    """The watch state, or {} when there is none. A damaged file (bad JSON or not an object) is renamed to
+    watch-state.json.corrupt-<UTC time> and logged, so it can't crash every later run. A dry run only logs it."""
+    if not WATCH_STATE.exists():
+        return {}
+    try:
+        state = json.loads(WATCH_STATE.read_text())
+        if isinstance(state, dict):
+            return state
+    except ValueError:
+        pass
+    if dry_run:
+        watch_log("watch state is damaged; a real run will move it aside and start with an empty state")
+        return {}
+    bad = WATCH_STATE.with_name(f"{WATCH_STATE.name}.corrupt-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
+    os.replace(WATCH_STATE, bad)
+    watch_log(f"watch state was damaged; moved it to {bad} and starting with an empty state")
+    return {}
+
+
+def save_watch_state(state):
+    write_json_atomic(WATCH_STATE, state, indent=1)
+
+
 def installed_repos(bot):
     """owner/name of every repository the bot's App is installed on."""
     cfg = bot_config(bot)
@@ -606,7 +643,7 @@ def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
         watch_log("another watch run holds the lock; skipping this pass")
         return 0
     with lock:
-        state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
+        state = load_watch_state(dry_run)
         seen = {}
         ctx = watch_setup(dry_run, limit, baseline)
         for repo in sorted(set().union(*ctx["installed"].values())):
@@ -619,8 +656,7 @@ def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
             for p in prs:
                 watch_pr(repo, p, state, seen, ctx)
         if not dry_run:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            WATCH_STATE.write_text(json.dumps(seen, indent=1) + "\n")  # keeps only PRs still open
+            save_watch_state(seen)  # keeps only PRs still open
         runs = ctx["runs"]
         watch_log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
     if not dry_run:
@@ -632,6 +668,7 @@ def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
 REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 QUEUE_DIR = Path(os.environ.get("PRBOT_QUEUE_DIR", Path.home() / ".local/state/github-events/prbot"))
 MAX_ATTEMPTS = 24        # deferrals before an event file is given up on and rejected
+QUEUE_SETTLE = 30        # seconds an unparsable event file is left alone in case it is still being written
 
 
 def queue_sibling(qdir, kind):
@@ -667,14 +704,7 @@ def move_into(path, dest, data=None):
     if data is None:
         os.replace(path, target)
         return target
-    fd, tmp = tempfile.mkstemp(dir=dest, prefix=".", suffix=".tmp")  # a dotfile, so a requeue never picks it up
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(data, indent=1) + "\n")
-        os.replace(tmp, target)
-    except BaseException:
-        os.unlink(tmp)
-        raise
+    write_json_atomic(target, data, indent=1)
     path.unlink()
     return target
 
@@ -689,12 +719,9 @@ def requeue_deferred(qdir):
 
 
 def parse_queue_event(path):
-    """(repo, number) from one event file, or None when the file can never be handled: not JSON, not a
-    pull_request event, or no valid repo and number."""
-    try:
-        ev = json.loads(path.read_text())
-    except ValueError:
-        return None
+    """(repo, number) from one event file, or None when it is JSON but not a pull_request event with a valid repo
+    and number. Raises ValueError when the file is not JSON at all, which may mean it is still being written."""
+    ev = json.loads(path.read_text())
     if not isinstance(ev, dict) or ev.get("kind") != "pull_request":
         return None
     repo, n = ev.get("repo"), ev.get("number")
@@ -754,6 +781,16 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
                 ev = parse_queue_event(path)
             except FileNotFoundError:
                 continue
+            except ValueError:
+                try:
+                    age = time.time() - path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age < QUEUE_SETTLE:  # may still be mid-write; ThrottleInterval (60s) brings the next run after it settles
+                    watch_log(f"queue: leaving {path.name} for now: not valid JSON yet, written {age:.0f}s ago")
+                    continue
+                reject(path, f"not valid JSON after {age:.0f}s")
+                continue
             if ev is None:
                 reject(path, "not a pull_request event with a valid repo and number")
             else:
@@ -775,7 +812,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
                 reject(path, f"{repo} is not a repository the bots are installed on")
             else:
                 groups.setdefault((covered[repo.lower()], n), []).append(path)
-        state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
+        state = load_watch_state(dry_run)
         seen, failed = {}, 0
         for (repo, n), paths in groups.items():
             try:
@@ -797,8 +834,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
             failed += result == "failed"
         if not dry_run:
             state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            WATCH_STATE.write_text(json.dumps(state, indent=1) + "\n")
+            save_watch_state(state)
         runs = ctx["runs"]
         watch_log(f"queue done: {len(groups)} PR{'s' if len(groups) != 1 else ''}, {runs} review"
                   f"{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}, {failed} failed")

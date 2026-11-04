@@ -15,7 +15,7 @@ launchd restarts the queue job for as long as anything is in the queue directory
 | --- | --- |
 | `prbot/` | New event files, and files of PRs waiting only on the per-run limit, left untouched. A PR's files are deleted once nothing is left to do on it. |
 | `prbot-deferred/` | Event files for PRs whose review failed, timed out, or waits out the one-hour retry delay, and every event file when the lookup of the bots' repositories fails. Each move adds 1 to an `attempts` field in the file. The hourly pass moves them back into `prbot/` after it finishes. |
-| `prbot-rejected/` | Anything that can never be handled: bad JSON, events that are not `pull_request`, repositories the bots don't cover, dotfiles such as `.DS_Store`, other file names, directories and symlinks, and events deferred 24 times. Kept as evidence; nothing reads or removes them, so clear this directory by hand now and then. |
+| `prbot-rejected/` | Anything that can never be handled: bad JSON (after 30 seconds, in case it was still being written), events that are not `pull_request`, repositories the bots don't cover, dotfiles such as `.DS_Store`, other file names, directories and symlinks, and events deferred 24 times. Kept as evidence; nothing reads or removes them, so clear this directory by hand now and then. |
 
 The hourly pass finds the queue directory through `PRBOT_QUEUE_DIR`, which defaults to `~/.local/state/github-events/prbot`. If you point the queue job at another directory, set `PRBOT_QUEUE_DIR` to the same path in the backstop plist.
 

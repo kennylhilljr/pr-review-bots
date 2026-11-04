@@ -399,6 +399,81 @@ class WatchQueue(unittest.TestCase):
     def read(self, kind, name):
         return json.loads(Path(prbot.queue_sibling(self.queue, kind), name).read_text())
 
+    def age(self, path, text, seconds=prbot.QUEUE_SETTLE + 1):
+        """Write path and backdate its mtime, as if the producer finished with it that long ago."""
+        path.write_text(text)
+        t = path.stat().st_mtime - seconds
+        os.utime(path, (t, t))
+        return path
+
+    def test_unparsable_event_waits_while_young_then_is_rejected(self):
+        # Codex review of PR 1: a file read mid-write must not be rejected before its producer finishes
+        young = Path(self.queue, "20261103T141502123Z-young.json")
+        young.write_text('{"repo": "o/r", "kind": "pull_re')
+        before = young.read_text()
+        prbot.installed_repos = lambda bot: (_ for _ in ()).throw(AssertionError("no GitHub call for a young file"))
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("rejected")), (0, [young.name], []))
+        self.assertEqual(young.read_text(), before)
+        self.assertIn("leaving 20261103T141502123Z-young.json for now: not valid JSON yet", log)
+        # the producer finishes the write: the event is handled normally
+        young.write_text(json.dumps({"repo": "o/r", "kind": "pull_request", "number": 2}))
+        prbot.installed_repos = lambda bot: {"o/r"}
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude")], []))
+        # a file still unparsable after the settle time is rejected, so it can't relaunch the job for long
+        old = self.age(Path(self.queue, "20261103T141503123Z-old.json"), '{"repo": "o/r"')
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("rejected")), (0, [], [old.name]))
+        self.assertIn(f"{old.name}: not valid JSON after", log)
+
+    def test_damaged_watch_state_is_moved_aside(self):
+        # Codex review of PR 1: a truncated state file crashed every queue run and every hourly pass
+        for damaged in ('{"o/r#2":', "[1, 2]"):
+            with self.subTest(damaged=damaged):
+                for p in self.tmp_files("watch-state.json.corrupt-"):
+                    p.unlink()
+                prbot.WATCH_STATE.write_text(damaged)
+                self.event(5)
+                code, log = self.run_queue(limit=5)
+                self.assertEqual((code, self.left()), (0, []))
+                self.assertIn("watch state was damaged; moved it to", log)
+                corrupt = self.tmp_files("watch-state.json.corrupt-")
+                self.assertEqual(len(corrupt), 1)
+                self.assertRegex(corrupt[0].name, r"^watch-state\.json\.corrupt-\d{8}T\d{6}Z$")
+                self.assertEqual(corrupt[0].read_text(), damaged)
+                self.assertIsInstance(json.loads(prbot.WATCH_STATE.read_text()), dict)
+        prbot.WATCH_STATE.write_text('{"o/r#2":')  # the hourly pass recovers the same way
+        log = Watch.run_pass(self, limit=5)
+        self.assertIn("watch state was damaged", log)
+        self.assertIn("pass done", log)
+
+    def tmp_files(self, prefix):
+        return sorted(p for p in Path(self.tmp.name).iterdir() if p.name.startswith(prefix))
+
+    def test_state_and_config_writes_never_leave_a_partial_file(self):
+        prbot.WATCH_STATE.write_text(json.dumps({"keep": {}}))
+        real_replace = os.replace
+        def crash(src, dst):
+            raise OSError("disk full")
+        os.replace = crash
+        try:
+            with self.assertRaises(OSError):
+                prbot.save_watch_state({"new": {"x": 1}})
+        finally:
+            os.replace = real_replace
+        self.assertEqual(json.loads(prbot.WATCH_STATE.read_text()), {"keep": {}})
+        self.assertEqual([p.name for p in Path(self.tmp.name).iterdir() if p.name.endswith(".tmp")], [])
+        saved = (prbot.CONFIG, prbot.CONFIG_DIR)
+        prbot.CONFIG_DIR = Path(self.tmp.name, "cfg")
+        prbot.CONFIG = prbot.CONFIG_DIR / "config.json"
+        try:
+            prbot.save_config({"claude": {"slug": "claude-pr-gh"}})
+            self.assertEqual(json.loads(prbot.CONFIG.read_text()), {"claude": {"slug": "claude-pr-gh"}})
+            self.assertEqual(sorted(p.name for p in prbot.CONFIG_DIR.iterdir()), ["config.json"])
+        finally:
+            prbot.CONFIG, prbot.CONFIG_DIR = saved
+
     def test_side_directories_sit_next_to_the_queue_not_inside_it(self):
         for kind in ("deferred", "rejected"):
             d = prbot.queue_sibling(self.queue, kind)
@@ -467,7 +542,7 @@ class WatchQueue(unittest.TestCase):
 
     def test_repository_lookup_failure_defers_everything(self):
         names = [self.event(2).name, self.event(2, repo="someone/else").name]
-        Path(self.queue, "bad.json").write_text("{oops")
+        self.age(Path(self.queue, "bad.json"), "{oops")
         def lookup_fails(bot):
             prbot.die("GitHub GET /app/installations failed: HTTP 502")
         prbot.installed_repos = lookup_fails
@@ -493,12 +568,14 @@ class WatchQueue(unittest.TestCase):
                "bool-number.json": json.dumps({"repo": "o/r", "kind": "pull_request", "number": True}),
                "bad-repo.json": json.dumps({"repo": "o", "kind": "pull_request", "number": 2})}
         for name, text in bad.items():
-            Path(self.queue, name).write_text(text)
+            self.age(Path(self.queue, name), text)
         code, log = self.run_queue(limit=5)
         self.assertEqual((code, self.runs, self.left(), self.names("rejected")), (0, [], [], sorted(bad)))
         self.assertEqual(self.read("rejected", "list.json"), [1, 2])  # kept unchanged as evidence
+        self.assertIn("not-json.json: not valid JSON after", log)
         for name in bad:
-            self.assertIn(f"{name}: not a pull_request event", log)
+            if name != "not-json.json":
+                self.assertIn(f"{name}: not a pull_request event", log)
 
     def test_events_for_repos_the_bots_do_not_cover_are_rejected(self):
         name = self.event(2, repo="someone/else").name
