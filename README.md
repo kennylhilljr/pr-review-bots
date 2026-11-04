@@ -163,7 +163,7 @@ How a pass behaves:
 
 - It finds earlier reviews from the "Reviewed commit" line in each bot review, so it never reviews the same commit twice, even after a restart.
 - It runs at most 3 reviews per pass; the rest wait for the next pass.
-- A PR it can't attribute is skipped and logged once, with the command to review it by hand.
+- A PR it can't attribute is skipped and logged once, with the command to review it by hand. Its labels are read again on every run, so adding `agent:claude` or `agent:codex` later starts the review without a new commit.
 - A review that fails, for example on a usage limit, is retried an hour later.
 - A review that runs longer than 900 seconds is stopped, along with every process it started, and counts as failed, so one stuck reviewer cannot hold up the PRs behind it. Set `PRBOT_REVIEW_TIMEOUT` (seconds) to change the limit.
 - Only one watch run works at a time. A run that finds the lock (`~/.config/prbot/watch.lock`) taken logs that and exits 0.
@@ -172,10 +172,12 @@ How a queue run treats the files:
 
 - Several events for the same PR are handled as one, oldest file first.
 - A PR's files are deleted once nothing is left to do on its head commit: it was reviewed, already had a review of that commit, is closed, merged or a draft, or can't be attributed.
-- Files are kept when a review fails, waits for the retry delay, or waits on the per-run limit. A failure makes the run exit 2; the other PRs in the same run still go ahead.
-- Files that are not JSON, are not `pull_request` events, lack a valid `repo` and `number`, or name a repository the bots are not installed on are logged and deleted. They can never succeed, and launchd restarts the job for as long as any file remains.
-- Dotfiles and files not ending in `.json` are ignored. A missing or empty directory exits 0 without output.
-- `--dry-run` deletes nothing and saves no state; `--limit` and `--baseline` work as in a full pass.
+- launchd restarts the queue job for as long as anything is in the queue directory, so nothing stays there. Two side directories sit next to it, outside it: for `DIR` they are `DIR-deferred` and `DIR-rejected` (for example `~/.local/state/github-events/prbot-deferred/`).
+- When a review fails, times out, waits for the retry delay, or waits on the per-run limit, the PR's files move to `DIR-deferred`, each rewritten with its `attempts` field raised by 1. After 24 attempts a file goes to `DIR-rejected` instead. A failure makes the run exit 2; waiting on the limit does not. The other PRs in the same run still go ahead.
+- The hourly `prbot watch` moves every file in the deferred directory back into the queue after its pass, so the queue job checks those PRs again. It finds the queue through `PRBOT_QUEUE_DIR`, default `~/.local/state/github-events/prbot`.
+- Files that are not JSON, are not `pull_request` events, lack a valid `repo` and `number`, or name a repository the bots are not installed on are logged and moved to `DIR-rejected`, and so is every other entry: dotfiles such as `.DS_Store`, names not ending in `.json`, directories and symlinks. Nothing cleans `DIR-rejected`; empty it by hand now and then.
+- A missing or empty directory exits 0 without output.
+- `--dry-run` moves and deletes nothing and saves no state; `--limit` and `--baseline` work as in a full pass.
 
 Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`. To see what a pass would do without posting, run `prbot watch --dry-run`. To start from now and skip the commits already open, run `prbot watch --baseline` once before installing the job. To remove the 5-minute job, run `install-watch.sh --uninstall`.
 

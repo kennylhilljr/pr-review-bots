@@ -126,8 +126,8 @@ installed on, and reviews each new head commit once with the agent the routing
 rules pick. Whether a commit was already reviewed comes from the
 "Reviewed commit" footer in the bots' own reviews, so a lost state file never
 causes duplicate reviews. The state file only remembers PRs it skipped as
-unclear (so they are logged once) and reviewers that failed (retried after an
-hour). A pass runs at most 3 reviews, so a backlog of open PRs cannot start a
+unclear (so they are logged once; their labels are still read on every run)
+and reviewers that failed (retried after an hour). A pass runs at most 3 reviews, so a backlog of open PRs cannot start a
 burst of model runs. `--baseline` marks the commits open at install time as
 seen, for starting from now instead of reviewing old PRs.
 
@@ -137,11 +137,18 @@ JSON file per PR event into `~/.local/state/github-events/prbot/`, and a
 launchd job with `QueueDirectories` runs `prbot watch --from-queue` on that
 directory. A queue run makes the same per-PR decision as a full pass, through
 the same function, for only the PRs named in the files. The full pass stays as
-an hourly backstop for events that never arrive. A PR's files are removed only
-once nothing is left to do on it, so a failed review is retried on a later
-run. Files that can never succeed (bad JSON, other event kinds, repositories
-the bots don't cover) are deleted, because launchd keeps restarting the job
-while the directory has files. The two jobs can overlap, so every watch run
+an hourly backstop for events that never arrive.
+
+launchd keeps restarting a `QueueDirectories` job while the directory has
+any entry in it, so a queue run always leaves the directory empty. A PR's
+files are deleted once nothing is left to do on it. When its review fails or
+has to wait, the files move to a sibling `prbot-deferred/` with an `attempts`
+count, and the hourly pass moves them back after it finishes; the pass has
+already looked at those PRs, so the queue job's recheck finds the reviewed
+commit and costs only GitHub reads. Entries that can never succeed (bad JSON,
+other event kinds, repositories the bots don't cover, stray files such as
+`.DS_Store`, and events deferred 24 times) move to `prbot-rejected/` and stay
+there as evidence until someone clears it. The two jobs can overlap, so every watch run
 takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
 when another run holds it.
 

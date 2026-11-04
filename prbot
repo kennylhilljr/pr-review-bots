@@ -548,17 +548,20 @@ def watch_pr(repo, p, state, seen, ctx):
         entry["baseline"] = True
         log(f"{key}: marked as seen; it will not be reviewed unless new commits arrive")
         return "done"
-    if entry.get("skipped") or entry.get("baseline"):
+    if entry.get("baseline"):
         return "done"
     try:
+        # labels are read even for a PR skipped before: a label added later, on the same commit, starts its review
         pr = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json", "labels,commits"]))
         author, why = detect_author(pr)
         reviewers, _ = choose_reviewers(author, [l["name"] for l in pr["labels"]])
         if not reviewers:
+            if not entry.get("skipped"):  # the marker only keeps this line from repeating every pass
+                log(f"{key}: skipped, can't tell who wrote it ({why}). Label it agent:claude or "
+                    f"agent:codex, or run: prbot review {n} -R {repo} --reviewer claude|codex|both")
             entry["skipped"] = why
-            log(f"{key}: skipped, can't tell who wrote it ({why}). Label it agent:claude or "
-                f"agent:codex, or run: prbot review {n} -R {repo} --reviewer claude|codex|both")
             return "done"
+        entry.pop("skipped", None)
         todo = [r for r in reviewers if r not in reviewed_by(repo, n, sha, ctx["slugs"])]
     except SystemExit:
         log(f"{key}: could not read the PR; will retry")
@@ -620,21 +623,69 @@ def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
             WATCH_STATE.write_text(json.dumps(seen, indent=1) + "\n")  # keeps only PRs still open
         runs = ctx["runs"]
         watch_log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
+    if not dry_run:
+        requeue_deferred(QUEUE_DIR)
     return 0
 
 # ---------- watch --from-queue: handle PRs named in GitHub event files ----------
 
 REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+QUEUE_DIR = Path(os.environ.get("PRBOT_QUEUE_DIR", Path.home() / ".local/state/github-events/prbot"))
+MAX_ATTEMPTS = 24        # deferrals before an event file is given up on and rejected
 
 
-def queue_files(qdir):
-    """Event files in qdir, oldest first. Names start with a UTC timestamp, so name order is arrival order.
-    Dotfiles and anything not ending in .json are left alone; a missing directory has no files."""
+def queue_sibling(qdir, kind):
+    """<parent>/<name>-deferred or -rejected. Outside the queue directory, so launchd does not see them."""
+    return qdir.parent / f"{qdir.name}-{kind}"
+
+
+def queue_entries(qdir):
+    """(event files, unsupported entries) in qdir, oldest first; names start with a UTC timestamp, so name order
+    is arrival order. Event files are regular .json files whose name does not start with a dot; anything else
+    (dotfiles, other names, directories, symlinks) is unsupported. A missing directory has neither."""
     try:
         names = sorted(os.listdir(qdir))
     except (FileNotFoundError, NotADirectoryError):
-        return []
-    return [qdir / n for n in names if n.endswith(".json") and not n.startswith(".") and (qdir / n).is_file()]
+        return [], []
+    files, other = [], []
+    for n in names:
+        p = qdir / n
+        ok = n.endswith(".json") and not n.startswith(".") and not p.is_symlink() and p.is_file()
+        (files if ok else other).append(p)
+    return files, other
+
+
+def move_into(path, dest, data=None):
+    """Move path into directory dest, adding -1, -2... to the name on a collision. With data, the file is
+    rewritten as that JSON instead, through a temp file in dest and an atomic rename."""
+    dest.mkdir(parents=True, exist_ok=True)
+    stem, suffix = (path.stem, path.suffix) if path.suffix == ".json" else (path.name, "")
+    target, i = dest / path.name, 0
+    while os.path.lexists(target):
+        i += 1
+        target = dest / f"{stem}-{i}{suffix}"
+    if data is None:
+        os.replace(path, target)
+        return target
+    fd, tmp = tempfile.mkstemp(dir=dest, prefix=".", suffix=".tmp")  # a dotfile, so a requeue never picks it up
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=1) + "\n")
+        os.replace(tmp, target)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    path.unlink()
+    return target
+
+
+def requeue_deferred(qdir):
+    """Move every deferred event file back into the queue, so the queue job checks those PRs again."""
+    files = queue_entries(queue_sibling(qdir, "deferred"))[0]
+    for p in files:
+        move_into(p, qdir)
+    if files:
+        watch_log(f"queue: moved {len(files)} deferred event file{'s' if len(files) != 1 else ''} back to {qdir}")
 
 
 def parse_queue_event(path):
@@ -655,39 +706,61 @@ def parse_queue_event(path):
 
 
 def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
-    """Handle each PR named in the event queue once, with the same decisions as a full pass. A PR's files are
-    deleted when nothing is left to do on it, and kept for the next run when a review waits or fails. Files that
-    can never be handled are deleted, since launchd relaunches the job for as long as the directory has files.
-    Returns 2 if any PR failed."""
-    if not queue_files(qdir):
+    """Handle each PR named in the event queue once, with the same decisions as a full pass. launchd relaunches
+    the job for as long as the directory has anything in it, so every entry leaves it: a PR's files are deleted
+    when nothing is left to do on it, moved to <queue>-deferred (with an attempts count) when a review waits or
+    fails, and anything that can never be handled is moved to <queue>-rejected. The hourly full pass moves the
+    deferred files back. Returns 2 if any PR failed."""
+    if not any(queue_entries(qdir)):
         return 0
     lock = watch_lock()
     if lock is None:
         watch_log("another watch run holds the lock; leaving the queue for the next run")
         return 0
+    rejected, deferred = queue_sibling(qdir, "rejected"), queue_sibling(qdir, "deferred")
 
-    def delete(paths, why):
-        for path in paths:
-            watch_log(f"queue: {'would delete' if dry_run else 'deleting'} {path.name}: {why}")
-            if not dry_run:
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+    def act(verb, path, why, fn):
+        watch_log(f"queue: {'would ' + verb if dry_run else verb} {path.name}: {why}")
+        if not dry_run:
+            try:
+                fn()
+            except FileNotFoundError:
+                pass
+
+    def reject(path, why):
+        act(f"move to {rejected}", path, why, lambda: move_into(path, rejected))
+
+    def defer(path, why):
+        try:
+            ev = json.loads(path.read_text())
+        except FileNotFoundError:
+            return
+        attempts = ev.get("attempts", 0)
+        ev["attempts"] = (attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0) + 1
+        if ev["attempts"] >= MAX_ATTEMPTS:
+            act(f"move to {rejected}", path, f"{why}; giving up after {ev['attempts']} attempts",
+                lambda: move_into(path, rejected, ev))
+        else:
+            act(f"move to {deferred}", path, f"{why}; attempt {ev['attempts']}", lambda: move_into(path, deferred, ev))
 
     with lock:
+        files, unsupported = queue_entries(qdir)
+        for path in unsupported:
+            reject(path, "not an event file")
+        if not files:
+            return 0
         ctx = watch_setup(dry_run, limit, baseline)
         covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
         groups = {}
-        for path in queue_files(qdir):
+        for path in files:
             try:
                 ev = parse_queue_event(path)
             except FileNotFoundError:
                 continue
             if ev is None:
-                delete([path], "not a pull_request event with a valid repo and number")
+                reject(path, "not a pull_request event with a valid repo and number")
             elif ev[0].lower() not in covered:
-                delete([path], f"{ev[0]} is not a repository the bots are installed on")
+                reject(path, f"{ev[0]} is not a repository the bots are installed on")
             else:
                 groups.setdefault((covered[ev[0].lower()], ev[1]), []).append(path)
         state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
@@ -700,12 +773,12 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
             except (SystemExit, Exception) as e:
                 watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
                 result = "failed"
-            if result == "done":
-                delete(paths, f"{repo}#{n} handled")
-            else:
-                failed += result == "failed"
-                watch_log(f"{repo}#{n}: {'failed' if result == 'failed' else 'waiting'}; "
-                          f"keeping {len(paths)} queue file{'s' if len(paths) != 1 else ''} for the next run")
+            for path in paths:
+                if result == "done":
+                    act("delete", path, f"{repo}#{n} handled", path.unlink)
+                else:
+                    defer(path, f"{repo}#{n} {'failed' if result == 'failed' else 'waits'}")
+            failed += result == "failed"
         if not dry_run:
             state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
