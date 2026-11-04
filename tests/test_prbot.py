@@ -296,6 +296,216 @@ class Watch(unittest.TestCase):
         self.assertIn("would run a claude review", log)
         self.assertFalse(prbot.WATCH_STATE.exists())
 
+    def test_full_pass_still_prunes_state_to_open_prs(self):
+        prbot.WATCH_STATE.write_text(json.dumps({"o/r#99@" + "0" * 10: {"skipped": "closed long ago"}}))
+        self.run_pass(limit=5)
+        state = json.loads(prbot.WATCH_STATE.read_text())
+        self.assertNotIn("o/r#99@" + "0" * 10, state)
+        self.assertIn("o/r#4@" + "d" * 10, state)
+
+    def test_full_pass_skips_while_another_run_holds_the_lock(self):
+        import fcntl
+        with open(prbot.WATCH_STATE.with_name("watch.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            log = self.run_pass(limit=5)
+        self.assertEqual(self.runs, [])
+        self.assertIn("another watch run holds the lock", log)
+        self.run_pass(limit=5)  # released: the next pass runs normally
+        self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])
+
+
+class WatchQueue(unittest.TestCase):
+    """watch --from-queue over the same fake repo as Watch, plus PR 6 (closed) and PR 9 (unreadable)."""
+    SHA, VIEW = Watch.SHA, Watch.VIEW
+    tearDown = Watch.tearDown
+    CLOSED = {6}
+
+    def setUp(self):
+        Watch.setUp(self)
+        self.queue = Path(self.tmp.name, "queue")
+        self.queue.mkdir()
+        self.fail_on, self.seq = set(), 0
+
+        def fake_review(n, repo, mode, only):
+            self.runs.append((int(n), only[0]))
+            if int(n) in self.fail_on:
+                raise SystemExit(2)
+        prbot.cmd_review = fake_review
+
+    def fake_gh(self, args):
+        if args[:2] == ["pr", "view"] and "state" in args[-1]:
+            n = int(args[2])
+            if n == 9:
+                prbot.die("gh pr view 9 failed: HTTP 502")
+            return json.dumps({"number": n, "state": "CLOSED" if n in self.CLOSED else "OPEN",
+                               "isDraft": n == 1, "headRefOid": self.SHA.get(n, "6" * 40)})
+        return Watch.fake_gh(self, args)
+
+    def event(self, number, event="opened", repo="o/r", **extra):
+        self.seq += 1
+        name = f"20261103T1415{self.seq:02d}123Z-1730643302_12345{self.seq}-{repo.replace('/', '__')}-pull_request-{number}-{event}.json"
+        body = {"repo": repo, "kind": "pull_request", "number": number, "event": event,
+                "received_at": "2026-11-03T14:15:02.123Z", "slack_message_id": "1730643302.123456",
+                "slack_channel": "C0CEMPH1L0N", "source": "github-event-router", "version": 1, **extra}
+        path = self.queue / name
+        path.write_text(json.dumps(body))
+        return path
+
+    def run_queue(self, **kw):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = prbot.cmd_watch(queue=str(self.queue), **kw)
+        return code, out.getvalue()
+
+    def left(self):
+        return sorted(p.name for p in self.queue.iterdir())
+
+    def test_each_pr_is_handled_once_and_its_files_deleted(self):
+        self.event(2, "opened")
+        self.event(5, "opened")
+        self.event(2, "synchronize")
+        self.event(2, "comment")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.runs, [(2, "claude"), (5, "claude")])  # oldest first, PR 2 once despite 3 events
+        self.assertEqual(self.left(), [])
+        self.assertIn("queue done: 2 PRs, 2 reviews run, 0 failed", log)
+
+    def test_files_are_deleted_when_there_is_nothing_to_do(self):
+        # 1 is a draft, 3 already has a codex review of its head commit, 4 can't be attributed, 6 is closed
+        for n in (1, 3, 4, 6):
+            self.event(n, "closed" if n == 6 else "unknown")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [], []))
+        self.assertIn("o/r#4@dddddddddd: skipped, can't tell who wrote it", log)
+
+    def test_failed_pr_keeps_its_files_and_the_rest_go_on(self):
+        prbot.WATCH_STATE.write_text(json.dumps({"other/repo#1@" + "1" * 10: {"skipped": "x"}}))
+        self.fail_on = {2}
+        keep = [self.event(2).name, self.event(9).name]
+        self.event(5)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.runs, [(2, "claude"), (5, "claude")])
+        self.assertEqual(self.left(), sorted(keep))
+        self.assertIn("o/r#9: could not handle the PR", log)
+        state = json.loads(prbot.WATCH_STATE.read_text())
+        self.assertIn("failed_claude", state["o/r#2@" + "b" * 10])
+        self.assertIn("other/repo#1@" + "1" * 10, state)  # a queue run keeps state for PRs it did not visit
+        # within the retry delay PR 2 waits without a model run; its file stays, and this is not a new failure
+        Path(self.queue, keep[1]).unlink()
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, len(self.runs), self.left()), (0, 2, [keep[0]]))
+
+    def test_review_over_the_limit_keeps_its_file_for_the_next_run(self):
+        self.event(2)
+        wait = self.event(5).name
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude")], [wait]))
+
+    def test_malformed_events_are_deleted(self):
+        bad = {"not-json.json": "{oops", "list.json": "[1, 2]", "issue.json": json.dumps({"repo": "o/r", "kind": "issue", "number": 2}),
+               "no-number.json": json.dumps({"repo": "o/r", "kind": "pull_request"}),
+               "string-number.json": json.dumps({"repo": "o/r", "kind": "pull_request", "number": "2"}),
+               "bool-number.json": json.dumps({"repo": "o/r", "kind": "pull_request", "number": True}),
+               "bad-repo.json": json.dumps({"repo": "o", "kind": "pull_request", "number": 2})}
+        for name, text in bad.items():
+            Path(self.queue, name).write_text(text)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [], []))
+        for name in bad:
+            self.assertIn(f"deleting {name}: not a pull_request event", log)
+
+    def test_events_for_repos_the_bots_do_not_cover_are_deleted(self):
+        self.event(2, repo="someone/else")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [], []))
+        self.assertIn("someone/else is not a repository the bots are installed on", log)
+
+    def test_dotfiles_other_files_and_missing_dirs_are_left_alone_quietly(self):
+        for name in (".partial.json", "notes.txt", "event.json.tmp"):
+            Path(self.queue, name).write_text("{}")
+        Path(self.queue, "sub.json").mkdir()
+        def no_github(bot):
+            raise AssertionError("an empty queue must not call GitHub")
+        prbot.installed_repos = no_github
+        self.assertEqual(self.run_queue(), (0, ""))
+        self.assertEqual(self.left(), [".partial.json", "event.json.tmp", "notes.txt", "sub.json"])
+        for name in self.left():
+            p = self.queue / name
+            p.rmdir() if p.is_dir() else p.unlink()
+        self.assertEqual(self.run_queue(), (0, ""))
+        self.queue.rmdir()
+        self.assertEqual(self.run_queue(), (0, ""))
+        self.assertEqual(prbot.main(["watch", "--from-queue", str(self.queue)]), 0)
+
+    def test_dry_run_keeps_files_and_state(self):
+        keep = [self.event(2).name, self.event(5).name, self.event(2, repo="someone/else").name]
+        code, log = self.run_queue(dry_run=True, limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [], sorted(keep)))
+        self.assertIn("would run a claude review", log)
+        self.assertFalse(prbot.WATCH_STATE.exists())
+
+    def test_queue_waits_while_another_run_holds_the_lock(self):
+        import fcntl
+        keep = self.event(2).name
+        with open(prbot.WATCH_STATE.with_name("watch.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [], [keep]))
+        self.assertIn("another watch run holds the lock", log)
+
+
+class ReviewTimeout(unittest.TestCase):
+    """A reviewer CLI that hangs, with a child that holds its output pipe, the way a stuck codex run did."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fake = Path(self.tmp.name, "claude")
+        fake.write_text("#!/bin/sh\nsleep 30 &\nsleep 30\n")
+        fake.chmod(0o755)
+        self.saved = (prbot.REVIEW_TIMEOUT, os.environ["PATH"])
+        prbot.REVIEW_TIMEOUT = 1
+        os.environ["PATH"] = f"{self.tmp.name}{os.pathsep}{os.environ['PATH']}"
+        self.pr = {"url": "https://github.com/o/r/pull/2", "title": "t"}
+
+    def tearDown(self):
+        prbot.REVIEW_TIMEOUT, os.environ["PATH"] = self.saved
+        self.tmp.cleanup()
+
+    def test_hung_review_is_stopped_and_fails(self):
+        import io, time
+        from contextlib import redirect_stderr
+        err, start = io.StringIO(), time.monotonic()
+        with redirect_stderr(err), self.assertRaises(SystemExit):
+            prbot.run_review("claude", self.pr, "diff", self.tmp.name)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("claude review timed out after 1s", err.getvalue())
+
+    def test_watch_moves_on_to_the_next_pr_after_a_timeout(self):
+        import io, time
+        from contextlib import redirect_stderr
+        w = Watch("run_pass")
+        w.setUp()
+        try:
+            def review(n, repo, mode, only):
+                w.runs.append((int(n), only[0]))
+                if int(n) == 2:
+                    prbot.run_review("claude", self.pr, "diff", self.tmp.name)
+            prbot.cmd_review = review
+            start = time.monotonic()
+            with redirect_stderr(io.StringIO()):
+                log = w.run_pass(limit=5)
+            self.assertLess(time.monotonic() - start, 10)
+            self.assertEqual(w.runs, [(2, "claude"), (5, "claude")])
+            self.assertIn("o/r#2@bbbbbbbbbb: claude review failed", log)
+            state = json.loads(prbot.WATCH_STATE.read_text())
+            self.assertIn("failed_claude", state["o/r#2@" + "b" * 10])  # not reviewed, retried after the delay
+        finally:
+            w.tearDown()
+
 
 class Jwt(unittest.TestCase):
     def test_signature_verifies_with_public_key(self):

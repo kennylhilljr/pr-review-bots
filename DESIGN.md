@@ -131,6 +131,26 @@ hour). A pass runs at most 3 reviews, so a backlog of open PRs cannot start a
 burst of model runs. `--baseline` marks the commits open at install time as
 seen, for starting from now instead of reviewing old PRs.
 
+Polling every 5 minutes means up to 5 minutes of delay and 288 full scans a
+day. The replacement is event-driven: OpenClaw's GitHub event router drops one
+JSON file per PR event into `~/.local/state/github-events/prbot/`, and a
+launchd job with `QueueDirectories` runs `prbot watch --from-queue` on that
+directory. A queue run makes the same per-PR decision as a full pass, through
+the same function, for only the PRs named in the files. The full pass stays as
+an hourly backstop for events that never arrive. A PR's files are removed only
+once nothing is left to do on it, so a failed review is retried on a later
+run. Files that can never succeed (bad JSON, other event kinds, repositories
+the bots don't cover) are deleted, because launchd keeps restarting the job
+while the directory has files. The two jobs can overlap, so every watch run
+takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
+when another run holds it.
+
+Each reviewer CLI runs in its own process group with a 900 second limit
+(`PRBOT_REVIEW_TIMEOUT`). A hung Codex review once held the whole watch queue.
+On timeout prbot kills the group, not only the CLI, because children left
+holding the output pipe would keep prbot waiting. The timeout counts as a
+failed review, so the commit is not marked reviewed and the pass moves on.
+
 ## What stays on Kenny's account
 
 - Merges, approvals that satisfy branch protection, and anything Kenny types

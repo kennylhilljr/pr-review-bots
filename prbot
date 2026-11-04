@@ -14,14 +14,15 @@
   prbot review <pr> [-R owner/repo] [--reviewer claude|codex|both] [--dry-run|--route-only]
                                      review a PR with the other agent and post it as that agent's bot;
                                      exits 3 and asks when it can't tell who wrote the PR
-  prbot watch [--dry-run] [--limit N] [--baseline]
+  prbot watch [--dry-run] [--limit N] [--baseline] [--from-queue DIR]
                                      one pass: review new commits on open, non-draft PRs on every repo
-                                     the bots are installed on (launchd runs it every 5 minutes)
+                                     the bots are installed on; with --from-queue, only the PRs named
+                                     in the GitHub event files in DIR
   prbot classify -- <gh args>        exit 0 if the gh call writes PR feedback
 
 Standard library plus the openssl and gh binaries. No token is printed or saved.
 """
-import base64, html, http.server, json, os, re, secrets, shlex, shutil, ssl, subprocess, sys, tempfile, time
+import base64, fcntl, html, http.server, json, os, re, secrets, shlex, shutil, signal, ssl, subprocess, sys, tempfile, time
 import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
@@ -323,26 +324,47 @@ If you find nothing worth reporting, say so in one sentence.
 Reply with the review text only, in GitHub Markdown, ready to post. Do not post anything yourself, edit files, or run commands that change state."""
 
 
+REVIEW_TIMEOUT = int(os.environ.get("PRBOT_REVIEW_TIMEOUT", 900))  # seconds one reviewer CLI may run
+
+
+def run_reviewer_cli(reviewer, cmd, diff, cwd=None):
+    """(returncode, stdout, stderr) of a reviewer CLI. It runs in its own process group, and on timeout the whole
+    group is killed: claude and codex start children that keep the output pipes open, so killing only the parent
+    would leave prbot waiting and block every PR queued behind this one."""
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         cwd=cwd, start_new_session=True)
+    try:
+        out, err = p.communicate(diff, timeout=REVIEW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.communicate()
+        die(f"{reviewer} review timed out after {REVIEW_TIMEOUT}s and was stopped")
+    return p.returncode, out, err
+
+
 def run_review(reviewer, pr, diff, cwd):
     prompt = REVIEW_PROMPT.format(url=pr["url"], title=pr["title"])
     if reviewer == "claude":
         cmd = ["claude", "-p", prompt, "--output-format", "text", "--no-session-persistence", "--strict-mcp-config",
                "--permission-mode", "dontAsk", "--allowedTools", "Read Grep Glob",
                "--disallowedTools", "Bash Edit Write NotebookEdit WebFetch WebSearch"]
-        r = subprocess.run(cmd, input=diff, capture_output=True, text=True, cwd=cwd, timeout=1800)
-        out = r.stdout
+        code, out, err = run_reviewer_cli(reviewer, cmd, diff, cwd)
+        stdout = out
     else:
         fd, outfile = tempfile.mkstemp(prefix="prbot-codex-", suffix=".md")
         os.close(fd)
         try:
             cmd = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "-C", cwd,
                    "-o", outfile, prompt]
-            r = subprocess.run(cmd, input=diff, capture_output=True, text=True, timeout=1800)
+            code, stdout, err = run_reviewer_cli(reviewer, cmd, diff)
             out = Path(outfile).read_text()
         finally:
             os.unlink(outfile)
-    if r.returncode != 0 or not out.strip():
-        die(f"{reviewer} review failed (exit {r.returncode}): {(r.stderr or r.stdout)[-500:]}")
+    if code != 0 or not out.strip():
+        die(f"{reviewer} review failed (exit {code}): {(err or stdout)[-500:]}")
     return out.strip()
 
 
@@ -484,75 +506,214 @@ def reviewed_by(repo, number, sha, slugs):
     return done
 
 
-def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False):
-    """One pass over open PRs on every repo the bots are installed on. launchd runs this every 5 minutes.
-    --baseline marks the commits open right now as seen without reviewing them, so only new ones get reviews."""
-    log = lambda msg: print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
-    state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
-    seen, runs = {}, 0
+def watch_log(msg):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+def watch_lock():
+    """An open file holding the watch lock, or None if another watch run holds it. The queue job and the hourly
+    pass are separate launchd jobs and can overlap; without the lock both could review the same commit."""
+    path = WATCH_STATE.with_name("watch.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
+def watch_setup(dry_run, limit, baseline):
+    """What every watch run needs: the registered bots, where they are installed, and the review budget."""
     cfg = load_config()
     bots = [b for b in AGENTS if b in cfg]
-    slugs = {cfg[b]["slug"] + "[bot]": b for b in bots}
-    installed = {b: installed_repos(b) for b in bots}
-    for repo in sorted(set().union(*installed.values())):
-        try:
-            prs = json.loads(gh_read(["pr", "list", "-R", repo, "--state", "open", "--limit", "100",
-                                      "--json", "number,isDraft,headRefOid"]))
-        except SystemExit:
-            log(f"{repo}: could not list PRs; skipping this pass")
+    return {"dry_run": dry_run, "limit": limit, "baseline": baseline, "runs": 0,
+            "slugs": {cfg[b]["slug"] + "[bot]": b for b in bots},
+            "installed": {b: installed_repos(b) for b in bots}}
+
+
+def watch_pr(repo, p, state, seen, ctx):
+    """The watcher's decision for one PR. p has number, isDraft and headRefOid, plus state when it comes from
+    `gh pr view`. Returns "done" when nothing is left to do on this commit, "later" when a review waits for a
+    later run (limit reached, or retry delay after a failure), and "failed" when the PR could not be read or a
+    review failed."""
+    if p["isDraft"] or p.get("state", "OPEN") != "OPEN":
+        return "done"
+    log, installed = watch_log, ctx["installed"]
+    n, sha = p["number"], p["headRefOid"]
+    key = f"{repo}#{n}@{sha[:10]}"
+    entry = seen[key] = state.get(key, {})
+    if ctx["baseline"]:
+        entry["baseline"] = True
+        log(f"{key}: marked as seen; it will not be reviewed unless new commits arrive")
+        return "done"
+    if entry.get("skipped") or entry.get("baseline"):
+        return "done"
+    try:
+        pr = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json", "labels,commits"]))
+        author, why = detect_author(pr)
+        reviewers, _ = choose_reviewers(author, [l["name"] for l in pr["labels"]])
+        if not reviewers:
+            entry["skipped"] = why
+            log(f"{key}: skipped, can't tell who wrote it ({why}). Label it agent:claude or "
+                f"agent:codex, or run: prbot review {n} -R {repo} --reviewer claude|codex|both")
+            return "done"
+        todo = [r for r in reviewers if r not in reviewed_by(repo, n, sha, ctx["slugs"])]
+    except SystemExit:
+        log(f"{key}: could not read the PR; will retry")
+        return "failed"
+    result = "done"
+    for r in todo:
+        if r not in installed:
+            log(f"{key}: needs a {r} review, but the {r} bot is not registered")
             continue
-        for p in prs:
-            if p["isDraft"]:
-                continue
-            n, sha = p["number"], p["headRefOid"]
-            key = f"{repo}#{n}@{sha[:10]}"
-            entry = seen[key] = state.get(key, {})
-            if baseline:
-                entry["baseline"] = True
-                log(f"{key}: marked as seen; it will not be reviewed unless new commits arrive")
-                continue
-            if entry.get("skipped") or entry.get("baseline"):
-                continue
+        if repo not in installed[r]:
+            log(f"{key}: needs a {r} review, but the {r} bot is not installed on {repo}")
+            continue
+        if time.time() - entry.get(f"failed_{r}", 0) < RETRY_AFTER:
+            result = "failed" if result == "failed" else "later"
+            continue
+        if ctx["runs"] >= ctx["limit"]:
+            log(f"{key}: {r} review waits for the next pass (limit {ctx['limit']} per pass)")
+            result = "failed" if result == "failed" else "later"
+            continue
+        ctx["runs"] += 1
+        if ctx["dry_run"]:
+            log(f"{key}: would run a {r} review")
+            continue
+        log(f"{key}: running a {r} review")
+        try:
+            cmd_review(str(n), repo, mode="post", only=[r])
+        except SystemExit:
+            entry[f"failed_{r}"] = time.time()
+            log(f"{key}: {r} review failed; retrying in {RETRY_AFTER // 60} minutes")
+            result = "failed"
+    return result
+
+
+def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
+    """One pass over open PRs on every repo the bots are installed on. launchd runs this every hour as a backstop
+    for the event queue. --baseline marks the commits open right now as seen without reviewing them, so only new
+    ones get reviews. With queue, only the PRs named in that event queue directory are handled."""
+    if queue is not None:
+        return cmd_watch_queue(Path(queue), dry_run, limit, baseline)
+    lock = watch_lock()
+    if lock is None:
+        watch_log("another watch run holds the lock; skipping this pass")
+        return 0
+    with lock:
+        state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
+        seen = {}
+        ctx = watch_setup(dry_run, limit, baseline)
+        for repo in sorted(set().union(*ctx["installed"].values())):
             try:
-                pr = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json", "labels,commits"]))
-                author, why = detect_author(pr)
-                reviewers, _ = choose_reviewers(author, [l["name"] for l in pr["labels"]])
-                if not reviewers:
-                    entry["skipped"] = why
-                    log(f"{key}: skipped, can't tell who wrote it ({why}). Label it agent:claude or "
-                        f"agent:codex, or run: prbot review {n} -R {repo} --reviewer claude|codex|both")
-                    continue
-                todo = [r for r in reviewers if r not in reviewed_by(repo, n, sha, slugs)]
+                prs = json.loads(gh_read(["pr", "list", "-R", repo, "--state", "open", "--limit", "100",
+                                          "--json", "number,isDraft,headRefOid"]))
             except SystemExit:
-                log(f"{key}: could not read the PR; will retry")
+                watch_log(f"{repo}: could not list PRs; skipping this pass")
                 continue
-            for r in todo:
-                if r not in installed:
-                    log(f"{key}: needs a {r} review, but the {r} bot is not registered")
-                    continue
-                if repo not in installed[r]:
-                    log(f"{key}: needs a {r} review, but the {r} bot is not installed on {repo}")
-                    continue
-                if time.time() - entry.get(f"failed_{r}", 0) < RETRY_AFTER:
-                    continue
-                if runs >= limit:
-                    log(f"{key}: {r} review waits for the next pass (limit {limit} per pass)")
-                    continue
-                runs += 1
-                if dry_run:
-                    log(f"{key}: would run a {r} review")
-                    continue
-                log(f"{key}: running a {r} review")
-                try:
-                    cmd_review(str(n), repo, mode="post", only=[r])
-                except SystemExit:
-                    entry[f"failed_{r}"] = time.time()
-                    log(f"{key}: {r} review failed; retrying in {RETRY_AFTER // 60} minutes")
-    if not dry_run:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        WATCH_STATE.write_text(json.dumps(seen, indent=1) + "\n")  # keeps only PRs still open
-    log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
+            for p in prs:
+                watch_pr(repo, p, state, seen, ctx)
+        if not dry_run:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            WATCH_STATE.write_text(json.dumps(seen, indent=1) + "\n")  # keeps only PRs still open
+        runs = ctx["runs"]
+        watch_log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
     return 0
+
+# ---------- watch --from-queue: handle PRs named in GitHub event files ----------
+
+REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def queue_files(qdir):
+    """Event files in qdir, oldest first. Names start with a UTC timestamp, so name order is arrival order.
+    Dotfiles and anything not ending in .json are left alone; a missing directory has no files."""
+    try:
+        names = sorted(os.listdir(qdir))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    return [qdir / n for n in names if n.endswith(".json") and not n.startswith(".") and (qdir / n).is_file()]
+
+
+def parse_queue_event(path):
+    """(repo, number) from one event file, or None when the file can never be handled: not JSON, not a
+    pull_request event, or no valid repo and number."""
+    try:
+        ev = json.loads(path.read_text())
+    except ValueError:
+        return None
+    if not isinstance(ev, dict) or ev.get("kind") != "pull_request":
+        return None
+    repo, n = ev.get("repo"), ev.get("number")
+    if not isinstance(repo, str) or not REPO_NAME.match(repo):
+        return None
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        return None
+    return repo, n
+
+
+def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
+    """Handle each PR named in the event queue once, with the same decisions as a full pass. A PR's files are
+    deleted when nothing is left to do on it, and kept for the next run when a review waits or fails. Files that
+    can never be handled are deleted, since launchd relaunches the job for as long as the directory has files.
+    Returns 2 if any PR failed."""
+    if not queue_files(qdir):
+        return 0
+    lock = watch_lock()
+    if lock is None:
+        watch_log("another watch run holds the lock; leaving the queue for the next run")
+        return 0
+
+    def delete(paths, why):
+        for path in paths:
+            watch_log(f"queue: {'would delete' if dry_run else 'deleting'} {path.name}: {why}")
+            if not dry_run:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    with lock:
+        ctx = watch_setup(dry_run, limit, baseline)
+        covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
+        groups = {}
+        for path in queue_files(qdir):
+            try:
+                ev = parse_queue_event(path)
+            except FileNotFoundError:
+                continue
+            if ev is None:
+                delete([path], "not a pull_request event with a valid repo and number")
+            elif ev[0].lower() not in covered:
+                delete([path], f"{ev[0]} is not a repository the bots are installed on")
+            else:
+                groups.setdefault((covered[ev[0].lower()], ev[1]), []).append(path)
+        state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
+        seen, failed = {}, 0
+        for (repo, n), paths in groups.items():
+            try:
+                p = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json",
+                                        "number,state,isDraft,headRefOid"]))
+                result = watch_pr(repo, p, state, seen, ctx)
+            except (SystemExit, Exception) as e:
+                watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
+                result = "failed"
+            if result == "done":
+                delete(paths, f"{repo}#{n} handled")
+            else:
+                failed += result == "failed"
+                watch_log(f"{repo}#{n}: {'failed' if result == 'failed' else 'waiting'}; "
+                          f"keeping {len(paths)} queue file{'s' if len(paths) != 1 else ''} for the next run")
+        if not dry_run:
+            state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            WATCH_STATE.write_text(json.dumps(state, indent=1) + "\n")
+        runs = ctx["runs"]
+        watch_log(f"queue done: {len(groups)} PR{'s' if len(groups) != 1 else ''}, {runs} review"
+                  f"{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}, {failed} failed")
+    return 2 if failed else 0
 
 # ---------- commands ----------
 
@@ -735,7 +896,13 @@ def main(argv):
         limit = WATCH_LIMIT
         if "--limit" in rest:
             limit = int(rest[rest.index("--limit") + 1])
-        return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest)
+        queue = None
+        if "--from-queue" in rest:
+            i = rest.index("--from-queue")
+            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                die("usage: prbot watch --from-queue DIR [--dry-run] [--limit N] [--baseline]")
+            queue = rest[i + 1]
+        return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest, queue=queue)
     if cmd == "review":
         opts = {"-R": None, "--repo": None, "--reviewer": None}
         flags, target, i = set(), None, 0
