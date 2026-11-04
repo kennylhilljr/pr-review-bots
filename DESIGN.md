@@ -160,9 +160,17 @@ run; single malformed entries are dropped with a log line each.
 Because a queue run moves everything it can't use out of the directory, it
 first checks that the directory really is an event queue: the default path,
 or a directory whose parent holds the router's `.github-events-queue` marker
-file. A symlinked or non-directory path is refused too. Without that check,
-`prbot watch --from-queue .` in a checkout would move `.git` and the sources
-into a `-rejected` directory. The two jobs can overlap, so every watch run
+file. A symlinked or non-directory path is refused too, and so are `-deferred`
+and `-rejected` destinations that are not real directories. Without that
+check, `prbot watch --from-queue .` in a checkout would move `.git` and the
+sources into a `-rejected` directory.
+
+When the router sees GitHub activity it can't pin to one PR, it writes a
+single `sweep.json` naming a repository, or null for all of them. A queue run
+handles it after the PR events by running the full pass's loop over those
+repositories. A sweep that hits the limit stays in the queue; a review ran in
+that run, and each review either posts or records a failure, so the next run
+starts further along. The two jobs can overlap, so every watch run
 takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
 when another run holds it.
 

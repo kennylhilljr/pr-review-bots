@@ -361,15 +361,20 @@ class WatchQueue(unittest.TestCase):
         Watch.setUp(self)
         self.queue = Path(self.tmp.name, "queue")
         self.queue.mkdir()
-        self.fail_on, self.seq = set(), 0
+        self.fail_on, self.seq, self.listed = set(), 0, []
 
         def fake_review(n, repo, mode, only):
             self.runs.append((int(n), only[0]))
             if int(n) in self.fail_on:
                 raise SystemExit(2)
+            # a posted review shows up in the PR's reviews, as on GitHub
+            self.reviews.setdefault(int(n), []).append(
+                [f"{only[0]}-pr-gh[bot]", f"Reviewed commit `{self.SHA[int(n)][:10]}`"])
         prbot.cmd_review = fake_review
 
     def fake_gh(self, args):
+        if args[:2] == ["pr", "list"]:
+            self.listed.append(args[3])
         if args[:2] == ["pr", "view"] and "state" in args[-1]:
             n = int(args[2])
             if n == 9:
@@ -451,7 +456,7 @@ class WatchQueue(unittest.TestCase):
         old = self.age(Path(self.queue, "20261103T141503123Z-old.json"), '{"repo": "o/r"')
         code, log = self.run_queue(limit=5)
         self.assertEqual((code, self.left(), self.names("rejected")), (0, [], [old.name]))
-        self.assertIn(f"{old.name}: not valid JSON after", log)
+        self.assertIn(f"{old.name}: not valid JSON, written", log)
 
     def test_damaged_watch_state_is_moved_aside(self):
         # Codex review of PR 1: a truncated state file crashed every queue run and every hourly pass
@@ -598,7 +603,7 @@ class WatchQueue(unittest.TestCase):
         code, log = self.run_queue(limit=5)
         self.assertEqual((code, self.runs, self.left(), self.names("rejected")), (0, [], [], sorted(bad)))
         self.assertEqual(self.read("rejected", "list.json"), [1, 2])  # kept unchanged as evidence
-        self.assertIn("not-json.json: not valid JSON after", log)
+        self.assertIn("not-json.json: not valid JSON, written", log)
         for name in bad:
             if name != "not-json.json":
                 self.assertIn(f"{name}: not a pull_request event", log)
@@ -718,6 +723,126 @@ class WatchQueue(unittest.TestCase):
         self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])
         self.assertEqual([p.name for p in deferred.iterdir()], ["e.json"])
         self.assertFalse(plain.exists())
+
+    def test_pr_needing_an_unavailable_bot_is_deferred_not_dropped(self):
+        # Codex review of PR 1: with only the codex bot on the repo, a codex-written PR's event was deleted unreviewed
+        prbot.installed_repos = lambda bot: {"o/r"} if bot == "codex" else set()
+        name = self.event(2).name
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [], [], [name]))
+        self.assertIn("needs a claude review, but the claude bot is not installed on o/r", log)
+
+    def test_deferral_moves_the_event_before_rewriting_it(self):
+        # Codex review of PR 1: writing the copy first and unlinking after could leave the event in two places
+        import io
+        from contextlib import redirect_stdout
+        src = self.event(2)
+        original = src.read_text()
+        dest = prbot.queue_sibling(self.queue, "deferred")
+        real = prbot.write_json_atomic
+        def crash(*a, **kw):
+            raise OSError("disk full")
+        prbot.write_json_atomic = crash
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                target = prbot.move_into(src, dest, {"attempts": 1})
+        finally:
+            prbot.write_json_atomic = real
+        self.assertFalse(src.exists())
+        self.assertEqual((self.left(), self.names("deferred")), ([], [src.name]))
+        self.assertEqual(target.read_text(), original)  # intact, and in exactly one place
+        self.assertIn("could not update it", out.getvalue())
+        moved = prbot.move_into(target, self.queue, {"attempts": 2})  # the normal path rewrites after the move
+        self.assertEqual((json.loads(moved.read_text()), self.names("deferred")), ({"attempts": 2}, []))
+
+    def test_unparsable_file_with_a_future_mtime(self):
+        # Codex review of PR 1: a negative age counted as young forever. Within CLOCK_SKEW it still waits;
+        # further ahead it counts as settled and is rejected
+        def future(name, seconds):
+            p = Path(self.queue, name)
+            p.write_text("{oops")
+            t = p.stat().st_mtime + seconds
+            os.utime(p, (t, t))
+        future("near.json", 120)
+        future("far.json", prbot.CLOCK_SKEW + 300)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("rejected")), (0, ["near.json"], ["far.json"]))
+        self.assertIn("leaving near.json for now", log)
+
+    def test_side_directories_must_be_real_directories(self):
+        keep = self.event(2).name
+        elsewhere = Path(self.tmp.name, "elsewhere")
+        elsewhere.mkdir()
+        deferred, rejected = prbot.queue_sibling(self.queue, "deferred"), prbot.queue_sibling(self.queue, "rejected")
+        deferred.symlink_to(elsewhere)
+        code, err = self.run_refused(self.queue)
+        self.assertEqual(code, 2)
+        self.assertIn("queue-deferred exists but is not a directory", err)
+        # the hourly pass refuses the requeue the same way
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        e2 = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(e2):
+            self.assertEqual(prbot.cmd_watch(dry_run=False, limit=0), 2)
+        self.assertIn("not moving deferred events back", e2.getvalue())
+        deferred.unlink()
+        rejected.write_text("a file")
+        code, err = self.run_refused(self.queue)
+        self.assertEqual(code, 2)
+        self.assertIn("queue-rejected exists but is not a directory", err)
+        self.assertEqual((self.left(), list(elsewhere.iterdir()), rejected.read_text()), ([keep], [], "a file"))
+
+    def sweep(self, repo, name="sweep.json"):
+        body = {"kind": "sweep", "repo": repo, "received_at": "2026-11-03T14:15:02.123Z",
+                "slack_message_id": "1730643302.123456", "slack_channel": "C0CEMPH1L0N",
+                "source": "github-event-router", "version": 1}
+        Path(self.queue, name).write_text(json.dumps(body))
+        return name
+
+    def test_sweep_of_one_repo_runs_the_pass_there_and_is_deleted(self):
+        prbot.installed_repos = lambda bot: {"o/r", "o/other"}
+        self.sweep("o/r")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.listed, self.runs, self.left()), (0, ["o/r"], [(2, "claude"), (5, "claude")], []))
+        self.assertIn("queue: sweep of o/r", log)
+
+    def test_sweep_with_null_repo_covers_every_repo(self):
+        prbot.installed_repos = lambda bot: {"o/r", "o/other"}
+        self.sweep(None)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.listed, self.left()), (0, ["o/other", "o/r"], []))
+        self.assertIn("sweep of every covered repository", log)
+
+    def test_failed_sweep_is_deferred(self):
+        self.fail_on = {2}
+        name = self.sweep(None)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("deferred")), (2, [], [name]))
+        self.assertEqual(self.read("deferred", name)["attempts"], 1)
+        self.assertEqual(self.read("deferred", name)["kind"], "sweep")
+
+    def test_sweep_of_an_unknown_repo_is_rejected(self):
+        name = self.sweep("someone/else")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.listed, self.left(), self.names("rejected")), (0, [], [], [name]))
+        bad = self.sweep(5)  # repo must be a name or null
+        self.run_queue(limit=5)
+        self.assertEqual(self.names("rejected"), sorted([name, f"{Path(bad).stem}-1.json"]))
+
+    def test_limit_bound_sweep_makes_progress_each_run(self):
+        self.sweep(None)
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude")], ["sweep.json"]))
+        self.assertIn("sweep is over this run's limit", log)
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude"), (5, "claude")], []))
+
+    def test_pr_events_run_before_the_sweep_and_are_not_reviewed_twice(self):
+        self.sweep(None)
+        self.event(5)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [(5, "claude"), (2, "claude")], []))
+        self.assertLess(log.index("running a claude review"), log.index("queue: sweep of"))
 
     def test_empty_and_missing_queues_exit_quietly(self):
         self.assertEqual(self.run_queue(), (0, ""))
