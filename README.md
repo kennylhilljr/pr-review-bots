@@ -26,6 +26,7 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | Claude Code guard hook | Installed and blocking direct posts. |
 | Codex CLI `gh` shim | Built and tested locally; not yet used in a live Codex session. |
 | `prbot watch` (automatic reviews) | Live: launchd runs it every 5 minutes across all 21 repos. |
+| `prbot watch --from-queue` (event-driven reviews) | Built and tested; the queue job and hourly backstop in `integrations/launchd/` are not installed yet. |
 | `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
 | `prbot git` (push as a bot) | Live for both bots, with Contents write. |
 | OpenClaw | Reviews with P1 or P2 findings appear in OpenClaw as `attention.required` under the `github` run, written through the orchestrator runtime's event writer. Skipped quietly if the runtime is not installed. |
@@ -150,7 +151,9 @@ If the author is unclear and nothing names a reviewer, prbot posts nothing and e
 
 ### Review new commits automatically
 
-`prbot watch` makes one pass over every open, non-draft PR on every repository the bots are installed on. Each new commit gets a review from the other agent, once. A launchd job runs a pass every 5 minutes:
+`prbot watch` makes one pass over every open, non-draft PR on every repository the bots are installed on. Each new commit gets a review from the other agent, once.
+
+`prbot watch --from-queue DIR` does the same for only the PRs named in GitHub event files in `DIR`. OpenClaw's GitHub event router writes one JSON file per PR event into `~/.local/state/github-events/prbot/`, and a launchd job with `QueueDirectories` starts a queue run as soon as one lands. A second launchd job runs the full pass every hour to catch anything the events missed. [`integrations/launchd/README.md`](integrations/launchd/README.md) has the two plists with install and rollback steps. The older `install-watch.sh` still installs a single job that runs the full pass every 5 minutes:
 
 ```bash
 ~/Documents/GitHub/pr-review-bots/integrations/launchd/install-watch.sh
@@ -160,10 +163,28 @@ How a pass behaves:
 
 - It finds earlier reviews from the "Reviewed commit" line in each bot review, so it never reviews the same commit twice, even after a restart.
 - It runs at most 3 reviews per pass; the rest wait for the next pass.
-- A PR it can't attribute is skipped and logged once, with the command to review it by hand.
+- A PR it can't attribute is skipped and logged once, with the command to review it by hand. Its labels are read again on every run, so adding `agent:claude` or `agent:codex` later starts the review without a new commit.
 - A review that fails, for example on a usage limit, is retried an hour later.
+- A review that runs longer than 900 seconds is stopped, along with every process it started, and counts as failed, so one stuck reviewer cannot hold up the PRs behind it. Set `PRBOT_REVIEW_TIMEOUT` (whole seconds) to change the limit. `prbot watch` and `prbot review` check it when they start and exit 2 with a message naming the variable if it is not a positive whole number; other commands ignore it.
+- Only one watch run works at a time. A run that finds the lock (`~/.config/prbot/watch.lock`) taken logs that and exits 0 without looking at the queue. A queue run holds the lock from checking the queue directory to its last move, and the hourly pass holds it until it has moved the deferred files back, so the queue job launched by those files waits for its next relaunch.
 
-Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`. To see what a pass would do without posting, run `prbot watch --dry-run`. To start from now and skip the commits already open, run `prbot watch --baseline` once before installing the job. To remove the job, run `install-watch.sh --uninstall`.
+How a queue run treats the files:
+
+- prbot only works on a queue directory that is `~/.local/state/github-events/prbot` itself or whose parent holds a regular file named `.github-events-queue`, which the event router creates. Anything else, a `DIR` that is a symlink, or a path that is not a directory, is refused with exit 2 and nothing is moved. This keeps a mistaken `--from-queue .` from emptying a checkout. The hourly pass applies the same check to `PRBOT_QUEUE_DIR` before moving deferred files back; when it refuses, the pass still runs and the command exits 2. The same refusal applies when `DIR-deferred` or `DIR-rejected` exists but is not a real directory (a symlink or a file).
+- Several events for the same PR are handled as one, oldest file first.
+- A sweep event, a file such as `sweep-20261103T150000000Z-3fa9c1.json` with `"kind": "sweep"`, means the router saw activity it could not pin to one PR. prbot recognizes sweeps by content, not by name. After the PR events, the run makes one full pass over the repos the pending sweeps name, or over every covered repository when any has a null `repo`, skipping PRs it just handled, with the usual limit and review timeout. Each kind of PR outcome is checked separately. If any PR in the pass was held back by the limit, the sweeps stay in the queue (a review ran, so each run still makes progress). Otherwise they are deferred when a review failed, a repository could not be listed, or a null sweep could not reach every repository; else deleted. Only the sweep files listed when the run started are deleted, so one written during the pass waits for the next run. A sweep is rejected when its `repo` is one the bots don't cover. Retry-delay waits and unavailable bots inside a sweep don't hold it; the hourly pass covers those PRs.
+- An event or sweep for a repository missing from the bots' installations is rejected only when the installations of both bots were read and neither list is empty. With a bot unregistered, its lookup failing, or its list empty, the event is deferred instead and the run exits 2, since the repository may belong to the bot that couldn't be read.
+- A PR's files are deleted once nothing is left to do on its head commit: it was reviewed, already had a review of that commit, is closed, merged or a draft, or can't be attributed.
+- launchd restarts the queue job for as long as anything is in the queue directory, so the only files a run leaves there belong to PRs held back by its per-run limit. Two side directories sit next to it, outside it: for `DIR` they are `DIR-deferred` and `DIR-rejected` (for example `~/.local/state/github-events/prbot-deferred/`).
+- A PR held back only by the limit keeps its files in the queue untouched. Every queue run reviews at least one PR (even with `--limit 0`), so launchd's relaunch after `ThrottleInterval` drains a burst of events about a minute apart.
+- When a review fails, times out, waits out the one-hour retry delay, or needs a reviewer bot that is not registered or not installed on the repo, the PR's files move to `DIR-deferred` and are then rewritten there with their `attempts` field raised by 1. An `attempts` value that is not a whole number of 0 or more is logged and counted from 0. The move comes first, so a failed rewrite leaves the event in `DIR-deferred` unchanged, never in two places. After 24 attempts a file goes to `DIR-rejected` instead. A failure makes the run exit 2, and the other PRs in the same run still go ahead.
+- The hourly `prbot watch` moves every file in the deferred directory back into the queue after its pass, so the queue job checks those PRs again. It finds the queue through `PRBOT_QUEUE_DIR`, default `~/.local/state/github-events/prbot`.
+- Files that are not JSON, are not `pull_request` events, lack a valid `repo` and `number`, or name a repository the bots are not installed on are logged and moved to `DIR-rejected`, and so is every other entry: dotfiles such as `.DS_Store`, names not ending in `.json`, subdirectories (moved whole, contents intact) and symlinks (the link itself moves; its target is never followed or touched). Left in place, any of these would make launchd relaunch the job every minute. Nothing cleans `DIR-rejected`; empty it by hand now and then.
+- A file that is not valid JSON is left alone for its first 30 seconds, in case it is still being written, and rejected only if it is still unparsable after that. launchd's 60-second `ThrottleInterval` means the next run finds it settled. A modification time up to 5 minutes in the future counts as just written (clock skew); further ahead counts as settled, so such a file is rejected rather than held for as long as its timestamp says.
+- A missing or empty directory exits 0 without output.
+- `--dry-run` moves and deletes nothing and saves no state; `--limit` and `--baseline` work as in a full pass.
+
+Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`, always written through a temp file and a rename; a damaged state file is moved to `watch-state.json.corrupt-<UTC time>`, logged, and replaced by an empty state. Single entries with the wrong shape (not an object, unknown fields, a failure time that is not a number or is more than a day in the future) are dropped with one log line each. A full pass normally keeps state only for PRs still open, but it keeps the old entries of any repository whose PRs it could not list, and prunes nothing at all when a bot's installations could not be read. To see what a pass would do without posting, run `prbot watch --dry-run`. To start from now and skip the commits already open, run `prbot watch --baseline` once before installing the job. To remove the 5-minute job, run `install-watch.sh --uninstall`.
 
 ## Make agents use the bots
 
@@ -225,7 +246,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `prbot gh <bot> [-R owner/repo] -- <gh args>` | Runs `gh` with a one-repo App token. | `gh`'s own code, or 2 |
 | `prbot git <bot> [-R owner/repo] -- <git args>` | Runs `git` (push) with a one-repo contents-write token. | `git`'s own code, or 2 |
 | `prbot review <pr> [-R owner/repo] [--reviewer claude\|codex\|both] [--dry-run\|--route-only]` | Routes, runs and posts a cross-review. | 0, 2 on error, 3 when the author is unclear |
-| `prbot watch [--dry-run] [--limit N] [--baseline]` | One pass of automatic reviews over open PRs. | 0, or 2 |
+| `prbot watch [--dry-run] [--limit N] [--baseline] [--from-queue DIR]` | One pass of automatic reviews over open PRs, or over the PRs named in the event files in `DIR`. | 0, or 2 (with `--from-queue`, also when a PR failed) |
 | `prbot classify -- <gh args>` | Used by the hook and shim. | 0 if the call posts PR feedback, else 1 |
 
 `<bot>` is `claude` or `codex`. `<pr>` is a number or a PR URL.
@@ -239,7 +260,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `logos/` | Bot logos: SVG sources and 512 px PNGs for GitHub. |
 | `integrations/claude-code/` | The PreToolUse guard hook. |
 | `integrations/codex/` | The `gh` shim and the `codex-as-bot` launcher. |
-| `integrations/launchd/` | Installer for the job that runs `prbot watch` every 5 minutes. |
+| `integrations/launchd/` | Plists for the event queue job and the hourly backstop, plus the older 5-minute installer. |
 | `skills/cross-review/` | The PR review skill shared by Claude Code and Codex. |
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents working on this repository. |
 | `tests/` | Unit tests, including fixtures shaped like real PRs. |

@@ -14,14 +14,15 @@
   prbot review <pr> [-R owner/repo] [--reviewer claude|codex|both] [--dry-run|--route-only]
                                      review a PR with the other agent and post it as that agent's bot;
                                      exits 3 and asks when it can't tell who wrote the PR
-  prbot watch [--dry-run] [--limit N] [--baseline]
+  prbot watch [--dry-run] [--limit N] [--baseline] [--from-queue DIR]
                                      one pass: review new commits on open, non-draft PRs on every repo
-                                     the bots are installed on (launchd runs it every 5 minutes)
+                                     the bots are installed on; with --from-queue, only the PRs named
+                                     in the GitHub event files in DIR
   prbot classify -- <gh args>        exit 0 if the gh call writes PR feedback
 
 Standard library plus the openssl and gh binaries. No token is printed or saved.
 """
-import base64, html, http.server, json, os, re, secrets, shlex, shutil, ssl, subprocess, sys, tempfile, time
+import base64, fcntl, html, http.server, json, math, os, re, secrets, shlex, shutil, signal, ssl, stat, subprocess, sys, tempfile, time
 import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
@@ -131,8 +132,21 @@ def load_config():
 
 
 def save_config(cfg):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    write_json_atomic(CONFIG, cfg)
+
+
+def write_json_atomic(path, data, indent=2):
+    """Write JSON through a temp file in the same directory and a rename, so a crash or a full disk never leaves
+    a half-written file. The temp name starts with a dot and ends in .tmp, so queue readers skip it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=indent) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def bot_config(bot):
@@ -323,26 +337,63 @@ If you find nothing worth reporting, say so in one sentence.
 Reply with the review text only, in GitHub Markdown, ready to post. Do not post anything yourself, edit files, or run commands that change state."""
 
 
+REVIEW_TIMEOUT = 900     # seconds one reviewer CLI may run, unless PRBOT_REVIEW_TIMEOUT says otherwise
+
+
+def review_timeout():
+    """Seconds a reviewer CLI may run. Read when a command needs it, never at import, so a bad value can't break
+    `prbot --help` or the commands that never run a review."""
+    raw = os.environ.get("PRBOT_REVIEW_TIMEOUT")
+    if raw is None:
+        return REVIEW_TIMEOUT
+    try:
+        seconds = int(raw.strip())
+    except ValueError:
+        seconds = 0
+    if seconds < 1:
+        die(f"PRBOT_REVIEW_TIMEOUT must be a positive whole number of seconds, not {raw!r}")
+    return seconds
+
+
+def run_reviewer_cli(reviewer, cmd, diff, cwd=None):
+    """(returncode, stdout, stderr) of a reviewer CLI. It runs in its own process group, and on timeout the whole
+    group is killed: claude and codex start children that keep the output pipes open, so killing only the parent
+    would leave prbot waiting and block every PR queued behind this one."""
+    timeout = review_timeout()
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         cwd=cwd, start_new_session=True)
+    try:
+        out, err = p.communicate(diff, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.communicate()
+        die(f"{reviewer} review timed out after {timeout}s and was stopped")
+    return p.returncode, out, err
+
+
 def run_review(reviewer, pr, diff, cwd):
     prompt = REVIEW_PROMPT.format(url=pr["url"], title=pr["title"])
     if reviewer == "claude":
         cmd = ["claude", "-p", prompt, "--output-format", "text", "--no-session-persistence", "--strict-mcp-config",
                "--permission-mode", "dontAsk", "--allowedTools", "Read Grep Glob",
                "--disallowedTools", "Bash Edit Write NotebookEdit WebFetch WebSearch"]
-        r = subprocess.run(cmd, input=diff, capture_output=True, text=True, cwd=cwd, timeout=1800)
-        out = r.stdout
+        code, out, err = run_reviewer_cli(reviewer, cmd, diff, cwd)
+        stdout = out
     else:
         fd, outfile = tempfile.mkstemp(prefix="prbot-codex-", suffix=".md")
         os.close(fd)
         try:
             cmd = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "-C", cwd,
                    "-o", outfile, prompt]
-            r = subprocess.run(cmd, input=diff, capture_output=True, text=True, timeout=1800)
+            code, stdout, err = run_reviewer_cli(reviewer, cmd, diff)
             out = Path(outfile).read_text()
         finally:
             os.unlink(outfile)
-    if r.returncode != 0 or not out.strip():
-        die(f"{reviewer} review failed (exit {r.returncode}): {(r.stderr or r.stdout)[-500:]}")
+    if code != 0 or not out.strip():
+        die(f"{reviewer} review failed (exit {code}): {(err or stdout)[-500:]}")
     return out.strip()
 
 
@@ -453,6 +504,69 @@ RETRY_AFTER = 3600       # seconds before retrying a reviewer that failed (usage
 REVIEWED = re.compile(r"Reviewed commit `([0-9a-f]{7,40})`")
 
 
+def load_watch_state(dry_run=False):
+    """The watch state, or {} when there is none. A damaged file (bad JSON or not an object) is renamed to
+    watch-state.json.corrupt-<UTC time> and logged, so it can't crash every later run. A dry run only logs it."""
+    if not WATCH_STATE.exists():
+        return {}
+    try:
+        state = json.loads(WATCH_STATE.read_text())
+        if isinstance(state, dict):
+            return valid_state_entries(state)
+    except ValueError:
+        pass
+    if dry_run:
+        watch_log("watch state is damaged; a real run will move it aside and start with an empty state")
+        return {}
+    bad = WATCH_STATE.with_name(f"{WATCH_STATE.name}.corrupt-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
+    os.replace(WATCH_STATE, bad)
+    watch_log(f"watch state was damaged; moved it to {bad} and starting with an empty state")
+    return {}
+
+
+def save_watch_state(state):
+    write_json_atomic(WATCH_STATE, state, indent=1)
+
+
+STATE_KEY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+@[0-9a-f]{7,40}$")
+
+
+def state_entry_problem(key, entry, now):
+    """Why one watch-state entry can't be used, or None. Entries look like
+    "owner/repo#12@0123456789": {"skipped": "<why>", "baseline": true, "failed_claude": <unix time>}."""
+    if not STATE_KEY.match(key):
+        return "key is not owner/repo#number@commit"
+    if not isinstance(entry, dict):
+        return f"value is {type(entry).__name__}, not an object"
+    for k, v in entry.items():
+        if k == "skipped":
+            if not isinstance(v, str):
+                return "skipped is not a string"
+        elif k == "baseline":
+            if v is not True:
+                return "baseline is not true"
+        elif k in (f"failed_{a}" for a in AGENTS):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                return f"{k} is not a time"
+            if not 0 < v <= now + 86400:  # unset is 0; more than a day ahead means a broken clock or a bad edit
+                return f"{k} is not a plausible time"
+        else:
+            return f"unknown field {k!r}"
+    return None
+
+
+def valid_state_entries(state):
+    """state without the entries that would break a run, logging one line for each dropped entry."""
+    now, good = time.time(), {}
+    for key, entry in state.items():
+        problem = state_entry_problem(key, entry, now)
+        if problem:
+            watch_log(f"watch state: dropping entry {key!r}: {problem}")
+        else:
+            good[key] = entry
+    return good
+
+
 def installed_repos(bot):
     """owner/name of every repository the bot's App is installed on."""
     cfg = bot_config(bot)
@@ -484,75 +598,450 @@ def reviewed_by(repo, number, sha, slugs):
     return done
 
 
-def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False):
-    """One pass over open PRs on every repo the bots are installed on. launchd runs this every 5 minutes.
-    --baseline marks the commits open right now as seen without reviewing them, so only new ones get reviews."""
-    log = lambda msg: print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
-    state = json.loads(WATCH_STATE.read_text()) if WATCH_STATE.exists() else {}
-    seen, runs = {}, 0
+def watch_log(msg):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+def watch_lock():
+    """An open file holding the watch lock, or None if another watch run holds it. The queue job and the hourly
+    pass are separate launchd jobs and can overlap; without the lock both could review the same commit."""
+    path = WATCH_STATE.with_name("watch.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
+def watch_setup(dry_run, limit, baseline):
+    """What every watch run needs: the registered bots, where they are installed, and the review budget.
+    "installed" holds only inventories that were read and are not empty. "gaps" says why any bot's inventory
+    is missing (not registered, lookup failed, installed nowhere); with a gap, a repository missing from the
+    inventory may still be covered, so it must not be treated as unknown and state must not be pruned.
+    "lookup_failed" is true when a lookup raised, which is worth a nonzero exit."""
     cfg = load_config()
     bots = [b for b in AGENTS if b in cfg]
-    slugs = {cfg[b]["slug"] + "[bot]": b for b in bots}
-    installed = {b: installed_repos(b) for b in bots}
-    for repo in sorted(set().union(*installed.values())):
+    installed, gaps, lookup_failed = {}, [], False
+    for b in AGENTS:
+        if b not in cfg:
+            gaps.append(f"the {b} bot is not registered")
+            continue
+        try:
+            repos = installed_repos(b)
+        except (SystemExit, Exception) as e:
+            gaps.append(f"could not read where the {b} bot is installed ({e!r})")
+            lookup_failed = True
+            continue
+        if not repos:
+            gaps.append(f"the {b} bot is installed on no repositories")
+            continue
+        installed[b] = repos
+    if gaps:
+        watch_log("bot inventory is incomplete: " + "; ".join(gaps))
+    return {"dry_run": dry_run, "limit": limit, "baseline": baseline, "runs": 0,
+            "slugs": {cfg[b]["slug"] + "[bot]": b for b in bots},
+            "installed": installed, "gaps": gaps, "lookup_failed": lookup_failed}
+
+
+RESULT_RANK = ("done", "limit", "later", "failed").index   # for max(): the worst result of several wins
+
+
+def watch_pr(repo, p, state, seen, ctx):
+    """The watcher's decision for one PR. p has number, isDraft and headRefOid, plus state when it comes from
+    `gh pr view`. Returns "done" when nothing is left to do on this commit, "limit" when a review only waits
+    because this run used up its limit, "later" when a review waits out the retry delay after a failure or needs
+    a reviewer bot that is not registered or not installed, and "failed" when the PR could not be read or a
+    review failed. With several reviewers the worst one wins."""
+    if p["isDraft"] or p.get("state", "OPEN") != "OPEN":
+        return "done"
+    log, installed = watch_log, ctx["installed"]
+    n, sha = p["number"], p["headRefOid"]
+    key = f"{repo}#{n}@{sha[:10]}"
+    entry = seen[key] = state.get(key, {})
+    if ctx["baseline"]:
+        entry["baseline"] = True
+        log(f"{key}: marked as seen; it will not be reviewed unless new commits arrive")
+        return "done"
+    if entry.get("baseline"):
+        return "done"
+    try:
+        # labels are read even for a PR skipped before: a label added later, on the same commit, starts its review
+        pr = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json", "labels,commits"]))
+        author, why = detect_author(pr)
+        reviewers, _ = choose_reviewers(author, [l["name"] for l in pr["labels"]])
+        if not reviewers:
+            if not entry.get("skipped"):  # the marker only keeps this line from repeating every pass
+                log(f"{key}: skipped, can't tell who wrote it ({why}). Label it agent:claude or "
+                    f"agent:codex, or run: prbot review {n} -R {repo} --reviewer claude|codex|both")
+            entry["skipped"] = why
+            return "done"
+        entry.pop("skipped", None)
+        todo = [r for r in reviewers if r not in reviewed_by(repo, n, sha, ctx["slugs"])]
+    except SystemExit:
+        log(f"{key}: could not read the PR; will retry")
+        return "failed"
+    result, rank = "done", RESULT_RANK
+    for r in todo:
+        # an unavailable reviewer bot leaves the review owed, so a queue run defers the event instead of dropping it
+        if r not in installed:
+            log(f"{key}: needs a {r} review, but the {r} bot is not registered or its installations are unknown")
+            result = max(result, "later", key=rank)
+            continue
+        if repo not in installed[r]:
+            log(f"{key}: needs a {r} review, but the {r} bot is not installed on {repo}")
+            result = max(result, "later", key=rank)
+            continue
+        if time.time() - entry.get(f"failed_{r}", 0) < RETRY_AFTER:
+            result = max(result, "later", key=rank)
+            continue
+        if ctx["runs"] >= ctx["limit"]:
+            log(f"{key}: {r} review waits for the next pass (limit {ctx['limit']} per pass)")
+            result = max(result, "limit", key=rank)
+            continue
+        ctx["runs"] += 1
+        if ctx["dry_run"]:
+            log(f"{key}: would run a {r} review")
+            continue
+        log(f"{key}: running a {r} review")
+        try:
+            cmd_review(str(n), repo, mode="post", only=[r])
+        except SystemExit:
+            entry[f"failed_{r}"] = time.time()
+            log(f"{key}: {r} review failed; retrying in {RETRY_AFTER // 60} minutes")
+            result = "failed"
+    return result
+
+
+def watch_repos(repos, state, seen, ctx, skip=()):
+    """The full pass over the open PRs of repos, skipping (repo, number) pairs in skip. Returns (outcomes,
+    unlisted): the set of every watch_pr result seen, so a caller can test each kind on its own instead of a
+    single worst one hiding the rest, and the repositories whose PRs could not be listed."""
+    outcomes, unlisted = set(), set()
+    for repo in sorted(repos):
         try:
             prs = json.loads(gh_read(["pr", "list", "-R", repo, "--state", "open", "--limit", "100",
                                       "--json", "number,isDraft,headRefOid"]))
         except SystemExit:
-            log(f"{repo}: could not list PRs; skipping this pass")
+            watch_log(f"{repo}: could not list PRs; skipping this pass")
+            unlisted.add(repo)
             continue
         for p in prs:
-            if p["isDraft"]:
-                continue
-            n, sha = p["number"], p["headRefOid"]
-            key = f"{repo}#{n}@{sha[:10]}"
-            entry = seen[key] = state.get(key, {})
-            if baseline:
-                entry["baseline"] = True
-                log(f"{key}: marked as seen; it will not be reviewed unless new commits arrive")
-                continue
-            if entry.get("skipped") or entry.get("baseline"):
-                continue
+            if (repo, p["number"]) not in skip:
+                outcomes.add(watch_pr(repo, p, state, seen, ctx))
+    return outcomes, unlisted
+
+
+def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
+    """One pass over open PRs on every repo the bots are installed on. launchd runs this every hour as a backstop
+    for the event queue. --baseline marks the commits open right now as seen without reviewing them, so only new
+    ones get reviews. With queue, only the PRs named in that event queue directory are handled."""
+    # the lock is held from before the queue directory is checked until the last file has moved, so another
+    # watch run can't change the queue or the deferred directory between a check and the action it allows
+    lock = watch_lock()
+    if lock is None:
+        watch_log("another watch run holds the lock; " +
+                  ("leaving the queue for the next run" if queue is not None else "skipping this pass"))
+        return 0
+    with lock:
+        if queue is not None:
+            qdir, why = checked_queue_dir(queue)
+            if qdir is None:
+                print(f"prbot: refusing --from-queue: {why}. Nothing was moved.", file=sys.stderr)
+                return 2
+            return cmd_watch_queue(qdir, dry_run, limit, baseline)
+        state = load_watch_state(dry_run)
+        seen = {}
+        ctx = watch_setup(dry_run, limit, baseline)
+        _, unlisted = watch_repos(set().union(*ctx["installed"].values()), state, seen, ctx)
+        if not dry_run:
+            if ctx["gaps"]:  # some repos were never looked at, so nothing can be called closed: merge, don't prune
+                state.update(seen)
+                seen = state
+            else:  # keep entries of repos that could not be listed; prune the rest to PRs still open
+                seen.update({k: v for k, v in state.items() if k.split("#", 1)[0] in unlisted and k not in seen})
+            save_watch_state(seen)
+        runs = ctx["runs"]
+        watch_log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
+        code = 2 if ctx["lookup_failed"] else 0
+        if not dry_run:
+            qdir, why = checked_queue_dir(QUEUE_DIR)
+            if qdir is None:  # the pass itself still ran; only the requeue is refused
+                print(f"prbot: not moving deferred events back: {why}. Check PRBOT_QUEUE_DIR.", file=sys.stderr)
+                return 2
+            # still under the lock: a queue job launched by the first file moved back waits for the next relaunch
+            requeue_deferred(qdir)
+    return code
+
+# ---------- watch --from-queue: handle PRs named in GitHub event files ----------
+
+REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+QUEUE_DIR = Path(os.environ.get("PRBOT_QUEUE_DIR", Path.home() / ".local/state/github-events/prbot")).expanduser()
+MAX_ATTEMPTS = 24        # deferrals before an event file is given up on and rejected
+QUEUE_SETTLE = 30        # seconds an unparsable event file is left alone in case it is still being written
+CLOCK_SKEW = 300         # an mtime up to this far in the future still counts as just written
+
+
+DEFAULT_QUEUE_DIR = Path.home() / ".local/state/github-events/prbot"
+QUEUE_MARKER = ".github-events-queue"   # a regular file the event router keeps in the queue's parent directory
+
+
+def checked_queue_dir(qdir):
+    """(resolved path, None) when qdir is safe to use as an event queue, else (None, why). A queue run moves
+    entries out of the directory, so it must be the default queue or sit next to the router's marker file; the
+    marker lives in the parent because anything inside the queue would keep launchd relaunching the job."""
+    qdir = Path(qdir).expanduser()
+    if os.path.islink(qdir):
+        return None, f"{qdir} is a symlink"
+    if os.path.lexists(qdir) and not qdir.is_dir():
+        return None, f"{qdir} is not a directory"
+    real = Path(os.path.realpath(qdir))
+    try:
+        marked = stat.S_ISREG(os.lstat(real.parent / QUEUE_MARKER).st_mode)
+    except OSError:
+        marked = False
+    if real != Path(os.path.realpath(DEFAULT_QUEUE_DIR)) and not marked:
+        return None, (f"{qdir} is not {DEFAULT_QUEUE_DIR} and its parent has no {QUEUE_MARKER} file, "
+                      f"so it does not look like a GitHub event queue")
+    for kind in ("deferred", "rejected"):  # files are moved into these, so they must not lead anywhere else
+        side = queue_sibling(real, kind)
+        try:
+            mode = os.lstat(side).st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(mode):
+            return None, f"{side} exists but is not a directory (a symlink or a file)"
+    return real, None
+
+
+def queue_sibling(qdir, kind):
+    """<parent>/<name>-deferred or -rejected. Outside the queue directory, so launchd does not see them."""
+    return qdir.parent / f"{qdir.name}-{kind}"
+
+
+def queue_entries(qdir):
+    """(event files, other entries) in qdir, oldest first; names start with a UTC timestamp, so name order is
+    arrival order. Event files are regular .json files whose name does not start with a dot. Everything else
+    (dotfiles, other names, subdirectories, symlinks) is another entry, judged with lstat so a symlink is never
+    followed. A missing directory has neither. Only call this on a directory checked_queue_dir accepted."""
+    try:
+        names = sorted(os.listdir(qdir))
+    except (FileNotFoundError, NotADirectoryError):
+        return [], []
+    files, other = [], []
+    for n in names:
+        p = qdir / n
+        try:
+            mode = os.lstat(p).st_mode
+        except FileNotFoundError:
+            continue
+        ok = stat.S_ISREG(mode) and n.endswith(".json") and not n.startswith(".")
+        (files if ok else other).append(p)
+    return files, other
+
+
+def move_into(path, dest, data=None):
+    """Move path into directory dest, adding -1, -2... to the name on a collision. With data, the moved file is
+    then rewritten as that JSON in place, atomically. Moving first means the event is in exactly one place at
+    every moment: if the rewrite fails, it sits in dest unchanged rather than in both directories."""
+    dest.mkdir(parents=True, exist_ok=True)
+    stem, suffix = (path.stem, path.suffix) if path.suffix == ".json" else (path.name, "")
+    target, i = dest / path.name, 0
+    while os.path.lexists(target):
+        i += 1
+        target = dest / f"{stem}-{i}{suffix}"
+    os.replace(path, target)
+    if data is not None:
+        try:
+            write_json_atomic(target, data, indent=1)
+        except OSError as e:
+            watch_log(f"queue: moved {path.name} to {dest} but could not update it ({e}); it keeps its old content")
+    return target
+
+
+def requeue_deferred(qdir):
+    """Move every deferred event file back into the queue, so the queue job checks those PRs again."""
+    files = queue_entries(queue_sibling(qdir, "deferred"))[0]
+    for p in files:
+        move_into(p, qdir)
+    if files:
+        watch_log(f"queue: moved {len(files)} deferred event file{'s' if len(files) != 1 else ''} back to {qdir}")
+
+
+def parse_queue_event(path):
+    """("pull_request", repo, number) or ("sweep", repo or None, None) from one event file, or None when it is
+    JSON but neither a pull_request event with a valid repo and number nor a sweep whose repo is a valid name or
+    null. Raises ValueError when the file is not JSON at all, which may mean it is still being written."""
+    ev = json.loads(path.read_text())
+    if not isinstance(ev, dict):
+        return None
+    repo = ev.get("repo")
+    if ev.get("kind") == "sweep":  # the router could not tell which PR: rescan repo, or every repo when null
+        return ("sweep", repo, None) if repo is None or (isinstance(repo, str) and REPO_NAME.match(repo)) else None
+    if ev.get("kind") != "pull_request" or not isinstance(repo, str) or not REPO_NAME.match(repo):
+        return None
+    n = ev.get("number")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        return None
+    return "pull_request", repo, n
+
+
+def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
+    """Handle each PR named in the event queue once, with the same decisions as a full pass. launchd relaunches
+    the job for as long as the directory has anything in it, so only PRs held back by this run's limit stay (each
+    run reviews at least one PR, so a burst drains a run at a time). A PR's files are deleted when nothing is
+    left to do on it, moved to <queue>-deferred (with an attempts count) when a review fails or waits out the
+    retry delay, and anything that can never be handled is moved to <queue>-rejected. The hourly full pass
+    moves the deferred files back. Returns 2 if any PR failed or the repository lookup failed. The caller holds
+    the watch lock and has already checked qdir with checked_queue_dir."""
+    if not any(queue_entries(qdir)):
+        return 0
+    rejected, deferred = queue_sibling(qdir, "rejected"), queue_sibling(qdir, "deferred")
+
+    def act(verb, path, why, fn):
+        watch_log(f"queue: {'would ' + verb if dry_run else verb} {path.name}: {why}")
+        if not dry_run:
             try:
-                pr = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json", "labels,commits"]))
-                author, why = detect_author(pr)
-                reviewers, _ = choose_reviewers(author, [l["name"] for l in pr["labels"]])
-                if not reviewers:
-                    entry["skipped"] = why
-                    log(f"{key}: skipped, can't tell who wrote it ({why}). Label it agent:claude or "
-                        f"agent:codex, or run: prbot review {n} -R {repo} --reviewer claude|codex|both")
-                    continue
-                todo = [r for r in reviewers if r not in reviewed_by(repo, n, sha, slugs)]
-            except SystemExit:
-                log(f"{key}: could not read the PR; will retry")
+                fn()
+            except FileNotFoundError:
+                pass
+
+    def reject(path, why):
+        act(f"move to {rejected}", path, why, lambda: move_into(path, rejected))
+
+    def defer(path, why):
+        try:
+            ev = json.loads(path.read_text())
+        except FileNotFoundError:
+            return
+        attempts = ev.get("attempts", 0)
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+            # a negative count would put off rejection almost forever; anything but a whole number >= 0 is invalid
+            watch_log(f"queue: {path.name} has an invalid attempts value {attempts!r}; counting from 0")
+            attempts = 0
+        ev["attempts"] = attempts + 1
+        if ev["attempts"] >= MAX_ATTEMPTS:
+            act(f"move to {rejected}", path, f"{why}; giving up after {ev['attempts']} attempts",
+                lambda: move_into(path, rejected, ev))
+        else:
+            act(f"move to {deferred}", path, f"{why}; attempt {ev['attempts']}", lambda: move_into(path, deferred, ev))
+
+    files, unsupported = queue_entries(qdir)
+    for path in unsupported:  # os.replace moves the entry itself: a directory whole, a symlink as a link
+        kind = "a directory" if os.path.isdir(path) and not os.path.islink(path) else "not an event file"
+        reject(path, kind)
+    events, sweeps = [], []
+    for path in files:
+        try:
+            ev = parse_queue_event(path)
+        except FileNotFoundError:
+            continue
+        except ValueError:
+            try:
+                age = time.time() - path.stat().st_mtime
+            except FileNotFoundError:
                 continue
-            for r in todo:
-                if r not in installed:
-                    log(f"{key}: needs a {r} review, but the {r} bot is not registered")
-                    continue
-                if repo not in installed[r]:
-                    log(f"{key}: needs a {r} review, but the {r} bot is not installed on {repo}")
-                    continue
-                if time.time() - entry.get(f"failed_{r}", 0) < RETRY_AFTER:
-                    continue
-                if runs >= limit:
-                    log(f"{key}: {r} review waits for the next pass (limit {limit} per pass)")
-                    continue
-                runs += 1
-                if dry_run:
-                    log(f"{key}: would run a {r} review")
-                    continue
-                log(f"{key}: running a {r} review")
-                try:
-                    cmd_review(str(n), repo, mode="post", only=[r])
-                except SystemExit:
-                    entry[f"failed_{r}"] = time.time()
-                    log(f"{key}: {r} review failed; retrying in {RETRY_AFTER // 60} minutes")
+            # may still be mid-write; ThrottleInterval (60s) brings the next run after it settles. An mtime
+            # further ahead than clock skew explains counts as settled, so it can't hold the queue open for long.
+            if -CLOCK_SKEW <= age < QUEUE_SETTLE:
+                watch_log(f"queue: leaving {path.name} for now: not valid JSON yet, written {age:.0f}s ago")
+                continue
+            reject(path, f"not valid JSON, written {age:.0f}s ago")
+            continue
+        if ev is None:
+            reject(path, "not a pull_request event with a valid repo and number, nor a sweep")
+        else:
+            (sweeps if ev[0] == "sweep" else events).append((path, ev))
+    if not events and not sweeps:
+        return 0
+    try:
+        # at least one review per run, so files held back by the limit drain one launchd relaunch at a time
+        ctx = watch_setup(dry_run, max(limit, 1), baseline)
+    except (SystemExit, Exception) as e:  # can't tell which repos are covered: retry later, never reject
+        watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
+        for path, _ in events + sweeps:
+            defer(path, "repository lookup failed")
+        return 2
+    covered = {r.lower(): r for r in set().union(*ctx["installed"].values())}
+    complete = not ctx["gaps"]  # only a full inventory of every bot can call a repository unknown
+    failed = 1 if ctx["lookup_failed"] else 0
+    uncovered = 0
+
+    def not_covered(path, repo, label=""):
+        nonlocal uncovered
+        if complete:
+            reject(path, f"{label}{repo}: {repo} is not a repository the bots are installed on")
+        else:
+            uncovered += 1
+            defer(path, f"{label}{repo}: {repo} is not in the bot inventory, which is incomplete")
+
+    groups = {}
+    for path, (_, repo, n) in events:
+        if repo.lower() not in covered:
+            not_covered(path, repo, "event for ")
+        else:
+            groups.setdefault((covered[repo.lower()], n), []).append(path)
+    sweep_paths, sweep_repos = [], set()  # None in sweep_repos means every covered repository
+    for path, (_, repo, _) in sweeps:
+        if repo is not None and repo.lower() not in covered:
+            not_covered(path, repo, "sweep of ")
+            continue
+        sweep_paths.append(path)
+        sweep_repos.add(covered[repo.lower()] if repo is not None else None)
+    if uncovered and not failed:
+        failed = 1  # events can't be placed until the configuration is fixed: say so with the exit code
+    state = load_watch_state(dry_run)
+    seen = {}
+    for (repo, n), paths in groups.items():
+        try:
+            p = json.loads(gh_read(["pr", "view", str(n), "-R", repo, "--json",
+                                    "number,state,isDraft,headRefOid"]))
+            result = watch_pr(repo, p, state, seen, ctx)
+        except (SystemExit, Exception) as e:
+            watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
+            result = "failed"
+        if result == "limit":  # untouched: launchd starts another run after ThrottleInterval
+            watch_log(f"{repo}#{n}: over this run's limit; leaving {len(paths)} file"
+                      f"{'s' if len(paths) != 1 else ''} in the queue for the next run")
+            continue
+        for path in paths:
+            if result == "done":
+                act("delete", path, f"{repo}#{n} handled", path.unlink)
+            else:
+                defer(path, f"{repo}#{n} {'failed' if result == 'failed' else 'has to wait'}")
+        failed += result == "failed"
+    if sweep_paths:  # after the PR events, which are more precise; PRs they just handled are skipped
+        repos = set(covered.values()) if None in sweep_repos else sweep_repos
+        watch_log(f"queue: sweep of {'every covered repository' if None in sweep_repos else ', '.join(sorted(repos))}")
+        try:
+            outcomes, unlisted = watch_repos(repos, state, seen, ctx, skip=set(groups))
+        except (SystemExit, Exception) as e:
+            watch_log(f"queue: sweep failed ({e!r})")
+            outcomes, unlisted = {"failed"}, set()
+        # each outcome is checked on its own, so one PR's success or wait can't hide another PR's limit block.
+        # Retry-delay waits and unavailable bots are owned by the hourly pass, so they don't hold the sweep.
+        sweep_failed = "failed" in outcomes or bool(unlisted)
+        if None in sweep_repos and not complete:
+            watch_log("queue: sweep could not reach repositories missing from the incomplete bot inventory")
+            sweep_failed = True
+        failed += sweep_failed
+        if "limit" in outcomes:  # a review ran this run, so leaving the sweep in place still makes progress
+            watch_log("queue: sweep is over this run's limit; leaving it in the queue for the next run")
+        elif sweep_failed:
+            for path in sweep_paths:
+                defer(path, "sweep failed or was incomplete")
+        else:
+            for path in sweep_paths:  # only the files listed at the start; a sweep written since waits its turn
+                act("delete", path, "sweep done", path.unlink)
     if not dry_run:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        WATCH_STATE.write_text(json.dumps(seen, indent=1) + "\n")  # keeps only PRs still open
-    log(f"pass done: {runs} review{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}")
-    return 0
+        state.update(seen)  # unlike a full pass, a queue run sees only some PRs, so it must not prune the rest
+        save_watch_state(state)
+    runs = ctx["runs"]
+    watch_log(f"queue done: {len(groups)} PR{'s' if len(groups) != 1 else ''}, {runs} review"
+              f"{'s' if runs != 1 else ''} {'planned' if dry_run else 'run'}, {failed} failed")
+    return 2 if failed else 0
 
 # ---------- commands ----------
 
@@ -731,11 +1220,19 @@ def main(argv):
         args = rest[1:] if rest[:1] == ["--"] else rest
         args = args[1:] if args[:1] == ["gh"] else args
         return 0 if is_feedback_write(args, load_config().get("codex_triggers_as_bot", False)) else 1
+    if cmd in ("watch", "review"):
+        review_timeout()  # a bad PRBOT_REVIEW_TIMEOUT stops here with a clear message, before any work
     if cmd == "watch":
         limit = WATCH_LIMIT
         if "--limit" in rest:
             limit = int(rest[rest.index("--limit") + 1])
-        return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest)
+        queue = None
+        if "--from-queue" in rest:
+            i = rest.index("--from-queue")
+            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                die("usage: prbot watch --from-queue DIR [--dry-run] [--limit N] [--baseline]")
+            queue = rest[i + 1]
+        return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest, queue=queue)
     if cmd == "review":
         opts = {"-R": None, "--repo": None, "--reviewer": None}
         flags, target, i = set(), None, 0

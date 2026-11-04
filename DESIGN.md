@@ -126,10 +126,68 @@ installed on, and reviews each new head commit once with the agent the routing
 rules pick. Whether a commit was already reviewed comes from the
 "Reviewed commit" footer in the bots' own reviews, so a lost state file never
 causes duplicate reviews. The state file only remembers PRs it skipped as
-unclear (so they are logged once) and reviewers that failed (retried after an
-hour). A pass runs at most 3 reviews, so a backlog of open PRs cannot start a
+unclear (so they are logged once; their labels are still read on every run)
+and reviewers that failed (retried after an hour). A pass runs at most 3 reviews, so a backlog of open PRs cannot start a
 burst of model runs. `--baseline` marks the commits open at install time as
 seen, for starting from now instead of reviewing old PRs.
+
+Polling every 5 minutes means up to 5 minutes of delay and 288 full scans a
+day. The replacement is event-driven: OpenClaw's GitHub event router drops one
+JSON file per PR event into `~/.local/state/github-events/prbot/`, and a
+launchd job with `QueueDirectories` runs `prbot watch --from-queue` on that
+directory. A queue run makes the same per-PR decision as a full pass, through
+the same function, for only the PRs named in the files. The full pass stays as
+an hourly backstop for events that never arrive.
+
+launchd keeps restarting a `QueueDirectories` job while the directory has
+any entry in it, so a queue run leaves only the files of PRs held back by its
+per-run limit. Each run reviews at least one PR, so those relaunches always
+make progress and drain a burst about a minute apart. A PR's files are
+deleted once nothing is left to do on it. When its review fails or has to
+wait out the retry delay, the files move to a sibling `prbot-deferred/` with an `attempts`
+count, and the hourly pass moves them back after it finishes; the pass has
+already looked at those PRs, so the queue job's recheck finds the reviewed
+commit and costs only GitHub reads. Entries that can never succeed (bad JSON,
+other event kinds, repositories the bots don't cover, stray files such as
+`.DS_Store`, and events deferred 24 times) move to `prbot-rejected/` and stay
+there as evidence until someone clears it. The router publishes by renaming a
+finished file into the queue, but a file that is not valid JSON still gets 30
+seconds to settle before it is rejected, in case some other writer is
+mid-write. The state file is written through a temp file and `os.replace`,
+and a damaged one is moved aside with a timestamp rather than crashing every
+run; single malformed entries are dropped with a log line each.
+
+Because a queue run moves everything it can't use out of the directory, it
+first checks that the directory really is an event queue: the default path,
+or a directory whose parent holds the router's `.github-events-queue` marker
+file. A symlinked or non-directory path is refused too, and so are `-deferred`
+and `-rejected` destinations that are not real directories. Without that
+check, `prbot watch --from-queue .` in a checkout would move `.git` and the
+sources into a `-rejected` directory.
+
+When the router sees GitHub activity it can't pin to one PR, it writes a
+uniquely named sweep file naming a repository, or null for all of them. A
+queue run handles the sweeps it listed at the start after the PR events, by
+running the full pass's loop over those repositories. The loop reports each
+kind of PR outcome separately, so a sweep stays in the queue whenever any PR
+hit the limit; a review ran in that run, and each review either posts or
+records a failure, so the next run starts further along.
+
+The bots' installation lists decide which repositories are covered. An empty
+or unreadable list for either bot makes the inventory incomplete. A
+repository missing from an incomplete inventory may belong to the missing
+bot, so its events are deferred, not rejected, and the full pass keeps all
+state rather than pruning entries for repositories it never looked at. The two jobs can overlap, so every watch run
+takes a non-blocking `flock` on `~/.config/prbot/watch.lock` and exits quietly
+when another run holds it. The lock covers every check on the queue
+directories and every move that follows, including the hourly pass moving
+deferred files back, so no run acts on a check another run has made stale.
+
+Each reviewer CLI runs in its own process group with a 900 second limit
+(`PRBOT_REVIEW_TIMEOUT`). A hung Codex review once held the whole watch queue.
+On timeout prbot kills the group, not only the CLI, because children left
+holding the output pipe would keep prbot waiting. The timeout counts as a
+failed review, so the commit is not marked reviewed and the pass moves on.
 
 ## What stays on Kenny's account
 

@@ -218,17 +218,20 @@ class Watch(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = {k: getattr(prbot, k) for k in ("installed_repos", "gh_read", "cmd_review", "load_config", "WATCH_STATE")}
+        self.saved = {k: getattr(prbot, k) for k in ("installed_repos", "gh_read", "cmd_review", "load_config", "WATCH_STATE",
+                                                       "QUEUE_DIR")}
         prbot.WATCH_STATE = Path(self.tmp.name, "watch-state.json")
+        prbot.QUEUE_DIR = Path(self.tmp.name, "queue")
+        Path(self.tmp.name, prbot.QUEUE_MARKER).write_text("")  # the event router's marker next to the queue
         prbot.load_config = lambda: {"claude": {"slug": "claude-pr-gh"}, "codex": {"slug": "codex-pr-gh"}}
         prbot.installed_repos = lambda bot: {"o/r"}
         prbot.gh_read = self.fake_gh
         self.reviews = {3: [["codex-pr-gh[bot]", "### Codex review\n<sub>Reviewed commit `" + "c" * 10 + "` · posted</sub>"]]}
-        self.runs, self.fail = [], False
+        self.runs, self.reviews_fail = [], False  # not self.fail, which would hide TestCase.fail
 
         def fake_review(n, repo, mode, only):
             self.runs.append((int(n), only[0]))
-            if self.fail:
+            if self.reviews_fail:
                 raise SystemExit(2)
         prbot.cmd_review = fake_review
 
@@ -276,7 +279,7 @@ class Watch(unittest.TestCase):
         self.assertIn((2, "claude"), self.runs)
 
     def test_failed_review_waits_an_hour(self):
-        self.fail = True
+        self.reviews_fail = True
         self.run_pass(limit=5)
         self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])
         self.run_pass(limit=5)
@@ -295,6 +298,879 @@ class Watch(unittest.TestCase):
         self.assertEqual(self.runs, [])
         self.assertIn("would run a claude review", log)
         self.assertFalse(prbot.WATCH_STATE.exists())
+
+    def test_full_pass_still_prunes_state_to_open_prs(self):
+        prbot.WATCH_STATE.write_text(json.dumps({"o/r#99@" + "0" * 10: {"skipped": "closed long ago"}}))
+        self.run_pass(limit=5)
+        state = json.loads(prbot.WATCH_STATE.read_text())
+        self.assertNotIn("o/r#99@" + "0" * 10, state)
+        self.assertIn("o/r#4@" + "d" * 10, state)
+
+    def test_full_pass_skips_while_another_run_holds_the_lock(self):
+        import fcntl
+        with open(prbot.WATCH_STATE.with_name("watch.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            log = self.run_pass(limit=5)
+        self.assertEqual(self.runs, [])
+        self.assertIn("another watch run holds the lock", log)
+        self.run_pass(limit=5)  # released: the next pass runs normally
+        self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])
+
+    def test_failed_listing_keeps_that_repos_state(self):
+        # Codex review of PR 1: a 502 on one repo's PR list dropped its baseline and retry-delay entries
+        import time
+        prbot.installed_repos = lambda bot: {"o/r", "o/down"}
+        down = {"o/down#7@" + "7" * 10: {"baseline": True}, "o/down#8@" + "8" * 10: {"failed_claude": time.time()}}
+        gone = "o/r#99@" + "9" * 10   # o/r was listed and #99 is no longer open: pruned as before
+        prbot.WATCH_STATE.write_text(json.dumps({**down, gone: {"skipped": "x"}}))
+        real_gh = self.fake_gh
+        def gh(args):
+            if args[:2] == ["pr", "list"] and args[3] == "o/down":
+                prbot.die("gh pr list failed: HTTP 502")
+            return real_gh(args)
+        prbot.gh_read = gh
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            log = self.run_pass(limit=5)
+        self.assertIn("o/down: could not list PRs", log)
+        state = json.loads(prbot.WATCH_STATE.read_text())
+        self.assertEqual({k: state[k] for k in down}, down)
+        self.assertNotIn(gone, state)
+
+    def test_incomplete_inventory_never_prunes_state(self):
+        gone = "o/r#99@" + "9" * 10
+        prbot.WATCH_STATE.write_text(json.dumps({gone: {"skipped": "x"}}))
+        def lookup(bot):
+            if bot == "codex":
+                prbot.die("GitHub GET /app/installations failed: HTTP 502")
+            return {"o/r"}
+        prbot.installed_repos = lookup
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            code = prbot.cmd_watch(limit=5)
+        self.assertEqual(code, 2)
+        self.assertIn("bot inventory is incomplete", out.getvalue())
+        self.assertIn(gone, json.loads(prbot.WATCH_STATE.read_text()))
+        self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])  # the known repos are still reviewed
+
+    def test_malformed_state_entries_are_dropped(self):
+        # Codex review of PR 1: {"o/r#2@bbbbbbbbbb": null} crashed every full pass at entry.get(...)
+        import time
+        b, d = "o/r#2@" + "b" * 10, "o/r#4@" + "d" * 10
+        good = {"o/r#5@" + "e" * 10: {"failed_claude": time.time() - 60}, "o/r#3@" + "c" * 10: {"baseline": True},
+                d: {"skipped": "no agent commits"}}
+        bad = {b: None, "o/r#9@" + "9" * 10: {"failed_claude": "yesterday"},
+               "o/r#8@" + "8" * 10: {"failed_codex": time.time() + 3 * 86400},
+               "o/r#7@" + "7" * 10: {"failed_claude": float("nan")}, "o/r#6@" + "6" * 10: {"failed_claude": True},
+               "o/r#5@" + "5" * 10: {"baseline": False}, "o/r#4@" + "4" * 10: {"surprise": 1},
+               "not a key": {}, "o/r#3@" + "3" * 10: {"skipped": 7}}
+        prbot.WATCH_STATE.write_text(json.dumps({**good, **bad}))
+        log = self.run_pass(limit=5)
+        for key in bad:
+            self.assertIn(f"watch state: dropping entry {key!r}", log)
+        self.assertEqual(log.count("dropping entry"), len(bad))
+        self.assertIn("pass done", log)
+        # 2 has no usable entry, so it is reviewed; 5 is still inside its retry delay; 4 stays quietly skipped
+        self.assertEqual(self.runs, [(2, "claude")])
+        self.assertNotIn(d + ": skipped", log)
+        state = json.loads(prbot.WATCH_STATE.read_text())
+        self.assertEqual(set(bad) & set(state), {b})  # 2 is still open, so it gets a fresh entry
+        self.assertEqual(state[b], {})
+        self.assertEqual(prbot.valid_state_entries(state), state)
+
+    def test_skipped_pr_is_reviewed_once_it_is_labeled(self):
+        # regression (codex review of PR 1): a PR skipped as unattributed stayed skipped after an agent label
+        # was added on the same commit, because the skipped marker returned before labels were read
+        self.run_pass(limit=5)
+        self.VIEW = {**self.VIEW, 4: dict(PR13, labels=[{"name": "agent:claude"}])}
+        log = self.run_pass(limit=5)
+        self.assertIn((4, "codex"), self.runs)
+        self.assertNotIn("skipped", log)
+
+
+class WatchQueue(unittest.TestCase):
+    """watch --from-queue over the same fake repo as Watch, plus PR 6 (closed) and PR 9 (unreadable)."""
+    SHA, VIEW = Watch.SHA, Watch.VIEW
+    tearDown = Watch.tearDown
+    CLOSED = {6}
+
+    def setUp(self):
+        Watch.setUp(self)
+        self.queue = Path(self.tmp.name, "queue")
+        self.queue.mkdir()
+        self.fail_on, self.seq, self.listed = set(), 0, []
+
+        def fake_review(n, repo, mode, only):
+            self.runs.append((int(n), only[0]))
+            if int(n) in self.fail_on:
+                raise SystemExit(2)
+            # a posted review shows up in the PR's reviews, as on GitHub
+            self.reviews.setdefault(int(n), []).append(
+                [f"{only[0]}-pr-gh[bot]", f"Reviewed commit `{self.SHA[int(n)][:10]}`"])
+        prbot.cmd_review = fake_review
+
+    def fake_gh(self, args):
+        if args[:2] == ["pr", "list"]:
+            self.listed.append(args[3])
+        if args[:2] == ["pr", "view"] and "state" in args[-1]:
+            n = int(args[2])
+            if n == 9:
+                prbot.die("gh pr view 9 failed: HTTP 502")
+            return json.dumps({"number": n, "state": "CLOSED" if n in self.CLOSED else "OPEN",
+                               "isDraft": n == 1, "headRefOid": self.SHA.get(n, "6" * 40)})
+        return Watch.fake_gh(self, args)
+
+    def event(self, number, event="opened", repo="o/r", **extra):
+        self.seq += 1
+        name = f"20261103T1415{self.seq:02d}123Z-1730643302_12345{self.seq}-{repo.replace('/', '__')}-pull_request-{number}-{event}.json"
+        body = {"repo": repo, "kind": "pull_request", "number": number, "event": event,
+                "received_at": "2026-11-03T14:15:02.123Z", "slack_message_id": "1730643302.123456",
+                "slack_channel": "C0CEMPH1L0N", "source": "github-event-router", "version": 1, **extra}
+        path = self.queue / name
+        path.write_text(json.dumps(body))
+        return path
+
+    def run_queue(self, **kw):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = prbot.cmd_watch(queue=str(self.queue), **kw)
+        return code, out.getvalue()
+
+    def left(self):
+        return sorted(p.name for p in self.queue.iterdir())
+
+    def test_each_pr_is_handled_once_and_its_files_deleted(self):
+        self.event(2, "opened")
+        self.event(5, "opened")
+        self.event(2, "synchronize")
+        self.event(2, "comment")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.runs, [(2, "claude"), (5, "claude")])  # oldest first, PR 2 once despite 3 events
+        self.assertEqual(self.left(), [])
+        self.assertIn("queue done: 2 PRs, 2 reviews run, 0 failed", log)
+
+    def test_files_are_deleted_when_there_is_nothing_to_do(self):
+        # 1 is a draft, 3 already has a codex review of its head commit, 4 can't be attributed, 6 is closed
+        for n in (1, 3, 4, 6):
+            self.event(n, "closed" if n == 6 else "unknown")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [], []))
+        self.assertIn("o/r#4@dddddddddd: skipped, can't tell who wrote it", log)
+
+    def names(self, kind):
+        d = prbot.queue_sibling(self.queue, kind)
+        return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+    def read(self, kind, name):
+        return json.loads(Path(prbot.queue_sibling(self.queue, kind), name).read_text())
+
+    def age(self, path, text, seconds=prbot.QUEUE_SETTLE + 1):
+        """Write path and backdate its mtime, as if the producer finished with it that long ago."""
+        path.write_text(text)
+        t = path.stat().st_mtime - seconds
+        os.utime(path, (t, t))
+        return path
+
+    def test_unparsable_event_waits_while_young_then_is_rejected(self):
+        # Codex review of PR 1: a file read mid-write must not be rejected before its producer finishes
+        young = Path(self.queue, "20261103T141502123Z-young.json")
+        young.write_text('{"repo": "o/r", "kind": "pull_re')
+        before = young.read_text()
+        prbot.installed_repos = lambda bot: (_ for _ in ()).throw(AssertionError("no GitHub call for a young file"))
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("rejected")), (0, [young.name], []))
+        self.assertEqual(young.read_text(), before)
+        self.assertIn("leaving 20261103T141502123Z-young.json for now: not valid JSON yet", log)
+        # the producer finishes the write: the event is handled normally
+        young.write_text(json.dumps({"repo": "o/r", "kind": "pull_request", "number": 2}))
+        prbot.installed_repos = lambda bot: {"o/r"}
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude")], []))
+        # a file still unparsable after the settle time is rejected, so it can't relaunch the job for long
+        old = self.age(Path(self.queue, "20261103T141503123Z-old.json"), '{"repo": "o/r"')
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("rejected")), (0, [], [old.name]))
+        self.assertIn(f"{old.name}: not valid JSON, written", log)
+
+    def test_damaged_watch_state_is_moved_aside(self):
+        # Codex review of PR 1: a truncated state file crashed every queue run and every hourly pass
+        for damaged in ('{"o/r#2":', "[1, 2]"):
+            with self.subTest(damaged=damaged):
+                for p in self.tmp_files("watch-state.json.corrupt-"):
+                    p.unlink()
+                prbot.WATCH_STATE.write_text(damaged)
+                self.event(5)
+                code, log = self.run_queue(limit=5)
+                self.assertEqual((code, self.left()), (0, []))
+                self.assertIn("watch state was damaged; moved it to", log)
+                corrupt = self.tmp_files("watch-state.json.corrupt-")
+                self.assertEqual(len(corrupt), 1)
+                self.assertRegex(corrupt[0].name, r"^watch-state\.json\.corrupt-\d{8}T\d{6}Z$")
+                self.assertEqual(corrupt[0].read_text(), damaged)
+                self.assertIsInstance(json.loads(prbot.WATCH_STATE.read_text()), dict)
+        prbot.WATCH_STATE.write_text('{"o/r#2":')  # the hourly pass recovers the same way
+        log = Watch.run_pass(self, limit=5)
+        self.assertIn("watch state was damaged", log)
+        self.assertIn("pass done", log)
+
+    def tmp_files(self, prefix):
+        return sorted(p for p in Path(self.tmp.name).iterdir() if p.name.startswith(prefix))
+
+    def test_state_and_config_writes_never_leave_a_partial_file(self):
+        prbot.WATCH_STATE.write_text(json.dumps({"keep": {}}))
+        real_replace = os.replace
+        def crash(src, dst):
+            raise OSError("disk full")
+        os.replace = crash
+        try:
+            with self.assertRaises(OSError):
+                prbot.save_watch_state({"new": {"x": 1}})
+        finally:
+            os.replace = real_replace
+        self.assertEqual(json.loads(prbot.WATCH_STATE.read_text()), {"keep": {}})
+        self.assertEqual([p.name for p in Path(self.tmp.name).iterdir() if p.name.endswith(".tmp")], [])
+        saved = (prbot.CONFIG, prbot.CONFIG_DIR)
+        prbot.CONFIG_DIR = Path(self.tmp.name, "cfg")
+        prbot.CONFIG = prbot.CONFIG_DIR / "config.json"
+        try:
+            prbot.save_config({"claude": {"slug": "claude-pr-gh"}})
+            self.assertEqual(json.loads(prbot.CONFIG.read_text()), {"claude": {"slug": "claude-pr-gh"}})
+            self.assertEqual(sorted(p.name for p in prbot.CONFIG_DIR.iterdir()), ["config.json"])
+        finally:
+            prbot.CONFIG, prbot.CONFIG_DIR = saved
+
+    def test_side_directories_sit_next_to_the_queue_not_inside_it(self):
+        for kind in ("deferred", "rejected"):
+            d = prbot.queue_sibling(self.queue, kind)
+            self.assertEqual(d.parent, self.queue.parent)
+            self.assertEqual(d.name, f"queue-{kind}")
+        self.assertEqual(prbot.queue_sibling(Path("/x/github-events/prbot"), "rejected"),
+                         Path("/x/github-events/prbot-rejected"))
+
+    def test_relabeled_pr_on_the_same_commit_gets_reviewed(self):
+        # regression (codex review of PR 1): PR 4 was skipped as unattributed; a later agent:codex label on the
+        # same head commit produced a queue event that was deleted as handled without reading the labels
+        self.event(4, "opened")
+        self.run_queue(limit=5)
+        self.assertIn("skipped", json.loads(prbot.WATCH_STATE.read_text())["o/r#4@" + "d" * 10])
+        self.VIEW = {**self.VIEW, 4: dict(PR13, labels=[{"name": "agent:codex"}])}
+        self.event(4, "labeled")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [(4, "claude")], []))
+        self.assertNotIn("skipped", json.loads(prbot.WATCH_STATE.read_text())["o/r#4@" + "d" * 10])
+
+    def test_failed_pr_is_deferred_and_the_rest_go_on(self):
+        prbot.WATCH_STATE.write_text(json.dumps({"other/repo#1@" + "1" * 10: {"skipped": "x"}}))
+        self.fail_on = {2}
+        moved = [self.event(2).name, self.event(9).name]
+        self.event(5)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.runs, [(2, "claude"), (5, "claude")])
+        self.assertEqual((self.left(), self.names("deferred")), ([], sorted(moved)))
+        self.assertIn("o/r#9: could not handle the PR", log)
+        self.assertEqual(self.read("deferred", moved[0])["attempts"], 1)
+        self.assertEqual(self.read("deferred", moved[0])["slack_message_id"], "1730643302.123456")
+        state = json.loads(prbot.WATCH_STATE.read_text())
+        self.assertIn("failed_claude", state["o/r#2@" + "b" * 10])
+        self.assertIn("other/repo#1@" + "1" * 10, state)  # a queue run keeps state for PRs it did not visit
+        # back in the queue, PR 2 is inside its retry delay: no model run, deferred again, and not a new failure
+        Path(prbot.queue_sibling(self.queue, "deferred"), moved[1]).unlink()
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            prbot.requeue_deferred(self.queue)
+        self.assertEqual((self.left(), self.names("deferred")), ([moved[0]], []))
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, len(self.runs), self.left()), (0, 2, []))
+        self.assertEqual(self.read("deferred", moved[0])["attempts"], 2)
+
+    def test_review_over_the_limit_stays_in_the_queue_untouched(self):
+        self.event(2)
+        wait = self.event(5)
+        before = wait.read_text()
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [(2, "claude")], [wait.name], []))
+        self.assertEqual(wait.read_text(), before)
+        self.assertNotIn("attempts", json.loads(wait.read_text()))
+        self.assertIn("o/r#5: over this run's limit; leaving 1 file in the queue", log)
+
+    def test_limit_bound_runs_always_make_progress(self):
+        # PR 2 fails and PR 5 succeeds; each relaunch must take at least one PR out of the queue, even at limit 0
+        self.fail_on = {2}
+        self.event(2)
+        self.event(5)
+        code, _ = self.run_queue(limit=0)
+        self.assertEqual((code, self.runs, len(self.left()), len(self.names("deferred"))), (2, [(2, "claude")], 1, 1))
+        code, _ = self.run_queue(limit=0)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude"), (5, "claude")], []))
+
+    def test_repository_lookup_failure_defers_everything(self):
+        names = [self.event(2).name, self.event(2, repo="someone/else").name]
+        self.age(Path(self.queue, "bad.json"), "{oops")
+        def lookup_fails(bot):
+            prbot.die("GitHub GET /app/installations failed: HTTP 502")
+        prbot.installed_repos = lookup_fails
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (2, [], []))
+        self.assertEqual(self.names("deferred"), sorted(names))
+        self.assertEqual(self.names("rejected"), ["bad.json"])  # malformed needs no lookup to reject
+        self.assertEqual(self.read("deferred", names[1])["attempts"], 1)
+        self.assertIn("could not read where the claude bot is installed", log)
+        self.assertIn("someone/else is not in the bot inventory, which is incomplete", log)
+
+    def test_event_is_rejected_after_too_many_attempts(self):
+        self.fail_on = {2}
+        name = self.event(2, attempts=prbot.MAX_ATTEMPTS - 1).name
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("deferred"), self.names("rejected")), (2, [], [], [name]))
+        self.assertEqual(self.read("rejected", name)["attempts"], prbot.MAX_ATTEMPTS)
+        self.assertIn(f"giving up after {prbot.MAX_ATTEMPTS} attempts", log)
+
+    def test_malformed_events_are_rejected(self):
+        bad = {"not-json.json": "{oops", "list.json": "[1, 2]", "issue.json": json.dumps({"repo": "o/r", "kind": "issue", "number": 2}),
+               "no-number.json": json.dumps({"repo": "o/r", "kind": "pull_request"}),
+               "string-number.json": json.dumps({"repo": "o/r", "kind": "pull_request", "number": "2"}),
+               "bool-number.json": json.dumps({"repo": "o/r", "kind": "pull_request", "number": True}),
+               "bad-repo.json": json.dumps({"repo": "o", "kind": "pull_request", "number": 2})}
+        for name, text in bad.items():
+            self.age(Path(self.queue, name), text)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left(), self.names("rejected")), (0, [], [], sorted(bad)))
+        self.assertEqual(self.read("rejected", "list.json"), [1, 2])  # kept unchanged as evidence
+        self.assertIn("not-json.json: not valid JSON, written", log)
+        for name in bad:
+            if name != "not-json.json":
+                self.assertIn(f"{name}: not a pull_request event", log)
+
+    def test_events_for_repos_the_bots_do_not_cover_are_rejected(self):
+        name = self.event(2, repo="someone/else").name
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left(), self.names("rejected")), (0, [], [], [name]))
+        self.assertIn("someone/else is not a repository the bots are installed on", log)
+
+    def test_unsupported_entries_leave_the_queue_without_calling_github(self):
+        # regression (codex review of PR 1): launchd's QueueDirectories counts any entry, so an ignored
+        # .DS_Store or directory left behind would restart the job forever
+        for name in (".DS_Store", ".partial.json", "notes.txt", "event.json.tmp"):
+            Path(self.queue, name).write_text("{}")
+        target = Path(self.tmp.name, "elsewhere.json")
+        target.write_text('{"keep": "me"}')
+        Path(self.queue, "link.json").symlink_to(target)
+        Path(prbot.queue_sibling(self.queue, "rejected")).mkdir()
+        Path(prbot.queue_sibling(self.queue, "rejected"), "notes.txt").write_text("older")
+        def no_github(bot):
+            raise AssertionError("a queue with no event files must not call GitHub")
+        prbot.installed_repos = no_github
+        code, log = self.run_queue()
+        self.assertEqual((code, self.left()), (0, []))
+        self.assertEqual(self.names("rejected"), [".DS_Store", ".partial.json", "event.json.tmp", "link.json",
+                                                  "notes.txt", "notes.txt-1"])
+        self.assertIn("notes.txt: not an event file", log)
+        # the link itself moved; what it points at did not
+        moved = Path(prbot.queue_sibling(self.queue, "rejected"), "link.json")
+        self.assertTrue(moved.is_symlink())
+        self.assertEqual(os.readlink(moved), str(target))
+        self.assertEqual(target.read_text(), '{"keep": "me"}')
+
+    def test_subdirectory_in_a_checked_queue_moves_to_rejected_intact(self):
+        # left in place it would keep launchd relaunching the job every ThrottleInterval
+        sub = Path(self.queue, "sub.json")
+        (sub / "deeper").mkdir(parents=True)
+        Path(sub, "deeper", "inner.txt").write_text("x")
+        self.event(2)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("rejected"), self.runs), (0, [], ["sub.json"], [(2, "claude")]))
+        self.assertIn("sub.json: a directory", log)
+        self.assertEqual(Path(prbot.queue_sibling(self.queue, "rejected"), "sub.json", "deeper", "inner.txt").read_text(), "x")
+
+    def run_refused(self, qdir):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = prbot.cmd_watch(queue=str(qdir), limit=5)
+        return code, err.getvalue()
+
+    def test_queue_directory_must_be_the_default_or_next_to_the_marker(self):
+        # Codex review of PR 1: `prbot watch --from-queue .` in a checkout moved .git and the sources out
+        plain = Path(self.tmp.name, "plain")
+        checkout = plain / "checkout"
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "README.md").write_text("hello")
+        (checkout / "event.json").write_text(json.dumps({"repo": "o/r", "kind": "pull_request", "number": 2}))
+        code, err = self.run_refused(checkout)
+        self.assertEqual(code, 2)
+        self.assertIn("refusing --from-queue", err)
+        self.assertIn(".github-events-queue", err)
+        self.assertEqual(sorted(p.name for p in checkout.iterdir()), [".git", "README.md", "event.json"])
+        self.assertEqual(sorted(p.name for p in plain.iterdir()), ["checkout"])  # no -rejected, no -deferred
+        # a marker that is not a regular file does not count
+        (plain / prbot.QUEUE_MARKER).mkdir()
+        self.assertEqual(self.run_refused(checkout)[0], 2)
+        # the default queue is accepted even without a marker
+        saved = prbot.DEFAULT_QUEUE_DIR
+        prbot.DEFAULT_QUEUE_DIR = checkout
+        try:
+            code, log = self.run_queue_at(checkout)
+        finally:
+            prbot.DEFAULT_QUEUE_DIR = saved
+        self.assertEqual((code, self.runs), (0, [(2, "claude")]))
+        # the marker parent is accepted (every other test in this class uses it)
+        self.event(5)
+        self.assertEqual((self.run_queue(limit=5)[0], self.left()), (0, []))
+
+    def run_queue_at(self, qdir):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = prbot.cmd_watch(queue=str(qdir), limit=5)
+        return code, out.getvalue()
+
+    def test_symlinked_or_non_directory_queue_is_refused(self):
+        self.event(2)
+        link = Path(self.tmp.name, "queue-link")
+        link.symlink_to(self.queue)
+        code, err = self.run_refused(link)
+        self.assertEqual(code, 2)
+        self.assertIn("is a symlink", err)
+        afile = Path(self.tmp.name, "afile")
+        afile.write_text("")
+        code, err = self.run_refused(afile)
+        self.assertEqual(code, 2)
+        self.assertIn("is not a directory", err)
+        self.assertEqual((len(self.left()), self.runs), (1, []))
+
+    def test_hourly_pass_refuses_an_unsafe_queue_but_still_reviews(self):
+        plain = Path(self.tmp.name, "plain", "prbot")
+        deferred = prbot.queue_sibling(plain, "deferred")
+        deferred.mkdir(parents=True)
+        (deferred / "e.json").write_text("{}")
+        prbot.QUEUE_DIR = plain
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = prbot.cmd_watch(limit=5)
+        self.assertEqual(code, 2)
+        self.assertIn("not moving deferred events back", err.getvalue())
+        self.assertEqual(sorted(self.runs), [(2, "claude"), (5, "claude")])
+        self.assertEqual([p.name for p in deferred.iterdir()], ["e.json"])
+        self.assertFalse(plain.exists())
+
+    def test_pr_needing_an_unavailable_bot_is_deferred_not_dropped(self):
+        # Codex review of PR 1: with only the codex bot on the repo, a codex-written PR's event was deleted unreviewed
+        prbot.installed_repos = lambda bot: {"o/r"} if bot == "codex" else {"o/elsewhere"}
+        name = self.event(2).name
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [], [], [name]))
+        self.assertIn("needs a claude review, but the claude bot is not installed on o/r", log)
+        # the claude bot's inventory is empty: same outcome
+        prbot.installed_repos = lambda bot: {"o/r"} if bot == "codex" else set()
+        Path(prbot.queue_sibling(self.queue, "deferred"), name).rename(Path(self.queue, name))
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left(), self.names("deferred")), (0, [], [], [name]))
+        self.assertIn("the claude bot is not registered or its installations are unknown", log)
+
+    def test_incomplete_inventory_defers_instead_of_rejecting(self):
+        # Codex review of PR 1: a missing config or a missing bot inventory made every repo look unknown
+        saved = prbot.load_config
+        try:
+            for case, setup in (("no config", lambda: setattr(prbot, "load_config", lambda: {})),
+                                ("one bot unregistered",
+                                 lambda: setattr(prbot, "load_config", lambda: {"codex": {"slug": "codex-pr-gh"}})),
+                                ("one lookup fails", lambda: setattr(prbot, "installed_repos", self.claude_lookup_fails)),
+                                ("one inventory empty", lambda: setattr(prbot, "installed_repos",
+                                                                         lambda b: set() if b == "claude" else {"o/r"}))):
+                with self.subTest(case=case):
+                    prbot.load_config, prbot.installed_repos = saved, (lambda bot: {"o/r"})
+                    for d in ("deferred", "rejected"):
+                        for p in Path(prbot.queue_sibling(self.queue, d)).glob("*") if prbot.queue_sibling(self.queue, d).is_dir() else []:
+                            p.unlink()
+                    setup()
+                    other = self.event(2, repo="o/maybe").name
+                    sweep = self.sweep("o/maybe", name="sweep-20261103T150000000Z-aaaaaa.json")
+                    code, log = self.run_queue(limit=5)
+                    self.assertEqual(code, 2)
+                    self.assertEqual((self.left(), self.names("rejected")), ([], []))
+                    self.assertEqual(self.names("deferred"), sorted([other, sweep]))
+                    self.assertIn("bot inventory is incomplete", log)
+        finally:
+            prbot.load_config = saved
+        # with every inventory read, the same repo is rejected as unknown
+        prbot.installed_repos = lambda bot: {"o/r"}
+        name = self.event(2, repo="o/maybe").name
+        self.run_queue(limit=5)
+        self.assertEqual(self.names("rejected"), [name])
+
+    @staticmethod
+    def claude_lookup_fails(bot):
+        if bot == "claude":
+            prbot.die("GitHub GET /app/installations failed: HTTP 502")
+        return {"o/r"}
+
+    def test_null_sweep_with_incomplete_inventory_is_deferred_after_its_pass(self):
+        prbot.installed_repos = self.claude_lookup_fails
+        name = self.sweep(None, name="sweep-20261103T150000000Z-bbbbbb.json")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("deferred")), (2, [], [name]))
+        self.assertIn("could not reach repositories missing from the incomplete bot inventory", log)
+
+    def test_sweep_kept_when_any_pr_hit_the_limit(self):
+        # Codex review of PR 1: PR 2 needs an unavailable bot ("later"), PR 3 and PR 5 need reviews and the limit
+        # is 1. The worst-result ranking said "later" and the sweep was deleted with PR 5 never reviewed
+        self.VIEW = {**self.VIEW, 2: PR18, 3: PR15}   # 2 needs codex, 3 and 5 need claude
+        self.reviews = {}
+        prbot.installed_repos = lambda bot: {"o/r"} if bot == "claude" else {"o/elsewhere"}
+        name = self.sweep("o/r", name="sweep-20261103T150000000Z-cccccc.json")
+        code, log = self.run_queue(limit=1)
+        self.assertIn("needs a codex review, but the codex bot is not installed on o/r", log)
+        self.assertEqual(self.runs, [(3, "claude")])
+        self.assertEqual((code, self.left()), (0, [name]))
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [(3, "claude"), (5, "claude")], []))
+
+    def test_sweep_with_an_unlistable_repo_is_deferred_and_keeps_its_state(self):
+        prbot.installed_repos = lambda bot: {"o/r", "o/down"}
+        kept = {"o/down#7@" + "7" * 10: {"baseline": True}}
+        prbot.WATCH_STATE.write_text(json.dumps(kept))
+        real_gh = prbot.gh_read
+        def gh(args):
+            if args[:2] == ["pr", "list"] and args[3] == "o/down":
+                prbot.die("gh pr list failed: HTTP 502")
+            return real_gh(args)
+        prbot.gh_read = gh
+        name = self.sweep(None, name="sweep-20261103T150000000Z-dddddd.json")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("deferred")), (2, [], [name]))
+        self.assertEqual(json.loads(prbot.WATCH_STATE.read_text())["o/down#7@" + "7" * 10], {"baseline": True})
+
+    def test_unique_sweeps_are_claimed_and_a_new_one_survives(self):
+        # the router names sweeps sweep-<UTC>-<hex>.json; a run deletes only the ones it listed at the start
+        first = self.sweep("o/r", name="sweep-20261103T150000000Z-3fa9c1.json")
+        second = self.sweep(None, name="sweep-20261103T150001000Z-0b12de.json")
+        late = "sweep-20261103T150002000Z-77aa01.json"
+        real_gh = prbot.gh_read
+        def gh_and_new_sweep(args):
+            if args[:2] == ["pr", "list"] and not Path(self.queue, late).exists():
+                self.sweep(None, name=late)  # the router publishes a new sweep while the pass runs
+            return real_gh(args)
+        prbot.gh_read = gh_and_new_sweep
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left()), (0, [late]))
+        self.assertIn("queue: delete " + first, log)
+        self.assertIn("queue: delete " + second, log)
+        prbot.gh_read = real_gh
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left()), (0, []))
+
+    def test_deferral_moves_the_event_before_rewriting_it(self):
+        # Codex review of PR 1: writing the copy first and unlinking after could leave the event in two places
+        import io
+        from contextlib import redirect_stdout
+        src = self.event(2)
+        original = src.read_text()
+        dest = prbot.queue_sibling(self.queue, "deferred")
+        real = prbot.write_json_atomic
+        def crash(*a, **kw):
+            raise OSError("disk full")
+        prbot.write_json_atomic = crash
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                target = prbot.move_into(src, dest, {"attempts": 1})
+        finally:
+            prbot.write_json_atomic = real
+        self.assertFalse(src.exists())
+        self.assertEqual((self.left(), self.names("deferred")), ([], [src.name]))
+        self.assertEqual(target.read_text(), original)  # intact, and in exactly one place
+        self.assertIn("could not update it", out.getvalue())
+        moved = prbot.move_into(target, self.queue, {"attempts": 2})  # the normal path rewrites after the move
+        self.assertEqual((json.loads(moved.read_text()), self.names("deferred")), ({"attempts": 2}, []))
+
+    def test_unparsable_file_with_a_future_mtime(self):
+        # Codex review of PR 1: a negative age counted as young forever. Within CLOCK_SKEW it still waits;
+        # further ahead it counts as settled and is rejected
+        def future(name, seconds):
+            p = Path(self.queue, name)
+            p.write_text("{oops")
+            t = p.stat().st_mtime + seconds
+            os.utime(p, (t, t))
+        future("near.json", 120)
+        future("far.json", prbot.CLOCK_SKEW + 300)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("rejected")), (0, ["near.json"], ["far.json"]))
+        self.assertIn("leaving near.json for now", log)
+
+    def test_side_directories_must_be_real_directories(self):
+        keep = self.event(2).name
+        elsewhere = Path(self.tmp.name, "elsewhere")
+        elsewhere.mkdir()
+        deferred, rejected = prbot.queue_sibling(self.queue, "deferred"), prbot.queue_sibling(self.queue, "rejected")
+        deferred.symlink_to(elsewhere)
+        code, err = self.run_refused(self.queue)
+        self.assertEqual(code, 2)
+        self.assertIn("queue-deferred exists but is not a directory", err)
+        # the hourly pass refuses the requeue the same way
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        e2 = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(e2):
+            self.assertEqual(prbot.cmd_watch(dry_run=False, limit=0), 2)
+        self.assertIn("not moving deferred events back", e2.getvalue())
+        deferred.unlink()
+        rejected.write_text("a file")
+        code, err = self.run_refused(self.queue)
+        self.assertEqual(code, 2)
+        self.assertIn("queue-rejected exists but is not a directory", err)
+        self.assertEqual((self.left(), list(elsewhere.iterdir()), rejected.read_text()), ([keep], [], "a file"))
+
+    def sweep(self, repo, name="sweep.json"):
+        body = {"kind": "sweep", "repo": repo, "received_at": "2026-11-03T14:15:02.123Z",
+                "slack_message_id": "1730643302.123456", "slack_channel": "C0CEMPH1L0N",
+                "source": "github-event-router", "version": 1}
+        Path(self.queue, name).write_text(json.dumps(body))
+        return name
+
+    def test_sweep_of_one_repo_runs_the_pass_there_and_is_deleted(self):
+        prbot.installed_repos = lambda bot: {"o/r", "o/other"}
+        self.sweep("o/r")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.listed, self.runs, self.left()), (0, ["o/r"], [(2, "claude"), (5, "claude")], []))
+        self.assertIn("queue: sweep of o/r", log)
+
+    def test_sweep_with_null_repo_covers_every_repo(self):
+        prbot.installed_repos = lambda bot: {"o/r", "o/other"}
+        self.sweep(None)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.listed, self.left()), (0, ["o/other", "o/r"], []))
+        self.assertIn("sweep of every covered repository", log)
+
+    def test_failed_sweep_is_deferred(self):
+        self.fail_on = {2}
+        name = self.sweep(None)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.left(), self.names("deferred")), (2, [], [name]))
+        self.assertEqual(self.read("deferred", name)["attempts"], 1)
+        self.assertEqual(self.read("deferred", name)["kind"], "sweep")
+
+    def test_sweep_of_an_unknown_repo_is_rejected(self):
+        name = self.sweep("someone/else")
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.listed, self.left(), self.names("rejected")), (0, [], [], [name]))
+        bad = self.sweep(5)  # repo must be a name or null
+        self.run_queue(limit=5)
+        self.assertEqual(self.names("rejected"), sorted([name, f"{Path(bad).stem}-1.json"]))
+
+    def test_limit_bound_sweep_makes_progress_each_run(self):
+        self.sweep(None)
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude")], ["sweep.json"]))
+        self.assertIn("sweep is over this run's limit", log)
+        code, log = self.run_queue(limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [(2, "claude"), (5, "claude")], []))
+
+    def test_pr_events_run_before_the_sweep_and_are_not_reviewed_twice(self):
+        self.sweep(None)
+        self.event(5)
+        code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [(5, "claude"), (2, "claude")], []))
+        self.assertLess(log.index("running a claude review"), log.index("queue: sweep of"))
+
+    def test_empty_and_missing_queues_exit_quietly(self):
+        self.assertEqual(self.run_queue(), (0, ""))
+        self.queue.rmdir()
+        self.assertEqual(self.run_queue(), (0, ""))
+        self.assertEqual(prbot.main(["watch", "--from-queue", str(self.queue)]), 0)
+
+    def test_dry_run_moves_nothing_and_saves_no_state(self):
+        Path(self.queue, ".DS_Store").write_text("")
+        keep = [self.event(2).name, self.event(5).name, self.event(2, repo="someone/else").name, ".DS_Store"]
+        code, log = self.run_queue(dry_run=True, limit=1)
+        self.assertEqual((code, self.runs, self.left()), (0, [], sorted(keep)))
+        self.assertEqual((self.names("deferred"), self.names("rejected")), ([], []))
+        self.assertIn("would run a claude review", log)
+        self.assertFalse(prbot.WATCH_STATE.exists())
+
+    def test_hourly_pass_moves_deferred_files_back_after_reviewing(self):
+        self.fail_on = {2}
+        name = self.event(2).name
+        self.run_queue(limit=5)
+        self.assertEqual(self.names("deferred"), [name])
+        Watch.run_pass(self, dry_run=True)  # a dry run moves nothing
+        self.assertEqual((self.left(), self.names("deferred")), ([], [name]))
+        self.fail_on = set()
+        log = Watch.run_pass(self, limit=5)
+        self.assertEqual((self.left(), self.names("deferred")), ([name], []))
+        self.assertEqual(json.loads(Path(self.queue, name).read_text())["attempts"], 1)
+        self.assertLess(log.index("pass done"), log.index("moved 1 deferred event file back"))
+        # no deferred directory at all is fine
+        Path(self.queue, name).unlink()
+        prbot.queue_sibling(self.queue, "deferred").rmdir()
+        self.assertNotIn("deferred", Watch.run_pass(self, limit=5))
+
+    LOCK_PROBE = ("import fcntl, sys\nf = open(sys.argv[1], 'w')\ntry:\n    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                  "    print('free')\nexcept BlockingIOError:\n    print('held')\n")
+
+    def lock_state(self):
+        """'held' or 'free', as another process sees the watch lock right now."""
+        r = subprocess.run([sys.executable, "-c", self.LOCK_PROBE, str(prbot.WATCH_STATE.with_name("watch.lock"))],
+                           capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def test_lock_held_by_another_process_means_nothing_is_touched(self):
+        # Codex review of PR 1: the queue had to be checked and moved only under the lock
+        keep = self.event(2).name
+        Path(self.queue, ".DS_Store").write_text("")
+        deferred = prbot.queue_sibling(self.queue, "deferred")
+        deferred.mkdir()
+        Path(deferred, "old.json").write_text("{}")
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\nf = open(sys.argv[1], 'w')\n"
+                                   "fcntl.flock(f, fcntl.LOCK_EX)\nprint('locked', flush=True)\ntime.sleep(60)\n",
+                                   str(prbot.WATCH_STATE.with_name("watch.lock"))], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            def no_check(*a):
+                raise AssertionError("the queue must not be checked or read without the lock")
+            saved, prbot.checked_queue_dir = prbot.checked_queue_dir, no_check
+            try:
+                code, log = self.run_queue(limit=5)
+                self.assertEqual(code, 0)
+                import io
+                from contextlib import redirect_stdout
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(prbot.cmd_watch(limit=5), 0)
+            finally:
+                prbot.checked_queue_dir = saved
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+        self.assertEqual((self.runs, self.left(), self.names("deferred")), ([], sorted([keep, ".DS_Store"]), ["old.json"]))
+        self.assertFalse(prbot.queue_sibling(self.queue, "rejected").exists())
+
+    def test_lock_is_held_through_queue_checks_and_the_requeue(self):
+        # Codex review of PR 1: the hourly pass released the lock before moving deferred files back
+        seen = []
+        real_check, real_requeue = prbot.checked_queue_dir, prbot.requeue_deferred
+        def check(q):
+            seen.append(("check", self.lock_state()))
+            return real_check(q)
+        def requeue(q):
+            seen.append(("requeue", self.lock_state()))
+            return real_requeue(q)
+        prbot.checked_queue_dir, prbot.requeue_deferred = check, requeue
+        try:
+            self.event(2)
+            self.run_queue(limit=5)
+            Watch.run_pass(self, limit=5)
+        finally:
+            prbot.checked_queue_dir, prbot.requeue_deferred = real_check, real_requeue
+        self.assertEqual(seen, [("check", "held"), ("check", "held"), ("requeue", "held")])
+        self.assertEqual(self.lock_state(), "free")
+
+    def test_invalid_attempt_counts_start_again_from_zero(self):
+        # Codex review of PR 1: "attempts": -1000000 would have put off rejection about a million retries
+        self.fail_on = {2}
+        deferred = prbot.queue_sibling(self.queue, "deferred")
+        for bad in (-1000000, "7", 2.5, True, None):
+            with self.subTest(bad=bad):
+                for p in (deferred.glob("*") if deferred.is_dir() else []):
+                    p.unlink()
+                name = self.event(2, attempts=bad).name
+                code, log = self.run_queue(limit=5)
+                self.assertEqual((code, self.names("deferred")), (2, [name]))
+                self.assertEqual(self.read("deferred", name)["attempts"], 1)
+                self.assertIn(f"invalid attempts value {bad!r}; counting from 0", log)
+                prbot.WATCH_STATE.unlink()   # forget the failure, so the next case fails afresh instead of waiting
+        name = self.event(2, attempts=prbot.MAX_ATTEMPTS - 1).name  # a valid count is still honored
+        self.run_queue(limit=5)
+        self.assertIn(name, self.names("rejected"))
+
+    def test_queue_waits_while_another_run_holds_the_lock(self):
+        import fcntl
+        keep = self.event(2).name
+        with open(prbot.WATCH_STATE.with_name("watch.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            code, log = self.run_queue(limit=5)
+        self.assertEqual((code, self.runs, self.left()), (0, [], [keep]))
+        self.assertIn("another watch run holds the lock", log)
+
+
+class ReviewTimeout(unittest.TestCase):
+    """A reviewer CLI that hangs, with a child that holds its output pipe, the way a stuck codex run did."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fake = Path(self.tmp.name, "claude")
+        fake.write_text("#!/bin/sh\nsleep 30 &\nsleep 30\n")
+        fake.chmod(0o755)
+        self.saved = (os.environ.get("PRBOT_REVIEW_TIMEOUT"), os.environ["PATH"])
+        os.environ["PRBOT_REVIEW_TIMEOUT"] = "1"
+        os.environ["PATH"] = f"{self.tmp.name}{os.pathsep}{os.environ['PATH']}"
+        self.pr = {"url": "https://github.com/o/r/pull/2", "title": "t"}
+
+    def tearDown(self):
+        timeout, os.environ["PATH"] = self.saved
+        if timeout is None:
+            os.environ.pop("PRBOT_REVIEW_TIMEOUT", None)
+        else:
+            os.environ["PRBOT_REVIEW_TIMEOUT"] = timeout
+        self.tmp.cleanup()
+
+    def test_bad_timeout_setting_fails_clearly_and_only_where_it_is_used(self):
+        # Codex review of PR 1: PRBOT_REVIEW_TIMEOUT=15m broke even `prbot --help` with an import-time traceback
+        for bad in ("abc", "15m", "0", "-5"):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as cfg:
+                env = dict(os.environ, PRBOT_REVIEW_TIMEOUT=bad, PRBOT_CONFIG_DIR=cfg)
+                run = lambda *args: subprocess.run([sys.executable, ROOT / "prbot", *args], capture_output=True,
+                                                   text=True, env=env)
+                r = run("--help")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("prbot watch", r.stdout)
+                self.assertEqual(run("classify", "--", "pr", "view", "1").returncode, 1)
+                for args in (("watch", "--dry-run"), ("review", "1", "-R", "o/r", "--route-only")):
+                    r = run(*args)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn(f"PRBOT_REVIEW_TIMEOUT must be a positive whole number of seconds, not {bad!r}",
+                                  r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+
+    def test_hung_review_is_stopped_and_fails(self):
+        import io, time
+        from contextlib import redirect_stderr
+        err, start = io.StringIO(), time.monotonic()
+        with redirect_stderr(err), self.assertRaises(SystemExit):
+            prbot.run_review("claude", self.pr, "diff", self.tmp.name)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("claude review timed out after 1s", err.getvalue())
+
+    def test_watch_moves_on_to_the_next_pr_after_a_timeout(self):
+        import io, time
+        from contextlib import redirect_stderr
+        w = Watch("run_pass")
+        w.setUp()
+        try:
+            def review(n, repo, mode, only):
+                w.runs.append((int(n), only[0]))
+                if int(n) == 2:
+                    prbot.run_review("claude", self.pr, "diff", self.tmp.name)
+            prbot.cmd_review = review
+            start = time.monotonic()
+            with redirect_stderr(io.StringIO()):
+                log = w.run_pass(limit=5)
+            self.assertLess(time.monotonic() - start, 10)
+            self.assertEqual(w.runs, [(2, "claude"), (5, "claude")])
+            self.assertIn("o/r#2@bbbbbbbbbb: claude review failed", log)
+            state = json.loads(prbot.WATCH_STATE.read_text())
+            self.assertIn("failed_claude", state["o/r#2@" + "b" * 10])  # not reviewed, retried after the delay
+        finally:
+            w.tearDown()
 
 
 class Jwt(unittest.TestCase):
