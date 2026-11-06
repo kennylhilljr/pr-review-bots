@@ -114,6 +114,14 @@ reviewer returns text; prbot posts it as a PR review comment through that
 agent's bot, with a line saying why that agent was chosen and which commit it
 reviewed.
 
+Both agents get the same prompt. It works through the checks that the
+`pr-review-toolkit` Claude Code plugin splits across separate agents: the
+repo's own AGENTS.md and CLAUDE.md rules, behavior and edge cases, silent
+failures, error messages, security, test quality, and comments that no longer
+match the code. Findings must be at least 80% likely to be real. The checks
+live in one prompt rather than in the plugin because Codex can't run Claude
+Code plugins, and because one run keeps each review inside the timeout.
+
 ## Reviews as PRs come in
 
 `prbot watch` runs every 5 minutes from a launchd job on Kenny's Mac rather

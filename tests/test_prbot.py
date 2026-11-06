@@ -1173,6 +1173,45 @@ class ReviewTimeout(unittest.TestCase):
             w.tearDown()
 
 
+class ReviewPrompt(unittest.TestCase):
+    """Both reviewer CLIs get the same full prompt, so Codex reviews are as thorough as Claude's."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        for name in ("claude", "codex"):
+            fake = Path(self.tmp.name, name)
+            # record the arguments, then reply like a reviewer: claude on stdout, codex in the -o file
+            fake.write_text(f"#!/usr/bin/env python3\nimport json, sys\n"
+                            f"json.dump(sys.argv[1:], open({str(Path(self.tmp.name, name + '.args'))!r}, 'w'))\n"
+                            "a = sys.argv\n"
+                            "if '-o' in a: open(a[a.index('-o') + 1], 'w').write('Nothing worth reporting.')\n"
+                            "else: print('Nothing worth reporting.')\n")
+            fake.chmod(0o755)
+        self.saved = os.environ["PATH"]
+        os.environ["PATH"] = f"{self.tmp.name}{os.pathsep}{os.environ['PATH']}"
+        self.pr = {"url": "https://github.com/o/r/pull/2", "title": "Fix {braces} in titles"}
+
+    def tearDown(self):
+        os.environ["PATH"] = self.saved
+        self.tmp.cleanup()
+
+    def test_both_reviewers_get_every_check(self):
+        prompts = {}
+        for reviewer in ("claude", "codex"):
+            self.assertEqual(prbot.run_review(reviewer, self.pr, "diff", self.tmp.name), "Nothing worth reporting.")
+            args = json.loads(Path(self.tmp.name, reviewer + ".args").read_text())
+            prompts[reviewer] = next(a for a in args if a.startswith("You are reviewing"))
+        self.assertEqual(prompts["claude"], prompts["codex"])
+        prompt = prompts["claude"]
+        self.assertIn('pull request https://github.com/o/r/pull/2: "Fix {braces} in titles"', prompt)
+        for check in ("AGENTS.md", "Silent failures:", "Error messages:", "Security:", "Tests:", "Comments and docs:",
+                      "Project rules:", "at least 80% sure"):
+            self.assertIn(check, prompt)
+        # count_findings relies on the reviewer labelling findings P1/P2/P3 and using the labels for nothing else
+        self.assertIn("P1 breaks something, P2 likely bug, P3 minor", prompt)
+        self.assertIn("Use the labels P1, P2 and P3 only to label findings", prompt)
+
+
 class Jwt(unittest.TestCase):
     def test_signature_verifies_with_public_key(self):
         with tempfile.TemporaryDirectory() as d:
