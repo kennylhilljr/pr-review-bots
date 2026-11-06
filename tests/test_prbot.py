@@ -1212,6 +1212,25 @@ class ReviewPrompt(unittest.TestCase):
         self.assertIn("Use the labels P1, P2 and P3 only to label findings", prompt)
 
 
+class BackupReviewWorkflow(unittest.TestCase):
+    """The GitHub Actions backup reviewer must ask for the same review as prbot."""
+
+    def test_workflow_prompt_matches_prbot(self):
+        import re, textwrap
+        text = (ROOT / "integrations" / "github-actions" / "backup-review.yml").read_text()
+        block = text[text.index("          prompt: |\n") + len("          prompt: |\n"):text.index("          claude_args:")]
+        workflow = textwrap.dedent(block)
+        start, end = "First read the repository", "Use the labels P1, P2 and P3 only to label findings"
+        shared = prbot.REVIEW_PROMPT[prbot.REVIEW_PROMPT.index(start):prbot.REVIEW_PROMPT.index(end) + len(end)]
+        self.assertIn(shared, workflow)
+        # it finds earlier reviews by the line prbot writes
+        self.assertTrue(prbot.REVIEWED.search("Reviewed commit `9e7cb5f291`"))
+        self.assertIn("(Reviewed commit|Backup review of commit)", text)
+        # the reviewer gets read-only tools; only the posting step has a token that can write
+        self.assertRegex(text, r"--allowedTools Read,Grep,Glob\n")
+        self.assertIn("--disallowedTools Bash,Edit,Write", text)
+
+
 class Jwt(unittest.TestCase):
     def test_signature_verifies_with_public_key(self):
         with tempfile.TemporaryDirectory() as d:

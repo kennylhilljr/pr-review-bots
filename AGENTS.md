@@ -9,6 +9,7 @@ This repository holds `prbot`, the CLI behind Kenny's two GitHub review bots (`c
 - `logos/`: bot logos, SVG sources and 512 px PNGs.
 - `integrations/claude-code/guard_gh_identity.py`: PreToolUse hook that stops Claude Code from posting PR feedback as Kenny.
 - `integrations/codex/`: the `gh` shim and the `codex-as-bot` launcher for Codex CLI.
+- `integrations/github-actions/`: `backup-review.yml`, a GitHub Actions workflow that reviews PRs prbot hasn't reviewed after 2 hours, posting as `claude[bot]`, and `install-backup-review.sh`, which Kenny runs to set the secret and open a PR adding it to each repo.
 - `integrations/launchd/`: `install-watch.sh` installs the job that runs `prbot watch` every 5 minutes; the two plists and `README.md` there are the event queue job and hourly backstop that replace it.
 - `skills/cross-review/`: the skill Claude Code and Codex use to review PRs and post through the bots. It is linked into `~/.claude/skills` and `~/.codex/skills`.
 - `tests/test_prbot.py`: unit tests. Fixtures copy the shape of real PRs from `openclaw-ecc-orchestrator`.
