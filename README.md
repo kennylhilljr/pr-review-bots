@@ -30,7 +30,7 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
 | `prbot git` (push as a bot) | Live for both bots, with Contents write. |
 | OpenClaw | Reviews with P1 or P2 findings appear in OpenClaw as `attention.required` under the `github` run, written through the orchestrator runtime's event writer. Skipped quietly if the runtime is not installed. |
-| CI (GitHub Actions) path | Not built. |
+| Backup review (GitHub Actions) | Built; not installed on any repo yet. See [Backup review when the Mac is offline](#backup-review-when-the-mac-is-offline). |
 
 ## Architecture
 
@@ -186,6 +186,23 @@ How a queue run treats the files:
 
 Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`, always written through a temp file and a rename; a damaged state file is moved to `watch-state.json.corrupt-<UTC time>`, logged, and replaced by an empty state. Single entries with the wrong shape (not an object, unknown fields, a failure time that is not a number or is more than a day in the future) are dropped with one log line each. A full pass normally keeps state only for PRs still open, but it keeps the old entries of any repository whose PRs it could not list, and prunes nothing at all when a bot's installations could not be read. To see what a pass would do without posting, run `prbot watch --dry-run`. To start from now and skip the commits already open, run `prbot watch --baseline` once before installing the job. To remove the 5-minute job, run `install-watch.sh --uninstall`.
 
+### Backup review when the Mac is offline
+
+`prbot watch` only runs while the Mac is awake. [`integrations/github-actions/backup-review.yml`](integrations/github-actions/backup-review.yml) is a GitHub Actions workflow that fills the gap:
+
+- Every 30 minutes it looks for open, non-draft PRs whose newest commit is at least 2 hours old and has no review, either from prbot ("Reviewed commit") or from an earlier backup run ("Backup review of commit").
+- It reviews up to 3 of them, one at a time, with the Claude Code GitHub Action. It uses the same prompt prbot uses, with only Read, Grep and Glob.
+- It posts each review as `claude[bot]` through the Claude GitHub App, not as `claude-pr-gh[bot]`. That keeps the App's private key in the Keychain, off GitHub.
+
+This is a fallback: Claude also reviews PRs Claude wrote here, which prbot never does.
+
+To install it, run this from your own shell, not an agent's:
+
+1. Install the Claude GitHub App on the repos: <https://github.com/apps/claude/installations/new>.
+2. Run `claude setup-token` and keep the token.
+3. Run `integrations/github-actions/install-backup-review.sh`. It asks for the token once, without echo, sets the `CLAUDE_CODE_OAUTH_TOKEN` secret on each repo, and opens a PR on each one that adds `.github/workflows/backup-review.yml`, labeled `review:codex`. Pass `owner/repo` arguments to pick the repos; by default it covers the six repos the worker bots code in.
+4. Merge the PRs, then run **Backup review** once from each repo's Actions tab.
+
 ## Make agents use the bots
 
 ### The `cross-review` skill
@@ -260,6 +277,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `logos/` | Bot logos: SVG sources and 512 px PNGs for GitHub. |
 | `integrations/claude-code/` | The PreToolUse guard hook. |
 | `integrations/codex/` | The `gh` shim and the `codex-as-bot` launcher. |
+| `integrations/github-actions/` | The backup review workflow and its installer. |
 | `integrations/launchd/` | Plists for the event queue job and the hourly backstop, plus the older 5-minute installer. |
 | `skills/cross-review/` | The PR review skill shared by Claude Code and Codex. |
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents working on this repository. |

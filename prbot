@@ -330,8 +330,20 @@ def choose_reviewers(author, labels, override=None):
 REVIEW_PROMPT = """You are reviewing GitHub pull request {url}: "{title}".
 The full diff is attached on stdin. The current directory may be a checkout of the repository; read files there for context if useful.
 
-Find real defects: wrong behavior, missed edge cases, error handling, security problems, and tests that do not test what they claim. Skip style nits a linter would catch.
-For each finding give a priority (P1 breaks something, P2 likely bug, P3 minor), the file and line, what goes wrong with a concrete input, and the fix.
+First read the repository's agent instructions if there are any (AGENTS.md, CLAUDE.md and the files they point to). Breaking a rule written there is a defect.
+
+Find real defects. Check the change for each of these:
+- Behavior: wrong results, missed edge cases (empty, missing, duplicate, very large or malformed input), races, and broken assumptions in the code the diff calls or is called by.
+- Silent failures: errors caught and dropped, broad catches that also hide unrelated errors, fallbacks or default values returned on error without saying so, retries that give up quietly, and fakes or stubs reachable outside tests.
+- Error messages: whether someone who hits the failure can tell what went wrong and what to do next.
+- Security: injection, unchecked input reaching a shell, path or query, secrets in code or logs, and permission checks that can be skipped.
+- Tests: tests that do not test what they claim, assertions that pass whether or not the code works, and new behavior or error paths with no test that would catch a regression. Name the missing test and the bug it would catch.
+- Comments and docs: comments, docstrings and docs that no longer match what the code does after this change.
+- Project rules: anything that breaks the agent instructions you read.
+Skip style nits a linter would catch, matters of taste, and problems that were there before this PR and that it does not make worse.
+
+Report a finding only when you are at least 80% sure it is real after reading the code involved. If you are less sure, read more of the surrounding code until you are, or leave it out.
+For each finding give a priority (P1 breaks something, P2 likely bug, P3 minor), the file and line, what goes wrong with a concrete input, and the fix. Use the labels P1, P2 and P3 only to label findings: prbot counts them to decide whether the review needs attention.
 If you find nothing worth reporting, say so in one sentence.
 
 Reply with the review text only, in GitHub Markdown, ready to post. Do not post anything yourself, edit files, or run commands that change state."""

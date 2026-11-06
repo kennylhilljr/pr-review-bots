@@ -114,6 +114,14 @@ reviewer returns text; prbot posts it as a PR review comment through that
 agent's bot, with a line saying why that agent was chosen and which commit it
 reviewed.
 
+Both agents get the same prompt. It works through the checks that the
+`pr-review-toolkit` Claude Code plugin splits across separate agents: the
+repo's own AGENTS.md and CLAUDE.md rules, behavior and edge cases, silent
+failures, error messages, security, test quality, and comments that no longer
+match the code. Findings must be at least 80% likely to be real. The checks
+live in one prompt rather than in the plugin because Codex can't run Claude
+Code plugins, and because one run keeps each review inside the timeout.
+
 ## Reviews as PRs come in
 
 `prbot watch` runs every 5 minutes from a launchd job on Kenny's Mac rather
@@ -188,6 +196,25 @@ Each reviewer CLI runs in its own process group with a 900 second limit
 On timeout prbot kills the group, not only the CLI, because children left
 holding the output pipe would keep prbot waiting. The timeout counts as a
 failed review, so the commit is not marked reviewed and the pass moves on.
+
+## Backup review in GitHub Actions
+
+Running locally means no reviews while the Mac is asleep. A GitHub Actions
+workflow covers that gap, but only for PRs prbot has left alone for 2 hours,
+so it doesn't post a second review of every PR. It finds earlier reviews by the
+same "Reviewed commit" line prbot uses.
+
+It posts as `claude[bot]` through the Claude GitHub App and authenticates with
+a Claude Code OAuth token from Kenny's subscription. Posting as
+`claude-pr-gh[bot]` would mean storing that App's private key in Actions
+secrets, which moves it off the Mac. Kenny chose the other identity instead.
+The cost is that a backup review may be Claude reviewing Claude's own PR.
+
+The reviewer gets the same prompt as prbot's reviewers, with Read, Grep and
+Glob only, and returns the review as structured output. A separate step posts
+it, so the model never holds a token that can write. The workflow file lives in
+this repo and is copied into each repo by `install-backup-review.sh`, which
+Kenny runs. The worker bots can't write `.github/workflows/`.
 
 ## What stays on Kenny's account
 
