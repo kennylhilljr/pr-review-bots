@@ -1,5 +1,5 @@
-"""Tests for prbot, the Claude Code guard hook and the Codex gh shim. Run: python3 -m unittest -v"""
-import base64, importlib.util, json, os, subprocess, sys, tempfile, unittest
+"""Tests for prbot, the Claude Code guard hook and the Codex gh shim. Run: python3 -B -m unittest discover -s tests -t . -v"""
+import base64, importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -1354,6 +1354,72 @@ class CodexShim(unittest.TestCase):
             write = subprocess.run(["gh", "pr", "comment", "1", "-R", "o/r", "-b", "x"], capture_output=True, text=True, env=env)
             self.assertNotEqual(write.returncode, 0)
             self.assertIn("bot 'codex' is not registered", write.stderr)
+
+
+STATE_ATTRS = ("CONFIG_DIR", "CONFIG", "WATCH_STATE", "QUEUE_DIR", "OPENCLAW_EVENTS")
+STATE_KEYS = ("PRBOT_CONFIG_DIR", "PRBOT_QUEUE_DIR", "PRBOT_OPENCLAW_EVENTS")
+# discovers the tests the way the test command does, then checks the prbot it loaded; self-contained on purpose
+PROBE = """
+import sys, unittest
+from pathlib import Path
+loader = unittest.TestLoader()
+loader.discover("tests", top_level_dir=".")
+assert not loader.errors, loader.errors
+p = sys.modules["tests.test_prbot"].prbot
+forbidden = [(Path.home() / r).resolve() for r in (".config", ".local/state", ".openclaw")]
+bad = [n for n in ("CONFIG_DIR", "CONFIG", "WATCH_STATE", "QUEUE_DIR", "OPENCLAW_EVENTS")
+       for r in forbidden if Path(getattr(p, n)).resolve().is_relative_to(r)]
+assert not bad, bad
+"""
+
+
+class StatePaths(unittest.TestCase):
+    """tests/__init__.py keeps prbot away from the real config, queue and OpenClaw files."""
+
+    sandbox = None
+
+    def tearDown(self):
+        if self.sandbox:
+            shutil.rmtree(self.sandbox, ignore_errors=True)
+
+    def probe(self, env):
+        subprocess.run([sys.executable, "-B", "-c", PROBE], cwd=str(ROOT), env=env,
+                       check=True, capture_output=True, text=True)
+
+    def test_in_process(self):
+        forbidden = [(Path.home() / r).resolve() for r in (".config", ".local/state", ".openclaw")]
+        for n in STATE_ATTRS:
+            path = Path(getattr(prbot, n)).resolve()
+            for root in forbidden:
+                self.assertFalse(path.is_relative_to(root), f"prbot.{n} resolves to {path}, under {root}")
+
+    def test_three_env_cases(self):
+        h = Path.home()
+        u = {"PRBOT_CONFIG_DIR": str(h / ".config/prbot"),
+             "PRBOT_QUEUE_DIR": str(h / ".local/state/github-events/prbot"),
+             "PRBOT_OPENCLAW_EVENTS": str(h / ".openclaw/events.jsonl")}
+        base = {x: y for x, y in os.environ.items() if x not in STATE_KEYS}
+        envs = (base, {**base, **u}, {**base, "PRBOT_QUEUE_DIR": u["PRBOT_QUEUE_DIR"]})
+        for env in envs:
+            with self.subTest(set_keys=sorted(k for k in STATE_KEYS if k in env)):
+                try:
+                    self.probe(env)
+                except subprocess.CalledProcessError as e:
+                    self.fail(e.stderr)
+
+    def test_symlinked_tmpdir_fallback(self):
+        # OpenClaw can put TMPDIR under ~/.openclaw, and that root may itself be a symlink
+        self.sandbox = Path(tempfile.mkdtemp(dir="/tmp"))
+        home, real = self.sandbox / "home", self.sandbox / "real"
+        home.mkdir()
+        real.mkdir()
+        (home / ".openclaw").symlink_to(real)
+        env = {x: y for x, y in os.environ.items() if x not in STATE_KEYS}
+        env.update(TMPDIR=str(home / ".openclaw"), HOME=str(home))
+        try:
+            self.probe(env)
+        except subprocess.CalledProcessError as e:
+            self.fail(e.stderr)
 
 
 if __name__ == "__main__":

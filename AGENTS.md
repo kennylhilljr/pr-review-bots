@@ -18,7 +18,7 @@ This repository holds `prbot`, the CLI behind Kenny's two GitHub review bots (`c
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -B -m unittest discover -s tests -t . -v
 ```
 
 The tests make no network calls. To try a change against real repos without posting anything, use the read-only modes:

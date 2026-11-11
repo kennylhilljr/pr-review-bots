@@ -216,6 +216,26 @@ it, so the model never holds a token that can write. The workflow file lives in
 this repo and is copied into each repo by `install-backup-review.sh`, which
 Kenny runs. The worker bots can't write `.github/workflows/`.
 
+## Test isolation
+
+prbot reads its config, watch state, event queue and OpenClaw event log from
+paths in Kenny's home folder. Tests must never touch those. `tests/__init__.py`
+sets `PRBOT_CONFIG_DIR`, `PRBOT_QUEUE_DIR` and `PRBOT_OPENCLAW_EVENTS` to a
+per-run temp folder before any test module imports prbot, and deletes that
+folder when the run ends. It overwrites values already in the environment. If
+the system temp folder sits under `~/.config`, `~/.local/state` or
+`~/.openclaw` (OpenClaw can set `TMPDIR` that way), it uses `/tmp` instead.
+
+The test command needs `-t .`:
+
+```bash
+python3 -B -m unittest discover -s tests -t . -v
+```
+
+Without it, unittest imports `test_prbot` as a top-level module and never runs
+`tests/__init__.py`. With the repo root as the top level, `tests` is a package
+and its `__init__.py` runs before the test modules load.
+
 ## What stays on Kenny's account
 
 - Merges, approvals that satisfy branch protection, and anything Kenny types

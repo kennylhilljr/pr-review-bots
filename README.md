@@ -82,7 +82,7 @@ ln -s ~/Documents/GitHub/pr-review-bots/prbot ~/.local/bin/prbot
 Run the tests before first use:
 
 ```bash
-cd ~/Documents/GitHub/pr-review-bots && python3 -m unittest discover -s tests -v
+cd ~/Documents/GitHub/pr-review-bots && python3 -B -m unittest discover -s tests -t . -v
 ```
 
 ### Register the Apps (once)
