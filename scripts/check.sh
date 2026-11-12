@@ -50,7 +50,8 @@ cd "$ROOT" || exit 2
 
 # A private work folder under /tmp, whatever TMPDIR the caller had, so the
 # checks never read or write the caller's temp folder or real prbot config.
-WORK=$(mktemp -d /tmp/prbot-check.XXXXXX) || {
+# mktemp is not a POSIX utility, so python3 (already required) makes it.
+WORK=$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="prbot-check.", dir="/tmp"))') || {
     echo "check: cannot create a temp folder under /tmp" >&2
     exit 2
 }
@@ -72,6 +73,7 @@ export TMPDIR PRBOT_CONFIG_DIR PYTHONPYCACHEPREFIX
 # numbers and finding types, never the matched text.
 scan_tracked() {
     python3 - "$1" <<'PY'
+import hashlib
 import os
 import re
 import subprocess
@@ -82,9 +84,11 @@ DASHES = {"\u2013": "en dash", "\u2014": "em dash"}
 SECRETS = [
     ("private key block", re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
     ("GitHub token", re.compile(rb"(?:ghp|gho)_[A-Za-z0-9_]{36,}")),
-    # Installation tokens: the legacy 36-character form and the stateless
-    # ghs_APPID_JWT form, whose body also holds underscores, dots and dashes.
-    ("GitHub App installation token", re.compile(rb"ghs_[A-Za-z0-9_.-]{36,}")),
+    # Installation tokens: the legacy 36-character form, and the stateless
+    # ghs_APPID_JWT form, whose JWT has three dot-separated base64url parts.
+    ("GitHub App installation token", re.compile(rb"ghs_[A-Za-z0-9_]{36,}")),
+    ("GitHub App installation token",
+     re.compile(rb"ghs_[0-9]+_[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("GitHub fine-grained token", re.compile(rb"github_pat_[A-Za-z0-9_]{82,}")),
 ]
 
@@ -107,29 +111,15 @@ for record in listing.split(b"\0"):
         continue  # submodule: its files belong to another repository
     entries.append((mode_bits, blob, os.fsdecode(raw_path)))
 
-findings = []
-errors = []
-for mode_bits, blob, path in entries:
-    try:
-        if mode_bits == b"120000":
-            data = os.fsencode(os.readlink(path))
-        else:
-            with open(path, "rb") as handle:
-                data = handle.read()
-    except FileNotFoundError:
-        # Deleted in the working tree but still staged: scan the staged copy.
-        shown = subprocess.run(["git", "cat-file", "blob", blob.decode()], capture_output=True)
-        if shown.returncode != 0:
-            errors.append("%s: missing and cannot read the staged copy" % path)
-            continue
-        data = shown.stdout
-    except OSError as exc:
-        errors.append("%s: cannot read (%s)" % (path, exc.strerror or exc))
-        continue
+def blob_id(data, like):
+    """The Git blob id of data, in the hash family of the index id `like`."""
+    algo = hashlib.sha256 if len(like) == 64 else hashlib.sha1
+    return algo(b"blob %d\0" % len(data) + data).hexdigest().encode()
+
+
+def scan(path, data, findings):
     lines = data.split(b"\n")
     if mode == "writing":
-        if not (path.endswith(".md") or path == "prbot"):
-            continue
         for number, line in enumerate(lines, 1):
             text = line.decode("utf-8", errors="replace")
             for char, name in DASHES.items():
@@ -137,9 +127,40 @@ for mode_bits, blob, path in entries:
                     findings.append("%s:%d: %s" % (path, number, name))
     else:
         for number, line in enumerate(lines, 1):
-            for name, pattern in SECRETS:
-                if pattern.search(line):
-                    findings.append("%s:%d: %s" % (path, number, name))
+            for name in sorted({name for name, pattern in SECRETS if pattern.search(line)}):
+                findings.append("%s:%d: %s" % (path, number, name))
+
+
+findings = []
+errors = []
+for mode_bits, blob, path in entries:
+    if mode == "writing" and not (path.endswith(".md") or path == "prbot"):
+        continue
+    try:
+        if mode_bits == b"120000":
+            data = os.fsencode(os.readlink(path))
+        else:
+            with open(path, "rb") as handle:
+                data = handle.read()
+    except FileNotFoundError:
+        data = None  # deleted in the working tree but still staged
+    except OSError as exc:
+        errors.append("%s: cannot read (%s)" % (path, exc.strerror or exc))
+        continue
+    if data is not None:
+        scan(path, data, findings)
+    # The staged copy is what a commit would hold. Scan it too whenever it
+    # differs from the working tree, so cleaning only the working tree does
+    # not hide a staged problem.
+    if data is None or blob_id(data, blob) != blob:
+        shown = subprocess.run(["git", "cat-file", "blob", blob.decode()], capture_output=True)
+        if shown.returncode != 0:
+            errors.append("%s: cannot read the staged copy" % path)
+            continue
+        before = set(findings)
+        staged = []
+        scan(path, shown.stdout, staged)
+        findings.extend(f + " (staged copy)" for f in staged if f not in before)
 
 for line in errors + findings:
     print(line)

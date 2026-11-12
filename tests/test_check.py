@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -177,6 +178,8 @@ class CheckScriptTest(unittest.TestCase):
              "GitHub App installation token"),
             (token("gho_", 40), "GitHub token"),
             (token("ghp_", 36, "a_B3"), "GitHub token"),
+            (token("gho_", 36, "a_B3"), "GitHub token"),
+            (token("ghs_", 36, "a_B3"), "GitHub App installation token"),
             (token("github_pat_", 82, "aB3_"), "GitHub fine-grained token"),
         ]
         for value, kind in cases:
@@ -190,6 +193,10 @@ class CheckScriptTest(unittest.TestCase):
         self.write("config.txt", "\n".join([
             token("ghp_", 35), token("ghs_", 35), token("gho_", 35),
             token("github_pat_", 81, "aB3_"), "ghp_" + "-" * 40, "ghs_" + "1_a.b-" * 5,
+            # Long runs of dots or dashes are neither installation token form.
+            "ghs_" + "." * 40, "ghs_" + "-" * 40, "ghs_" + "a.b-" * 12,
+            # A JWT-like body with a part under 10 characters is too short.
+            "ghs_" + "12345_" + token("eyJ", 6) + "." + token("eyJ", 30) + "." + token("x-_", 30),
         ]) + "\n")
         self.assert_passes("--check", "secrets")
 
@@ -210,6 +217,26 @@ class CheckScriptTest(unittest.TestCase):
         path = self.write("config.txt", token("ghp_", 40) + "\n")
         path.unlink()
         self.assert_fails("secrets", "config.txt:1: GitHub token")
+
+    def test_staged_problem_cleaned_only_in_working_tree_is_still_scanned(self):
+        value = token("ghp_", 40)
+        path = self.write("config.txt", "ok\n" + value + "\n")
+        path.write_text("ok\nclean\n", encoding="utf-8")
+        out = self.assert_fails("secrets", "config.txt:2: GitHub token (staged copy)")
+        self.assertNotIn(value, out)
+        doc = self.write("notes.md", "a " + EM_DASH + " b\n")
+        doc.write_text("a - b\n", encoding="utf-8")
+        self.assert_fails("writing", "notes.md:1: em dash (staged copy)")
+
+    def test_problem_in_both_copies_is_reported_once(self):
+        path = self.write("config.txt", token("ghp_", 40) + "\n")
+        path.write_text("new first line\n" + token("ghp_", 40) + "\n", encoding="utf-8")
+        out = self.assert_fails("secrets", "config.txt:2: GitHub token")
+        self.assertIn("config.txt:1: GitHub token (staged copy)", out)
+        self.write("config.txt", token("ghp_", 40) + "\n")
+        out = self.assert_fails("secrets", "config.txt:1: GitHub token")
+        self.assertEqual(out.count("config.txt:1:"), 1, out)
+        self.assertNotIn("staged copy", out)
 
     def test_git_listing_error_fails_scans(self):
         shutil.rmtree(self.repo / ".git")
@@ -252,10 +279,11 @@ class CheckScriptTest(unittest.TestCase):
         """A bin folder with only the tools the plists check needs."""
         bindir = self.base / "bin"
         bindir.mkdir()
-        for tool in ("dirname", "mktemp", "chmod", "mkdir", "rm"):
+        for tool in ("dirname", "chmod", "mkdir", "rm"):
             found = shutil.which(tool)
             self.assertIsNotNone(found, tool)
             os.symlink(found, bindir / tool)
+        os.symlink(sys.executable, bindir / "python3")
         if plutil_script is not None:
             stub = bindir / "plutil"
             stub.write_text(plutil_script)
