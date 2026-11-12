@@ -116,12 +116,14 @@ filename is the config path; any other OSError still raises. That line names
 the config path and the error type, then a fixed reason ("the path is a
 directory, not a file", "permission denied; check the file's mode and owner",
 or "the file could not be read"), never the exception's own text. A queue run
-(`watch --from-queue`) checks the config before it moves anything: when the
-config is bad it prints the same line on stderr, logs it and exits 2, leaving
-every file in the queue. launchd retries at most once a minute until the
-config is fixed. If the config breaks while a run is under way, the run prints
-the same line and defers the files it picked up, as for any other lookup or
-review failure, so they are retried and never lost.
+(`watch --from-queue`) and the hourly pass check the config before the lock and
+before anything moves: when the config is bad they print the same line on
+stderr and exit 2, and a queue run logs it and leaves every file in the queue.
+launchd retries at most once a minute until the config is fixed. If the config
+breaks while a run is under way, the run prints the same line once and defers
+the files it picked up, as for any other lookup or review failure, so they are
+retried and never lost. The hook treats any exception from prbot, SystemExit
+included, as a guard failure.
 
 Agents editing this repository also get project hooks from
 `.claude/settings.json`, which runs `.claude/hooks/check_edit.py` on

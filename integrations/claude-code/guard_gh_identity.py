@@ -17,11 +17,11 @@ TOKEN = re.compile(r"(?<![A-Za-z0-9_])(?:[^\s'\"]*/)?(gh|prbot|git)(?![A-Za-z0-9
 GIT_WRITE_FALLBACK = re.compile(
     r"(?<![A-Za-z0-9_])(?:[^\s'\"]*/)?git\s+(?:-\S+\s+|[A-Za-z0-9=./][A-Za-z0-9=./-]*\s+)*(commit|push)\b")
 # While the guard is broken, a command passes only if every simple command in it starts with one of these
-# programs, none of which can start another program (rg --pre and sort --compress-program can, and printf -v
-# can set PATH, so they are out). Bash can spell gh without the letters in a row (g\h, 'g'h, ${x}h, a glob, base64 piped to sh), so a
-# token check alone cannot prove a command unrelated.
+# programs, none of which can start another program (rg --pre, sort --compress-program, file -z and diff -l
+# can, and printf -v can set PATH, so they are out). Bash can spell gh without the letters in a row (g\h,
+# 'g'h, ${x}h, a glob, base64 piped to sh), so a token check alone cannot prove a command unrelated.
 SAFE_WHEN_BROKEN = frozenset("""
-    ls pwd cd cat head tail wc echo grep egrep fgrep which stat file diff cmp uniq cut tr
+    ls pwd cd cat head tail wc echo grep which stat cmp uniq cut tr
     true false date whoami id uname basename dirname realpath du df tree
 """.split())
 # Command and process substitution, subshells, $'..' and ${..} can run or build any program, even inside an
@@ -91,7 +91,7 @@ def decide(payload):
         if offending:
             return deny(routing_fix(offending))
         return None
-    except Exception as e:
+    except BaseException as e:  # prbot's die() raises SystemExit, and SystemExit(0) would end the hook as allow
         return fail_closed(payload, e)
 
 
@@ -117,7 +117,7 @@ def fail_closed(payload, e):
     the error only."""
     try:
         command = bash_command(payload)
-    except Exception:
+    except BaseException:
         command = ""
     tag = f"prbot guard failed ({type(e).__name__}: {e})"
     if type(e).__name__ == "ConfigError":
@@ -126,7 +126,7 @@ def fail_closed(payload, e):
         suffix = ". Fix the guard, then re-run."
     try:
         offending = load_prbot().unrouted_writes(command, False)
-    except Exception:
+    except BaseException:
         offending = []
     if offending:
         return deny(f"{routing_fix(offending)}\n(guard note: {tag}{suffix})")

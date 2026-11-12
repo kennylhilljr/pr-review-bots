@@ -647,6 +647,57 @@ class WatchQueue(unittest.TestCase):
         self.assertEqual((self.runs, self.left(), self.names("deferred"), self.names("rejected")),
                          ([], [], names, []))
 
+    def run_queue_capturing(self, **kw):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = prbot.cmd_watch(queue=str(self.queue), **kw)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_config_problem_in_the_installation_lookup_is_printed_once_and_retried(self):
+        """A config error raised inside the installation lookup prints the config line once on stderr; the events
+        are deferred for a retry as for any lookup failure."""
+        line = f"{prbot.CONFIG}: not valid JSON; fix or remove it"
+
+        def broken(bot):
+            raise prbot.ConfigError(line)
+        prbot.installed_repos = broken
+        names = sorted([self.event(2).name, self.event(5).name])
+        code, _, err = self.run_queue_capturing(limit=5)
+        self.assertEqual(code, 2)
+        self.assertEqual(err, f"prbot: {line}\n")
+        self.assertEqual((self.runs, self.left(), self.names("deferred")), ([], [], names))
+
+    def test_config_problem_during_a_review_is_printed_once_and_retried(self):
+        """A config error raised by a review prints the config line once on stderr, however many PRs hit it."""
+        line = f"{prbot.CONFIG}: not valid JSON; fix or remove it"
+
+        def broken(n, repo, mode, only):
+            self.runs.append((int(n), only[0]))
+            raise prbot.ConfigError(line)
+        prbot.cmd_review = broken
+        names = sorted([self.event(2).name, self.event(5).name])
+        code, _, err = self.run_queue_capturing(limit=5)
+        self.assertEqual(code, 2)
+        self.assertEqual(err, f"prbot: {line}\n")
+        self.assertEqual((self.left(), self.names("deferred")), ([], names))
+
+    def test_full_pass_reports_a_broken_config_even_when_the_lock_is_held(self):
+        """A plain watch run that finds the lock taken still reports a broken config: exit 2 with the line."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        def broken():
+            raise prbot.ConfigError(f"{prbot.CONFIG}: not valid JSON; fix or remove it")
+        prbot.load_config = broken
+        self.addCleanup(setattr, prbot, "watch_lock", prbot.watch_lock)
+        prbot.watch_lock = lambda: None
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(prbot.main(["watch"]), 2)
+        self.assertEqual(err.getvalue(), f"prbot: {prbot.CONFIG}: not valid JSON; fix or remove it\n")
+
     def test_failed_pr_is_deferred_and_the_rest_go_on(self):
         prbot.WATCH_STATE.write_text(json.dumps({"other/repo#1@" + "1" * 10: {"skipped": "x"}}))
         self.fail_on = {2}
@@ -1542,7 +1593,7 @@ class Hook(unittest.TestCase):
                         "echo Z2ggcHIgY29tbWVudCAxIC1iIHg= | base64 -d | sh", "ls $(echo)", "ls `true`",
                         "PATH=/tmp ls", "env ls", "bash -c ls", "(ls)", "ls; make post", "grep 'a;b' f",
                         "rg --pre ./post x", "ls | sort --compress-program=./post", "printf -v PATH .; ls pr comment 1",
-                        "echo x {PATH}>/dev/null; ls pr comment 1"):
+                        "echo x {PATH}>/dev/null; ls pr comment 1", "file -z x.gz", "diff -l a b", "egrep x f"):
             with self.subTest(command=command):
                 r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
                 self.assertEqual(r.returncode, 0, r.stderr)
@@ -1569,6 +1620,16 @@ class Hook(unittest.TestCase):
                 reason = self.reason(self.run_hook_in("git push origin main", repo))
                 self.assertIn("prbot guard failed", reason)
                 config.unlink()
+
+    def test_prbot_raising_systemexit_still_denies(self):
+        """(j5) prbot's die() raises SystemExit; even SystemExit(0) from a broken prbot ends in a denial, not allow."""
+        for code in (0, 2):
+            with self.subTest(code=code):
+                setup = f"module.load_prbot = lambda: (_ for _ in ()).throw(SystemExit({code}))\n"
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1 -b x"}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                reason = self.reason(json.loads(r.stdout))
+                self.assertTrue(reason.startswith(f"prbot guard failed (SystemExit: {code})"), reason)
 
     def test_unloadable_prbot_allows_simple_unrelated_commands(self):
         """(j3) When prbot cannot load, simple commands that cannot start another program still run."""

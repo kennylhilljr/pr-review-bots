@@ -676,6 +676,7 @@ def watch_setup(dry_run, limit, baseline):
         try:
             repos = installed_repos(b)
         except (SystemExit, Exception) as e:
+            note_config_problem(e)
             gaps.append(f"could not read where the {b} bot is installed ({e!r})")
             lookup_failed = True
             continue
@@ -795,17 +796,32 @@ def report_queue_config_problem(problem, left):
     watch_log(f"queue: config problem, leaving {left} in the queue: {problem}")
 
 
+_config_noted = set()
+
+
+def note_config_problem(e):
+    """When a failure caught deep in a watch run is a config problem, print its one line on stderr, once per
+    message. The caller still handles the failure as usual (defer and retry)."""
+    problem = config_problem(e) if isinstance(e, (ConfigError, OSError)) else None
+    if problem is not None and problem not in _config_noted:
+        _config_noted.add(problem)
+        print(f"prbot: {problem}", file=sys.stderr)
+
+
 def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
     """One pass over open PRs on every repo the bots are installed on. launchd runs this every hour as a backstop
     for the event queue. --baseline marks the commits open right now as seen without reviewing them, so only new
     ones get reviews. With queue, only the PRs named in that event queue directory are handled."""
-    if queue is not None:
-        # before the lock and before anything moves: a bad config is reported on every queue run, and every file
-        # stays put. launchd relaunches at most once per ThrottleInterval (60s) while it is broken.
-        problem = queue_config_problem()
-        if problem is not None:
+    # before the lock and before anything moves: a bad config is reported on every run, even one that finds the
+    # lock taken, and every queue file stays put. launchd relaunches at most once per ThrottleInterval (60s).
+    _config_noted.clear()
+    problem = queue_config_problem()
+    if problem is not None:
+        if queue is not None:
             report_queue_config_problem(problem, "every file")
-            return 2
+        else:
+            print(f"prbot: {problem}", file=sys.stderr)
+        return 2
     # the lock is held from before the queue directory is checked until the last file has moved, so another
     # watch run can't change the queue or the deferred directory between a check and the action it allows
     lock = watch_lock()
@@ -1035,7 +1051,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
         problem = config_problem(e) if isinstance(e, (ConfigError, OSError)) else None
         if problem is not None:
             # the config broke after the check at the start: say why on stderr, then retry like any lookup failure
-            print(f"prbot: {problem}", file=sys.stderr)
+            note_config_problem(e)
             watch_log(f"queue: config problem during the run, deferring the event files: {problem}")
         else:
             watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
@@ -1078,6 +1094,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
                                     "number,state,isDraft,headRefOid"]))
             result = watch_pr(repo, p, state, seen, ctx)
         except (SystemExit, Exception) as e:
+            note_config_problem(e)
             watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
             result = "failed"
         if result == "limit":  # untouched: launchd starts another run after ThrottleInterval
@@ -1096,6 +1113,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
         try:
             outcomes, unlisted = watch_repos(repos, state, seen, ctx, skip=set(groups))
         except (SystemExit, Exception) as e:
+            note_config_problem(e)
             watch_log(f"queue: sweep failed ({e!r})")
             outcomes, unlisted = {"failed"}, set()
         # each outcome is checked on its own, so one PR's success or wait can't hide another PR's limit block.
