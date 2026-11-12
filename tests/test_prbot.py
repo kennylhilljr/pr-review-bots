@@ -265,6 +265,16 @@ class ShellCommands(unittest.TestCase):
             'gh pr close 1 -c "done"',
             'gh issue close 1 --comment "done"',
             "if true; then sudo gh -R o/r pr close 1 -c done; fi",
+            "echo ok\ngh pr comment 1 -b x",
+            "for i in 1 2\ndo\n  gh pr comment $i -b x\ndone",
+            "if true\nthen\n  gh pr comment 1 -b x\nfi",
+            "{\n  gh pr comment 1 -b x\n}",
+            "gh pr comment 1 \\\n  -b x",
+            "env -S gh -R o/r pr comment 1 -b x",
+            "env -S 'gh -R o/r pr comment 1' -b x",
+            "env -iS 'gh -R o/r pr comment 1 -b x'",
+            "env --split-string='gh --repo o/r pr comment 1 -b x'",
+            "env -S '-u FOO gh -R o/r pr comment 1 -b x'",
         ]
         for cmd in positives:
             with self.subTest(cmd=cmd):
@@ -327,6 +337,11 @@ class ShellCommands(unittest.TestCase):
         self.assertEqual(self.count(nest("prbot gh claude -- pr comment 1 -b x", 4)), 0)
         self.assertEqual(prbot.unrouted_writes("bash -c 'gh -R o/r pr comment 1 -b x'"),
                          [["-R", "o/r", "pr", "comment", "1", "-b", "x"]])
+        self.assertEqual(prbot.unrouted_writes("env -S gh -R o/r pr comment 1 -b x"),
+                         [["-R", "o/r", "pr", "comment", "1", "-b", "x"]])
+        self.assertEqual(prbot.unrouted_writes('gh pr comment 1 \\\n  -b "two\nlines"'),
+                         [["pr", "comment", "1", "-b", "two\nlines"]])  # a quoted newline stays in the body
+        self.assertEqual(self.count('echo "gh pr comment 1\n-b x"'), 0)
 
 
 class GitPush(unittest.TestCase):
@@ -371,6 +386,8 @@ class GitPush(unittest.TestCase):
             ("bash -lc 'git commit -m x && git -C repo push origin main'", [(commit, None), (push, "repo")]),
             ("sudo bash -c 'env -u X git -C repo push origin main'", [(push, "repo")]),
             ("`git commit -m x`", [(commit, None)]),
+            ("git status\ngit commit -m x", [(commit, None)]),
+            ("env -S 'git -C repo push origin main'", [(push, "repo")]),
             ("bash -c 'echo git push'", []),
             ("bash -c 'prbot git claude -- push'", []),
             ("sudo git status", []),

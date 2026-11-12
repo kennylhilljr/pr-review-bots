@@ -274,13 +274,16 @@ WRAPPERS = {
 
 
 def _tokens(command):
-    lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+    """Shell words, with ; & | ( ) and unquoted newlines as separate tokens. A backslash-newline joins lines."""
+    command = command.replace("\\\n", "")
+    lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+    lex.whitespace = " \t\r"  # a newline ends a command, like ;
     lex.whitespace_split = True
     lex.commenters = ""
     try:
         return list(lex)
     except ValueError:  # unbalanced quotes: fall back to a rough split rather than letting the call through
-        return command.split()
+        return re.findall(r"\n|[^\s]+", command)
 
 
 def _backticks(command):
@@ -311,25 +314,29 @@ def _backticks(command):
     return out
 
 
-def _skip_options(seg, i, spec):
-    """(index of the wrapped command, [(option, value)]) for a wrapper's options starting at seg[i]."""
+def _skip_options(seg, i, spec, split=()):
+    """(index of the wrapped command, [(option, value)], None) for a wrapper's options starting at seg[i].
+    An option named in split (env -S) stops the scan at once: the third item is then (value, start, prefix, end),
+    where seg[start:end] holds the option and its value and prefix is any flags clustered before it."""
     value_short, optional_short, value_long, optional_long = spec
     found = []
     while i < len(seg):
         t = seg[i]
         if t == "--":
-            return i + 1, found
+            return i + 1, found, None
         if t.startswith("--"):
             name, eq, val = t.partition("=")
             if name in value_long and not eq:
-                found.append((name, seg[i + 1] if i + 1 < len(seg) else ""))
-                i += 2
+                val, end = (seg[i + 1] if i + 1 < len(seg) else ""), i + 2
             else:
-                found.append((name, val if eq else None))
-                i += 1
+                val, end = (val if eq else None), i + 1
+            found.append((name, val))
+            if name in split:
+                return end, found, (val or "", i, "", end)
+            i = end
             continue
         if not t.startswith("-") or t == "-":
-            return i, found
+            return i, found, None
         step = 1
         for k in range(1, len(t)):
             ch = t[k]
@@ -339,13 +346,15 @@ def _skip_options(seg, i, spec):
                     val = seg[i + 1] if i + 1 < len(seg) else ""
                     step = 2
                 found.append((ch, val))
+                if ch in split:
+                    return i + step, found, (val, i, t[:k] if k > 1 else "", i + step)
                 break
             if ch in optional_short:
                 found.append((ch, t[k + 1:] or None))
                 break
             found.append((ch, None))
         i += step
-    return i, found
+    return i, found, None
 
 
 def _shell_script(args):
@@ -384,13 +393,14 @@ def _simple_command(seg, depth):
         if name not in WRAPPERS:
             break
         leading = False
-        i, opts = _skip_options(seg, i + 1, WRAPPERS[name])
+        at = i
+        i, opts, split = _skip_options(seg, at + 1, WRAPPERS[name], ("S", "--split-string") if name == "env" else ())
         if name == "command" and any(o in ("v", "V") for o, _ in opts):
             return  # command -v/-V only looks the program up
-        split = [v for o, v in opts if name == "env" and o in ("S", "--split-string") and v]
-        if split:  # env -S splits its string into the command and its first arguments
-            seg = _tokens(split[-1]) + seg[i:]
-            i = 0
+        if split:  # env -S: its string becomes more env arguments in its place, then env is read again
+            value, start, prefix, end = split
+            seg = seg[:start] + ([prefix] if prefix else []) + _tokens(value) + seg[end:]
+            i = at
     if i >= len(seg):
         return
     prog, args = os.path.basename(seg[i]), seg[i + 1:]
