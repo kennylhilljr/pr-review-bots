@@ -49,10 +49,10 @@ This is separate from `.github/workflows/backup-review.yml`. That workflow posts
 | --- | --- |
 | `tests` | `python3 -B -m unittest discover -s tests -t .` |
 | `python` | `python3 -m py_compile` on `prbot` and `integrations/claude-code/guard_gh_identity.py` |
-| `shell` | `bash -n` on `integrations/codex/bin/gh`, `integrations/codex/codex-as-bot` and `integrations/launchd/install-watch.sh`, one at a time |
+| `shell` | `bash -n` on `integrations/codex/bin/gh`, `integrations/codex/codex-as-bot`, `integrations/launchd/install-watch.sh` and `integrations/github-actions/install-backup-review.sh`, one at a time |
 | `writing` | No em dash (U+2014) or en dash (U+2013) in tracked `*.md` files or in `prbot` |
 | `secrets` | No private key block and no literal GitHub token in any tracked file |
-| `plists` | `plutil -lint` on the two plists in `integrations/launchd/`, skipped with a message when `plutil` is missing (as on Linux) |
+| `plists` | `plutil -lint` on the two plists in `integrations/launchd/`, or a Python `plistlib` parse when `plutil` is missing (as on Linux) |
 
 With no arguments the script runs every check, keeps going after a failure, prints `FAIL: <check>` for each one that failed, and exits 1. Run one check, or a few, with `--check`:
 

@@ -100,7 +100,8 @@ class CheckScriptTest(unittest.TestCase):
         self.write("prbot", "#!/usr/bin/env python3\nprint('fixture')\n")
         self.write("integrations/claude-code/guard_gh_identity.py", "x = 1\n")
         for rel in ("integrations/codex/bin/gh", "integrations/codex/codex-as-bot",
-                    "integrations/launchd/install-watch.sh"):
+                    "integrations/launchd/install-watch.sh",
+                    "integrations/github-actions/install-backup-review.sh"):
             self.write(rel, "#!/bin/bash\nif true; then echo ok; fi\n")
         for name in ("prbot-watch", "prbot-watch-queue"):
             self.write("integrations/launchd/com.kennylhilljr.%s.plist" % name, PLIST)
@@ -195,6 +196,9 @@ class CheckScriptTest(unittest.TestCase):
             token("github_pat_", 81, "aB3_"), "ghp_" + "-" * 40, "ghs_" + "1_a.b-" * 5,
             # Long runs of dots or dashes are neither installation token form.
             "ghs_" + "." * 40, "ghs_" + "-" * 40, "ghs_" + "a.b-" * 12,
+            # A stateless-like token with a long first part but short JWT
+            # parts is neither form (the legacy form skips this shape).
+            "ghs_" + "12345_" + token("eyJ", 36) + "." + "ab" + "." + "cd",
             # A JWT-like body with a part under 10 characters is too short.
             "ghs_" + "12345_" + token("eyJ", 6) + "." + token("eyJ", 30) + "." + token("x-_", 30),
         ]) + "\n")
@@ -266,7 +270,8 @@ class CheckScriptTest(unittest.TestCase):
 
     def test_shell_syntax_error_fails_shell_and_names_file(self):
         for rel in ("integrations/codex/bin/gh", "integrations/codex/codex-as-bot",
-                    "integrations/launchd/install-watch.sh"):
+                    "integrations/launchd/install-watch.sh",
+                    "integrations/github-actions/install-backup-review.sh"):
             with self.subTest(file=rel):
                 original = (self.repo / rel).read_text()
                 self.write(rel, "#!/bin/bash\nif true; then echo\n")
@@ -300,11 +305,17 @@ class CheckScriptTest(unittest.TestCase):
         self.assertIn("prbot-watch.plist", args)
         self.assertIn("prbot-watch-queue.plist", args)
 
-    def test_missing_plutil_skips_plists(self):
+    def test_missing_plutil_parses_plists_with_plistlib(self):
         path = self.stub_bin()
         code, out = self.run_check("--check", "plists", env=self.env(PATH=path))
         self.assertEqual(code, 0, out)
-        self.assertIn("skip: plutil not found", out)
+        self.assertIn("plutil not found, parsing plists with python3 plistlib", out)
+        self.assertIn("ok: plists", out)
+        self.write("integrations/launchd/com.kennylhilljr.prbot-watch.plist", "<plist><dict>\n")
+        code, out = self.run_check("--check", "plists", env=self.env(PATH=path))
+        self.assertEqual(code, 1, out)
+        self.assertIn("prbot-watch.plist: ", out)
+        self.assertIn("FAIL: plists", out)
 
     # Arguments, full runs and isolation
 

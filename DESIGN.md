@@ -253,7 +253,8 @@ and its `__init__.py` runs before the test modules load.
 `scripts/check.sh` runs everything a PR must pass in one command: the unit
 tests, `py_compile` on the Python files, `bash -n` on the shell scripts, a
 writing check for em and en dashes, a secret check for private keys and
-literal GitHub tokens, and `plutil -lint` on the plists when `plutil` exists.
+literal GitHub tokens, and `plutil -lint` on the plists (a Python `plistlib`
+parse where `plutil` is missing).
 It runs every check even after one fails, so a single run lists all problems.
 Each check can also run alone with `--check`, which is how
 `tests/test_check.py` plants one problem at a time in a throwaway Git repo.

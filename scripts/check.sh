@@ -86,7 +86,10 @@ SECRETS = [
     ("GitHub token", re.compile(rb"(?:ghp|gho)_[A-Za-z0-9_]{36,}")),
     # Installation tokens: the legacy 36-character form, and the stateless
     # ghs_APPID_JWT form, whose JWT has three dot-separated base64url parts.
-    ("GitHub App installation token", re.compile(rb"ghs_[A-Za-z0-9_]{36,}")),
+    # The legacy pattern skips anything shaped like a stateless token, so the
+    # two forms never overlap.
+    ("GitHub App installation token",
+     re.compile(rb"ghs_(?![0-9]+_[A-Za-z0-9_-]{10,}\.)[A-Za-z0-9_]{36,}")),
     ("GitHub App installation token",
      re.compile(rb"ghs_[0-9]+_[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("GitHub fine-grained token", re.compile(rb"github_pat_[A-Za-z0-9_]{82,}")),
@@ -180,7 +183,8 @@ run_check() {
             ;;
         shell)
             status=0
-            for script in integrations/codex/bin/gh integrations/codex/codex-as-bot integrations/launchd/install-watch.sh; do
+            for script in integrations/codex/bin/gh integrations/codex/codex-as-bot integrations/launchd/install-watch.sh \
+                    integrations/github-actions/install-backup-review.sh; do
                 bash -n "$script" || { echo "bash -n failed: $script"; status=1; }
             done
             return $status
@@ -192,11 +196,25 @@ run_check() {
             scan_tracked secrets
             ;;
         plists)
+            plists="integrations/launchd/com.kennylhilljr.prbot-watch.plist
+                integrations/launchd/com.kennylhilljr.prbot-watch-queue.plist"
             if command -v plutil >/dev/null 2>&1; then
-                plutil -lint integrations/launchd/com.kennylhilljr.prbot-watch.plist \
-                    integrations/launchd/com.kennylhilljr.prbot-watch-queue.plist
+                # shellcheck disable=SC2086
+                plutil -lint $plists
             else
-                echo "skip: plutil not found, plists not linted"
+                echo "plutil not found, parsing plists with python3 plistlib"
+                # shellcheck disable=SC2086
+                python3 -c 'import plistlib, sys
+status = 0
+for path in sys.argv[1:]:
+    try:
+        with open(path, "rb") as fh:
+            plistlib.load(fh)
+        print(path + ": OK")
+    except Exception as exc:
+        print(path + ": " + type(exc).__name__)
+        status = 1
+sys.exit(status)' $plists
             fi
             ;;
     esac
