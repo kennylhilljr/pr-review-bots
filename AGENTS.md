@@ -12,6 +12,7 @@ This repository holds `prbot`, the CLI behind Kenny's two GitHub review bots (`c
 - `integrations/github-actions/`: `backup-review.yml`, a GitHub Actions workflow that reviews PRs prbot hasn't reviewed after 2 hours, posting as `claude[bot]`, and `install-backup-review.sh`, which Kenny runs to set the secret and open a PR adding it to each repo.
 - `integrations/launchd/`: `install-watch.sh` installs the job that runs `prbot watch` every 5 minutes; the two plists and `README.md` there are the event queue job and hourly backstop that replace it.
 - `skills/cross-review/`: the skill Claude Code and Codex use to review PRs and post through the bots. It is linked into `~/.claude/skills` and `~/.codex/skills`.
+- `.claude/settings.json` and `.claude/hooks/check_edit.py`: project Claude Code hooks. They refuse writes to `*.pem`, `*.key` and `.env*` files, run the unit tests after an edit to `prbot`, `integrations/` or `tests/`, and flag em and en dashes after an edit to a `*.md` file or `skills/`. Tested in `tests/test_claude_hooks.py`.
 - `tests/test_prbot.py`: unit tests. Fixtures copy the shape of real PRs from `openclaw-ecc-orchestrator`.
 - `docs/assets/`: the README header.
 

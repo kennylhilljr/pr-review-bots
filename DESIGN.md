@@ -83,6 +83,18 @@ each agent also gets a mechanical check.
 Both use the same classifier in `prbot`, so the rules cannot drift apart. Reads
 such as `gh pr view`, `gh pr diff` and `gh api` GET calls stay on Kenny's login.
 
+Agents editing this repository also get project hooks from
+`.claude/settings.json`, which runs `.claude/hooks/check_edit.py` on
+PreToolUse and PostToolUse for Write, Edit and MultiEdit. Before a write it
+refuses `*.pem`, `*.key` and `.env*` files, because App keys live in Keychain.
+After an edit to `prbot`, `integrations/` or `tests/` it runs the unit tests in
+fresh temp folders and returns the failure output; a marker variable stops a
+hook started inside that run from starting the suite again. After an edit to a
+`*.md` file or anything in `skills/` it reports em and en dashes by line. These
+hooks never post, push or call GitHub. The identity guard
+(`guard_gh_identity.py`) is separate: it is installed globally from
+`~/.claude/settings.json` and covers every repository.
+
 ## Who reviews which PR
 
 The default is cross-review: Codex reviews what Claude wrote, and Claude

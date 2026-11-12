@@ -281,6 +281,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `integrations/launchd/` | Plists for the event queue job and the hourly backstop, plus the older 5-minute installer. |
 | `skills/cross-review/` | The PR review skill shared by Claude Code and Codex. |
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents working on this repository. |
+| `.claude/settings.json`, `.claude/hooks/check_edit.py` | Project Claude Code hooks: block key files, run the tests after code edits, flag dashes in docs. |
 | `tests/` | Unit tests, including fixtures shaped like real PRs. |
 | `docs/assets/` | The README header (SVG source and WebP). |
 | [`DESIGN.md`](DESIGN.md) | Why it works this way. |
