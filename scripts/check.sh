@@ -81,7 +81,10 @@ mode = sys.argv[1]
 DASHES = {"–": "en dash", "—": "em dash"}
 SECRETS = [
     ("private key block", re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
-    ("GitHub token", re.compile(rb"(?:ghp|ghs|gho)_[A-Za-z0-9]{36,}")),
+    ("GitHub token", re.compile(rb"(?:ghp|gho)_[A-Za-z0-9]{36,}")),
+    # Installation tokens: the legacy 36-character form and the stateless
+    # ghs_APPID_JWT form, whose body also holds underscores, dots and dashes.
+    ("GitHub App installation token", re.compile(rb"ghs_[A-Za-z0-9_.-]{36,}")),
     ("GitHub fine-grained token", re.compile(rb"github_pat_[A-Za-z0-9_]{82,}")),
 ]
 

@@ -172,12 +172,14 @@ class CheckScriptTest(unittest.TestCase):
     def test_each_token_family_fails_secrets_without_printing_it(self):
         cases = [
             (token("ghp_", 36), "GitHub token"),
-            (token("ghs_", 36), "GitHub token"),
+            (token("ghs_", 36), "GitHub App installation token"),
+            ("ghs_" + "12345_" + token("eyJ", 30) + "." + token("eyJ", 60) + "." + token("x-_", 43),
+             "GitHub App installation token"),
             (token("gho_", 40), "GitHub token"),
             (token("github_pat_", 82, "aB3_"), "GitHub fine-grained token"),
         ]
         for value, kind in cases:
-            with self.subTest(prefix=value.split("_")[0]):
+            with self.subTest(value=value[:12]):
                 self.write("config.txt", "key = " + value + "\n")
                 out = self.assert_fails("secrets", "config.txt:1: " + kind)
                 self.assertNotIn(value, out)
@@ -186,7 +188,7 @@ class CheckScriptTest(unittest.TestCase):
     def test_short_token_lookalikes_pass_secrets(self):
         self.write("config.txt", "\n".join([
             token("ghp_", 35), token("ghs_", 35), token("gho_", 35),
-            token("github_pat_", 81, "aB3_"), "ghp_" + "-" * 40,
+            token("github_pat_", 81, "aB3_"), "ghp_" + "-" * 40, "ghs_" + "1_a.b-" * 5,
         ]) + "\n")
         self.assert_passes("--check", "secrets")
 

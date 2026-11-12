@@ -64,7 +64,7 @@ An unknown or incomplete argument exits 2.
 
 The `writing` and `secrets` checks read the working-tree copy of each file Git tracks (`git ls-files`), so untracked files are ignored and staged edits are checked. If Git can't list the files or a tracked file can't be read, the check fails.
 
-The `secrets` check looks for a `BEGIN ... PRIVATE KEY` line (plain, RSA, EC, OPENSSH, ENCRYPTED and other labels), for `ghp_`, `ghs_` or `gho_` followed by 36 or more letters and digits, and for `github_pat_` followed by 82 or more letters, digits and underscores. It prints the file, line and kind of finding, never the matched text. Tests that need a fake token build it at runtime, for example `"ghp_" + "a" * 36`, so the source holds no literal token.
+The `secrets` check looks for a `BEGIN ... PRIVATE KEY` line (plain, RSA, EC, OPENSSH, ENCRYPTED and other labels), for `ghp_` or `gho_` followed by 36 or more letters and digits, for `ghs_` followed by 36 or more letters, digits, underscores, dots and dashes (this covers both the old 40-character installation tokens and the long stateless `ghs_APPID_JWT` ones), and for `github_pat_` followed by 82 or more letters, digits and underscores. It prints the file, line and kind of finding, never the matched text. Tests that need a fake token build it at runtime, for example `"ghp_" + "a" * 36`, so the source holds no literal token.
 
 ## Isolation
 
