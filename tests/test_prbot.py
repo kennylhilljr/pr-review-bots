@@ -1805,6 +1805,23 @@ class CodexShim(unittest.TestCase):
             self.assertTrue(os.path.exists(f"{tmp}/prbot.called"), "PRBOT_ACTIVE skipped classify")
             self.assertFalse(os.path.exists(f"{tmp}/gh.called"))
 
+    def test_real_gh_override_pointing_at_the_shim_is_refused(self):
+        """(e) PRBOT_REAL_GH naming the shim, directly or through a symlink, stops prbot instead of looping."""
+        shim = ROOT / "integrations/codex/bin/gh"
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "gh"
+            link.symlink_to(shim)
+            for target in (shim, link):
+                with self.subTest(target=str(target)):
+                    env = {k: v for k, v in os.environ.items() if k != "PRBOT_ACTIVE"}
+                    env["PRBOT_CONFIG_DIR"] = tmp
+                    env["PRBOT_REAL_GH"] = str(target)
+                    env["PATH"] = f"{os.path.dirname(sys.executable)}:/usr/bin:/bin"
+                    r = subprocess.run([str(shim), "pr", "comment", "1", "-R", "o/r", "-b", "x"],
+                                       capture_output=True, text=True, env=env, timeout=30)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("PRBOT_REAL_GH points at the Codex gh shim", r.stderr)
+
     def test_broken_config_refuses_and_shows_classify_message(self):
         """(c) A broken config.json stops the shim with exit 4 and passes classify's own message through."""
         with tempfile.TemporaryDirectory() as tmp:

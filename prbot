@@ -447,7 +447,15 @@ def review_body(reviewer, reason, pr, text):
 
 
 def _real_gh():
-    gh = os.environ.get("PRBOT_REAL_GH") or shutil.which("gh", path=_path_without_shims())
+    """The gh prbot runs. PRBOT_REAL_GH may not resolve into the Codex shim's directory: the shim sends writes
+    back through prbot, so that would loop forever."""
+    override = os.environ.get("PRBOT_REAL_GH")
+    if override:
+        shim = os.path.realpath(ROOT / "integrations" / "codex" / "bin")
+        if os.path.dirname(os.path.realpath(override)) == shim:
+            die(f"PRBOT_REAL_GH points at the Codex gh shim ({override}); set it to the real gh or unset it")
+        return override
+    gh = shutil.which("gh", path=_path_without_shims())
     if not gh:
         die("gh not found on PATH")
     return gh
@@ -1300,11 +1308,9 @@ def cmd_gh(bot, args, repo=None):
     repo = repo or repo_from_args(args) or repo_from_git()
     if not repo:
         die("cannot tell which repository this is for; pass -R owner/repo")
+    gh = _real_gh()  # before the token: a PRBOT_REAL_GH that loops back through the shim is refused first
     env = dict(os.environ, GH_TOKEN=installation_token(bot, repo), PRBOT_ACTIVE=bot)
     env.pop("GITHUB_TOKEN", None)
-    gh = os.environ.get("PRBOT_REAL_GH") or shutil.which("gh", path=_path_without_shims())
-    if not gh:
-        die("gh not found on PATH")
     os.execve(gh, [gh] + args, env)
 
 
