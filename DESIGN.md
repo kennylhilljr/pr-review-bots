@@ -83,6 +83,46 @@ each agent also gets a mechanical check.
 Both use the same classifier in `prbot`, so the rules cannot drift apart. Reads
 such as `gh pr view`, `gh pr diff` and `gh api` GET calls stay on Kenny's login.
 
+Both the Claude Code hook and the Codex gh shim fail closed for feedback writes
+when the classifier cannot decide. The shim captures classify's stdout and exit
+code and leaves its stderr visible. It routes through prbot only when the exit
+code is 0 and stdout is write, and runs the real gh only when the exit code is 1
+and stdout is read. Anything else, including a missing, non-executable or
+crashing prbot, is refused with a non-zero exit. There is no bypass: the shim
+classifies every call whatever the environment holds (`PRBOT_ACTIVE` included),
+because prbot runs the real gh itself with the shim directory taken off PATH and
+so never comes back through the shim. The hook uses the same
+classifier, with one exception: when prbot itself can't be loaded or decide()
+raises, the hook falls back to a stricter check. It denies any command with a
+gh, prbot or git token, and any command it cannot prove makes no such call.
+Bash can spell gh without those letters in a row (`g\h`, `'g'h`, `${x}h`, a glob,
+base64 piped to sh), so a command passes only when it has no `$`, backtick or
+parentheses and every simple command in it starts with a program from a short
+list that cannot start another program (ls, cat, grep, head, wc and similar).
+`ls` still works while the guard is broken; `sh`, `env`, `make` and scripts do
+not. The guard's denial reason names the error type and its message, never the
+config contents.
+
+Every other prbot command (review, whoami, gh, git and the rest) exits 2 with
+one line on stderr when the config is bad, never a traceback. `load_config`
+raises ConfigError for anything the guard can't trust: JSON the parser rejects
+(huge integers and deep nesting included), invalid UTF-8, a non-object, a
+dangling symlink, a `claude` or `codex` entry that is not an object or whose
+`owner` is missing or not a non-empty string, and a `codex_triggers_as_bot`
+that is not a boolean. Only a missing file means `{}`. It lets an OSError from
+reading the file (a directory, no permission, a symlink loop) through so the
+guard can name it. `main` turns an OSError into the one line only when its
+filename is the config path; any other OSError still raises. That line names
+the config path and the error type, then a fixed reason ("the path is a
+directory, not a file", "permission denied; check the file's mode and owner",
+or "the file could not be read"), never the exception's own text. A queue run
+(`watch --from-queue`) checks the config before it moves anything: when the
+config is bad it prints the same line on stderr, logs it and exits 2, leaving
+every file in the queue. launchd retries at most once a minute until the
+config is fixed. If the config breaks while a run is under way, the run prints
+the same line and defers the files it picked up, as for any other lookup or
+review failure, so they are retried and never lost.
+
 Agents editing this repository also get project hooks from
 `.claude/settings.json`, which runs `.claude/hooks/check_edit.py` on
 PreToolUse and PostToolUse for Write, Edit and MultiEdit. Before a write it
@@ -238,15 +278,17 @@ folder when the run ends. It overwrites values already in the environment. If
 the system temp folder sits under `~/.config`, `~/.local/state` or
 `~/.openclaw` (OpenClaw can set `TMPDIR` that way), it uses `/tmp` instead.
 
-The test command needs `-t .`:
+The test command is:
 
 ```bash
 python3 -B -m unittest discover -s tests -t . -v
 ```
 
-Without it, unittest imports `test_prbot` as a top-level module and never runs
-`tests/__init__.py`. With the repo root as the top level, `tests` is a package
-and its `__init__.py` runs before the test modules load.
+With the repo root as the top level, `tests` is a package and its `__init__.py`
+runs before the test modules load. Without `-t .`, unittest imports `test_prbot`
+as a top-level module and does not run `tests/__init__.py` itself, so
+`tests/test_prbot.py` runs it before it imports prbot (when no `tests` module is
+loaded yet). Either way the state paths are set up before prbot loads.
 
 ## Checks before a PR
 

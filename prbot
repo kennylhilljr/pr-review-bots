@@ -18,7 +18,7 @@
                                      one pass: review new commits on open, non-draft PRs on every repo
                                      the bots are installed on; with --from-queue, only the PRs named
                                      in the GitHub event files in DIR
-  prbot classify -- <gh args>        exit 0 if the gh call writes PR feedback
+  prbot classify -- <gh args>        exit 0 if the call posts PR feedback, 1 if it does not, 4 when it can't decide
 
 Standard library plus the openssl and gh binaries. No token is printed or saved.
 """
@@ -127,8 +127,39 @@ def unrouted_writes(command, codex_triggers_as_bot=False):
 # ---------- config and key storage ----------
 
 
+class ConfigError(Exception):
+    pass
+
+
 def load_config():
-    return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    """The config as a dict, {} when there is none. A broken file raises ConfigError; OSError propagates.
+
+    The guard decides from this config, so anything it can't trust is an error, never {}: a dangling symlink, a
+    symlink loop (OSError), bytes that are not UTF-8, JSON the parser rejects for any reason, a non-object, and
+    a bot entry or field whose type would make the guard's owner check silently match nothing."""
+    try:
+        text = CONFIG.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if os.path.lexists(CONFIG):
+            raise ConfigError(f"{CONFIG}: a symlink to a file that does not exist; fix or remove it") from None
+        return {}
+    except UnicodeDecodeError:
+        raise ConfigError(f"{CONFIG}: not valid UTF-8 text; fix or remove it") from None
+    try:
+        cfg = json.loads(text)
+    except (ValueError, RecursionError):  # JSONDecodeError, huge integers, very deep nesting
+        raise ConfigError(f"{CONFIG}: not valid JSON; fix or remove it") from None
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"{CONFIG}: top-level value is not a JSON object; fix or remove it")
+    for bot in AGENTS:
+        entry = cfg.get(bot)
+        if bot in cfg and not isinstance(entry, dict):
+            raise ConfigError(f"{CONFIG}: \"{bot}\" is not a JSON object; fix or remove it")
+        if isinstance(entry, dict) and not (isinstance(entry.get("owner"), str) and entry["owner"]):
+            raise ConfigError(f"{CONFIG}: \"{bot}\".owner is not a non-empty string; fix or remove it")
+    if not isinstance(cfg.get("codex_triggers_as_bot", False), bool):
+        raise ConfigError(f"{CONFIG}: codex_triggers_as_bot is not true or false; fix or remove it")
+    return cfg
 
 
 def save_config(cfg):
@@ -431,7 +462,8 @@ def gh_read(args):
 
 
 def cmd_review(target, repo=None, override=None, mode="post", only=None):
-    repo = repo or repo_from_args([target]) or repo_from_git()
+    load_config()  # a broken config stops here, before any gh call
+    repo =repo or repo_from_args([target]) or repo_from_git()
     if not repo:
         die("cannot tell which repository this PR is in; pass -R owner/repo")
     number = re.sub(r".*/pull/(\d+).*", r"\1", target)
@@ -746,10 +778,34 @@ def watch_repos(repos, state, seen, ctx, skip=()):
     return outcomes, unlisted
 
 
+def queue_config_problem():
+    """The one-line message when the config is bad or unreadable, else None. Other errors still raise."""
+    try:
+        load_config()
+    except (ConfigError, OSError) as e:
+        problem = config_problem(e)
+        if problem is None:
+            raise
+        return problem
+    return None
+
+
+def report_queue_config_problem(problem, left):
+    print(f"prbot: {problem}", file=sys.stderr)
+    watch_log(f"queue: config problem, leaving {left} in the queue: {problem}")
+
+
 def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
     """One pass over open PRs on every repo the bots are installed on. launchd runs this every hour as a backstop
     for the event queue. --baseline marks the commits open right now as seen without reviewing them, so only new
     ones get reviews. With queue, only the PRs named in that event queue directory are handled."""
+    if queue is not None:
+        # before the lock and before anything moves: a bad config is reported on every queue run, and every file
+        # stays put. launchd relaunches at most once per ThrottleInterval (60s) while it is broken.
+        problem = queue_config_problem()
+        if problem is not None:
+            report_queue_config_problem(problem, "every file")
+            return 2
     # the lock is held from before the queue directory is checked until the last file has moved, so another
     # watch run can't change the queue or the deferred directory between a check and the action it allows
     lock = watch_lock()
@@ -908,6 +964,10 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
     retry delay, and anything that can never be handled is moved to <queue>-rejected. The hourly full pass
     moves the deferred files back. Returns 2 if any PR failed or the repository lookup failed. The caller holds
     the watch lock and has already checked qdir with checked_queue_dir."""
+    problem = queue_config_problem()  # cmd_watch checked already; this covers a direct call
+    if problem is not None:
+        report_queue_config_problem(problem, "every file")
+        return 2
     if not any(queue_entries(qdir)):
         return 0
     rejected, deferred = queue_sibling(qdir, "rejected"), queue_sibling(qdir, "deferred")
@@ -972,7 +1032,13 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
         # at least one review per run, so files held back by the limit drain one launchd relaunch at a time
         ctx = watch_setup(dry_run, max(limit, 1), baseline)
     except (SystemExit, Exception) as e:  # can't tell which repos are covered: retry later, never reject
-        watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
+        problem = config_problem(e) if isinstance(e, (ConfigError, OSError)) else None
+        if problem is not None:
+            # the config broke after the check at the start: say why on stderr, then retry like any lookup failure
+            print(f"prbot: {problem}", file=sys.stderr)
+            watch_log(f"queue: config problem during the run, deferring the event files: {problem}")
+        else:
+            watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
         for path, _ in events + sweeps:
             defer(path, "repository lookup failed")
         return 2
@@ -1089,7 +1155,8 @@ def manifest(spec, redirect_url):
 
 def cmd_register(bot, org=None, spec_path=None):
     """GitHub App manifest flow: a local page posts the manifest, GitHub redirects back with a one-hour code."""
-    spec = load_bot_spec(bot, spec_path)
+    load_config()  # a broken config stops here, before the local server starts or GitHub creates an App
+    spec =load_bot_spec(bot, spec_path)
     state = secrets.token_urlsafe(16)
     result = {}
 
@@ -1223,83 +1290,123 @@ def cmd_gh(bot, args, repo=None):
     os.execve(gh, [gh] + args, env)
 
 
+def _classify(rest):
+    """Print write or read for a gh argv. Exit 0 for write, 1 for read, 4 when it can't decide."""
+    args = rest[1:] if rest[:1] == ["--"] else rest
+    args = args[1:] if args[:1] == ["gh"] else args
+    try:
+        cfg = load_config()
+        write = is_feedback_write(args, cfg.get("codex_triggers_as_bot", False))
+    except ConfigError as e:
+        print(f"prbot classify: {e}", file=sys.stderr)
+        return 4
+    except Exception as e:
+        print(f"prbot classify: cannot decide ({type(e).__name__}: {e})", file=sys.stderr)
+        return 4
+    print("write" if write else "read")
+    return 0 if write else 1
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
     cmd, rest = argv[0], argv[1:]
     if cmd == "classify":
-        args = rest[1:] if rest[:1] == ["--"] else rest
-        args = args[1:] if args[:1] == ["gh"] else args
-        return 0 if is_feedback_write(args, load_config().get("codex_triggers_as_bot", False)) else 1
-    if cmd in ("watch", "review"):
-        review_timeout()  # a bad PRBOT_REVIEW_TIMEOUT stops here with a clear message, before any work
-    if cmd == "watch":
-        limit = WATCH_LIMIT
-        if "--limit" in rest:
-            limit = int(rest[rest.index("--limit") + 1])
-        queue = None
-        if "--from-queue" in rest:
-            i = rest.index("--from-queue")
-            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
-                die("usage: prbot watch --from-queue DIR [--dry-run] [--limit N] [--baseline]")
-            queue = rest[i + 1]
-        return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest, queue=queue)
-    if cmd == "review":
-        opts = {"-R": None, "--repo": None, "--reviewer": None}
-        flags, target, i = set(), None, 0
-        while i < len(rest):
-            a = rest[i]
-            if a in opts and i + 1 < len(rest):
-                opts[a] = rest[i + 1]
-                i += 2
-                continue
-            if a in ("--dry-run", "--route-only"):
-                flags.add(a)
-            elif not a.startswith("-") and target is None:
-                target = a
-            else:
-                die(f"review: unexpected argument '{a}'")
-            i += 1
-        if not target:
-            die("usage: prbot review <pr-number|url> [-R owner/repo] [--reviewer claude|codex|both] "
-                "[--dry-run|--route-only]")
-        if opts["--reviewer"] not in (None, "claude", "codex", "both"):
-            die("--reviewer must be claude, codex or both")
-        mode = "route" if "--route-only" in flags else "dry-run" if "--dry-run" in flags else "post"
-        return cmd_review(target, opts["-R"] or opts["--repo"], opts["--reviewer"], mode)
-    if not rest:
-        die(f"{cmd}: missing bot name")
-    bot = rest[0]
-    if cmd == "register":
-        cmd_register(bot, rest[rest.index("--org") + 1] if "--org" in rest else None,
-                     rest[rest.index("--spec") + 1] if "--spec" in rest else None)
-    elif cmd == "import-key":
-        cfg = load_config()
-        if bot not in cfg:
-            if len(rest) < 4:
-                die("first import needs: prbot import-key <bot> <pem> <app_id> <owner>")
-            cfg[bot] = {"app_id": int(rest[2]), "owner": rest[3]}
-            save_config(cfg)
-        print("stored in", store_key(bot, Path(rest[1]).read_text()))
-    elif cmd == "install-url":
-        print(f"https://github.com/apps/{bot_config(bot)['slug']}/installations/new")
-    elif cmd == "whoami":
-        cfg = bot_config(bot)
-        jwt = app_jwt(cfg.get("client_id") or cfg["app_id"], read_key(bot))
-        app = api("GET", "/app", auth=jwt)
-        print(f"{app['slug']}[bot]  app_id={app['id']}  owner={app['owner']['login']}")
-        for i in api("GET", "/app/installations", auth=jwt):
-            print(f"  installed on {i['account']['login']} ({i['repository_selection']} repos)")
-    elif cmd == "gh":
-        repo, args = split_gh_args(rest[1:])
-        cmd_gh(bot, args, repo)
-    elif cmd == "git":
-        repo, args = split_gh_args(rest[1:])
-        cmd_git(bot, args, repo)
+        return _classify(rest)
+    try:
+        if cmd in ("watch", "review"):
+            review_timeout()  # a bad PRBOT_REVIEW_TIMEOUT stops here with a clear message, before any work
+        if cmd == "watch":
+            limit = WATCH_LIMIT
+            if "--limit" in rest:
+                limit = int(rest[rest.index("--limit") + 1])
+            queue = None
+            if "--from-queue" in rest:
+                i = rest.index("--from-queue")
+                if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                    die("usage: prbot watch --from-queue DIR [--dry-run] [--limit N] [--baseline]")
+                queue = rest[i + 1]
+            return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest, queue=queue)
+        if cmd == "review":
+            opts = {"-R": None, "--repo": None, "--reviewer": None}
+            flags, target, i = set(), None, 0
+            while i < len(rest):
+                a = rest[i]
+                if a in opts and i + 1 < len(rest):
+                    opts[a] = rest[i + 1]
+                    i += 2
+                    continue
+                if a in ("--dry-run", "--route-only"):
+                    flags.add(a)
+                elif not a.startswith("-") and target is None:
+                    target = a
+                else:
+                    die(f"review: unexpected argument '{a}'")
+                i += 1
+            if not target:
+                die("usage: prbot review <pr-number|url> [-R owner/repo] [--reviewer claude|codex|both] "
+                    "[--dry-run|--route-only]")
+            if opts["--reviewer"] not in (None, "claude", "codex", "both"):
+                die("--reviewer must be claude, codex or both")
+            mode = "route" if "--route-only" in flags else "dry-run" if "--dry-run" in flags else "post"
+            return cmd_review(target, opts["-R"] or opts["--repo"], opts["--reviewer"], mode)
+        if not rest:
+            die(f"{cmd}: missing bot name")
+        bot = rest[0]
+        if cmd == "register":
+            cmd_register(bot, rest[rest.index("--org") + 1] if "--org" in rest else None,
+                         rest[rest.index("--spec") + 1] if "--spec" in rest else None)
+        elif cmd == "import-key":
+            cfg = load_config()
+            if bot not in cfg:
+                if len(rest) < 4:
+                    die("first import needs: prbot import-key <bot> <pem> <app_id> <owner>")
+                cfg[bot] = {"app_id": int(rest[2]), "owner": rest[3]}
+                save_config(cfg)
+            print("stored in", store_key(bot, Path(rest[1]).read_text()))
+        elif cmd == "install-url":
+            print(f"https://github.com/apps/{bot_config(bot)['slug']}/installations/new")
+        elif cmd == "whoami":
+            cfg = bot_config(bot)
+            jwt = app_jwt(cfg.get("client_id") or cfg["app_id"], read_key(bot))
+            app = api("GET", "/app", auth=jwt)
+            print(f"{app['slug']}[bot]  app_id={app['id']}  owner={app['owner']['login']}")
+            for i in api("GET", "/app/installations", auth=jwt):
+                print(f"  installed on {i['account']['login']} ({i['repository_selection']} repos)")
+        elif cmd == "gh":
+            repo, args = split_gh_args(rest[1:])
+            cmd_gh(bot, args, repo)
+        elif cmd == "git":
+            repo, args = split_gh_args(rest[1:])
+            cmd_git(bot, args, repo)
+        else:
+            die(f"unknown command '{cmd}'")
+        return 0
+    except (ConfigError, OSError) as e:
+        problem = config_problem(e)
+        if problem is None:
+            raise
+        print(f"prbot: {problem}", file=sys.stderr)
+        return 2
+
+
+def config_problem(e):
+    """The one-line message for a bad or unreadable config, or None when e is about something else.
+
+    load_config lets read errors through so the guard hook can name them; only the config's own are turned into
+    a message here. The raw OS error text is never shown, only a fixed reason."""
+    if isinstance(e, ConfigError):
+        return str(e)
+    if not isinstance(e, OSError) or e.filename is None or Path(e.filename) != CONFIG:
+        return None
+    if isinstance(e, IsADirectoryError):
+        reason = "the path is a directory, not a file"
+    elif isinstance(e, PermissionError):
+        reason = "permission denied; check the file's mode and owner"
     else:
-        die(f"unknown command '{cmd}'")
-    return 0
+        reason = "the file could not be read"
+    return f"{CONFIG}: cannot read ({type(e).__name__}: {reason}); fix or remove it"
 
 
 if __name__ == "__main__":
