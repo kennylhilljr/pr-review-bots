@@ -259,7 +259,7 @@ MAX_NESTING = 4
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # wrapper: (short options with an operand, short options with an optional attached operand,
 #           long options with an operand, long options with an optional attached operand).
-# Every other option is taken as a flag; a word not starting with - (or anything after --) is the command.
+# Option sets cover GNU and BSD/macOS. Every other option is taken as a flag; a word not starting with - (or anything after --) is the command.
 WRAPPERS = {
     "env": ("uCSP", "", ("--unset", "--chdir", "--split-string"), ()),
     "time": ("fo", "", ("--format", "--output"), ()),
@@ -268,7 +268,7 @@ WRAPPERS = {
     "nohup": ("", "", (), ()),
     "sudo": ("CDghprRtTUu", "", ("--close-from", "--chdir", "--group", "--host", "--prompt", "--chroot", "--role",
                                  "--type", "--command-timeout", "--other-user", "--user"), ("--preserve-env",)),
-    "xargs": ("IanLPsEd", "ile", ("--arg-file", "--max-args", "--max-procs", "--max-chars", "--delimiter",
+    "xargs": ("IanLPsEdJRS", "ile", ("--arg-file", "--max-args", "--max-procs", "--max-chars", "--delimiter",
                                   "--process-slot-var"), ("--replace", "--max-lines", "--eof")),
 }
 
