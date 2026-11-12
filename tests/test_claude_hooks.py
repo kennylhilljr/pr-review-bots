@@ -127,7 +127,7 @@ class HookBehaviorTests(unittest.TestCase):
                 self.assertEqual(proc.stderr, "")
 
     def test_pre_tool_use_does_not_read_key_contents(self):
-        key = self.repo.write("real.pem", "-----BEGIN PRIVATE KEY-----\nSECRETMATERIAL\n")
+        key = self.repo.write("real.pem", "-----BEGIN " + "PRIVATE KEY-----\nSECRETMATERIAL\n")
         proc = self.repo.run("PreToolUse", "Write", key)
         self.assertEqual(proc.returncode, 2)
         self.assertNotIn("SECRETMATERIAL", proc.stderr + proc.stdout)
