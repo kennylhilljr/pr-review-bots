@@ -248,6 +248,30 @@ Without it, unittest imports `test_prbot` as a top-level module and never runs
 `tests/__init__.py`. With the repo root as the top level, `tests` is a package
 and its `__init__.py` runs before the test modules load.
 
+## Checks before a PR
+
+`scripts/check.sh` runs everything a PR must pass in one command: the unit
+tests, `py_compile` on the Python files, `bash -n` on the shell scripts, a
+writing check for em and en dashes, a secret check for private keys and
+literal GitHub tokens, and `plutil -lint` on the plists (a Python `plistlib`
+parse where `plutil` is missing).
+It runs every check even after one fails, so a single run lists all problems.
+Each check can also run alone with `--check`, which is how
+`tests/test_check.py` plants one problem at a time in a throwaway Git repo.
+
+The script makes its own folder under `/tmp` and points `TMPDIR`,
+`PRBOT_CONFIG_DIR` and `PYTHONPYCACHEPREFIX` into it, so a run never depends on
+the caller's temp folder or real config. This matters because OpenClaw can set
+`TMPDIR` under `~/.openclaw`. The folder is removed on exit and on signals.
+
+The writing and secret checks scan files Git tracks, not everything on disk, so
+a local `*.pem` or draft doesn't fail the check. The secret check reports the
+file, line and kind of finding and never prints the match.
+
+GitHub should run the same script on every PR. The worker bots can't write
+`.github/workflows/`, so [`docs/ci.md`](docs/ci.md) holds the workflow for
+Kenny to add, with the full list of checks and token thresholds.
+
 ## What stays on Kenny's account
 
 - Merges, approvals that satisfy branch protection, and anything Kenny types

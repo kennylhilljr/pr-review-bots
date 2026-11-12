@@ -283,6 +283,8 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents working on this repository. |
 | `.claude/settings.json`, `.claude/hooks/check_edit.py` | Project Claude Code hooks: block key files, run the tests after code edits, flag dashes in docs. |
 | `tests/` | Unit tests, including fixtures shaped like real PRs. |
+| `scripts/check.sh` | Every check a PR must pass: tests, syntax, writing and secrets. |
+| [`docs/ci.md`](docs/ci.md) | What `scripts/check.sh` checks, and the CI workflow Kenny adds to run it on every PR. |
 | `docs/assets/` | The README header (SVG source and WebP). |
 | [`DESIGN.md`](DESIGN.md) | Why it works this way. |
 
@@ -321,5 +323,11 @@ gh auth status
 Post it from your own terminal; the hook only applies inside Claude Code.
 
 ## Contributing
+
+Run `scripts/check.sh` before opening a PR. It runs the tests in an isolated temp folder, checks Python and shell syntax, and rejects em dashes and committed secrets; [`docs/ci.md`](docs/ci.md) lists every check and has the CI workflow that runs the same script on GitHub.
+
+```bash
+scripts/check.sh
+```
 
 Run the tests before every change and add a regression test for every bug found; `tests/test_prbot.py` has examples built from real PR data. Keep `prbot` to the standard library. Agents commit and push with `prbot git <bot> -- commit` and `-- push`, so GitHub attributes the work to `claude-pr-gh[bot]` or `codex-pr-gh[bot]` rather than to you.
