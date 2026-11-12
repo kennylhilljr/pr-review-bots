@@ -1,5 +1,9 @@
 .ruff_cache/
 __pycache__/
 *.pem
-.claude/
+/.claude/*
+!/.claude/settings.json
+!/.claude/hooks/
+/.claude/hooks/*
+!/.claude/hooks/check_edit.py
 .DS_Store
