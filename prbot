@@ -39,7 +39,9 @@ WRITE_SUBCOMMANDS = {("pr", "review"), ("pr", "comment"), ("issue", "comment")}
 CLOSE_SUBCOMMANDS = {("pr", "close"), ("issue", "close")}  # feedback only when they carry -c/--comment
 FEEDBACK_PATH = re.compile(r"/(comments|reviews|replies)(/|$|\?)|/reviews/\d+/(events|dismissals)")
 FEEDBACK_MUTATION = re.compile(r"\b(addPullRequestReview\w*|submitPullRequestReview|addComment|updateIssueComment|"
-                               r"updatePullRequestReview\w*|resolveReviewThread|unresolveReviewThread)\b")
+                               r"updatePullRequestReview\w*|resolveReviewThread|unresolveReviewThread|"
+                               r"deleteIssueComment|deletePullRequestReview\w*|dismissPullRequestReview|"
+                               r"minimizeComment|unminimizeComment)\b")
 FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
 WRITE_METHODS = ("POST", "PATCH", "PUT", "DELETE")
 GH_GLOBAL_VALUE = ("-R", "--repo", "--hostname")
@@ -182,7 +184,7 @@ def _api_feedback_write(rest):
         return False  # gh api sends GET without fields or with an explicit GET
     if endpoint is None:
         return False
-    if endpoint.rstrip("/").endswith("graphql"):
+    if re.split(r"[?#]", endpoint)[0].rstrip("/").endswith("graphql"):  # a query string doesn't change the route
         return _graphql_feedback_write(rest, fields, inputs)
     return FEEDBACK_PATH.search(endpoint) is not None
 
@@ -273,22 +275,101 @@ WRAPPERS = {
 }
 
 
+PUNCTUATION = ";&|()<>\n"
+# one shell operator inside a run of punctuation; process substitution <( and >( first, so it separates
+OPERATOR = re.compile(r"[<>]\(|&>>?|<<<|<<|<>|>>|>&|>\||<&|&&|\|\||;;|[<>;&|()\n]")
+
+
+def _drop_fd_numbers(command):
+    """The command without file descriptor numbers in front of redirections (2>x, 2>&1), outside quotes, so
+    they are never read as words."""
+    out, quote, i = [], None, 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                out.append(command[i:i + 2])
+                i += 2
+                continue
+        elif ch == "\\":
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        elif ch in "'\"":
+            quote = ch
+        elif ch.isdigit() and (i == 0 or command[i - 1] in " \t\r" + PUNCTUATION):
+            j = i
+            while j < len(command) and command[j].isdigit():
+                j += 1
+            if j < len(command) and command[j] in "<>":
+                i = j
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _tokens(command):
-    """Shell words, with ; & | ( ) and unquoted newlines as separate tokens. A backslash-newline joins lines."""
-    command = command.replace("\\\n", "")
-    lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+    """Shell words, with ; & | ( ) and unquoted newlines as separate tokens and each redirection operator as one
+    token. A backslash-newline joins lines."""
+    command = _drop_fd_numbers(command.replace("\\\n", ""))
+    lex = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION)
     lex.whitespace = " \t\r"  # a newline ends a command, like ;
     lex.whitespace_split = True
     lex.commenters = ""
     try:
-        return list(lex)
+        words = list(lex)
     except ValueError:  # unbalanced quotes: fall back to a rough split rather than letting the call through
-        return re.findall(r"\n|[^\s]+", command)
+        words = re.findall(r"[;&|()<>\n]+|[^\s;&|()<>]+", command)
+    out = []
+    for w in words:  # shlex joins neighbouring punctuation (;>, &&>), so split each run into operators
+        out.extend(OPERATOR.findall(w) if w and set(w) <= set(PUNCTUATION) else [w])
+    return out
 
 
-def _backticks(command):
-    """Command strings inside `...` substitutions, outside single quotes and not escaped. An unclosed backtick
-    yields the rest of the string."""
+def _is_operator(tok):
+    return bool(tok) and set(tok) <= set(PUNCTUATION)
+
+
+def _is_redirection(tok):
+    return _is_operator(tok) and bool(set(tok) & set("<>")) and "(" not in tok
+
+
+def _closing_paren(command, i):
+    """Index of the ) that closes a $( whose body starts at i, skipping quoted text, or len(command)."""
+    depth, quote = 1, None
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                i += 1
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return i
+
+
+def _unescape_backticks(body):
+    """A backtick body as the shell runs it: inside `...`, a backslash quotes only $, ` and itself."""
+    return re.sub(r"\\([$`\\])", r"\1", body)
+
+
+def _substitutions(command):
+    """Command strings inside `...` and inside $(...) within double quotes, outside single quotes and not escaped.
+    Unquoted $(...) needs no special case, since ( and ) already split commands. An unclosed substitution yields
+    the rest of the string."""
     out, quote, start, i = [], None, None, 0
     while i < len(command):
         ch = command[i]
@@ -302,15 +383,20 @@ def _backticks(command):
             if start is None:
                 start = i + 1
             else:
-                out.append(command[start:i])
+                out.append(_unescape_backticks(command[start:i]))
                 start = None
+        elif start is None and quote == '"' and command.startswith("$(", i):
+            end = _closing_paren(command, i + 2)
+            out.append(command[i + 2:end])
+            i = end + 1
+            continue
         elif start is None and ch == "'" and quote is None:
             quote = "'"
         elif start is None and ch == '"':
             quote = None if quote == '"' else '"'
         i += 1
     if start is not None:
-        out.append(command[start:])
+        out.append(_unescape_backticks(command[start:]))
     return out
 
 
@@ -415,15 +501,20 @@ def _commands(command, depth=0):
     """Yield (program, argv) for each simple command in a shell command string, skipping shell keywords,
     VAR=... and wrappers, and looking inside backticks and bash|sh|zsh -c strings up to MAX_NESTING deep."""
     if depth < MAX_NESTING:
-        for inner in _backticks(command):
+        for inner in _substitutions(command):
             yield from _commands(inner, depth + 1)
-    seg = []
-    for tok in _tokens(command) + [";"]:
-        if tok and set(tok) <= set(";&|()\n"):
+    seg, toks, k = [], _tokens(command) + [";"], 0
+    while k < len(toks):
+        tok = toks[k]
+        if _is_redirection(tok):  # the shell removes a redirection and its target before running the command
+            k += 1 if _is_operator(toks[k + 1]) else 2
+            continue
+        if _is_operator(tok):
             yield from _simple_command(seg, depth)
             seg = []
         else:
             seg.append(tok)
+        k += 1
 
 
 def gh_calls(command):
@@ -441,10 +532,28 @@ def git_writes(command):
     for prog, args in _commands(command):
         if prog != "git":
             continue
-        _, sub = git_subcommand(args)
+        at, sub = git_subcommand(args)
         if sub in GUARDED_GIT:
-            cdir = args[args.index("-C") + 1] if "-C" in args[:args.index(sub)] else None
-            yield args, cdir
+            yield args, _git_dir(args[:at])
+
+
+def _git_dir(opts):
+    """The directory git runs in from its own options: -C <dir>, then --git-dir <dir> under it; None for cwd."""
+    cdir = gitdir = None
+    i = 0
+    while i < len(opts):
+        o = opts[i]
+        if o in ("-C", "--git-dir") and i + 1 < len(opts):
+            if o == "-C":
+                cdir = os.path.join(cdir, opts[i + 1]) if cdir else opts[i + 1]
+            else:
+                gitdir = opts[i + 1]
+        elif o.startswith("--git-dir="):
+            gitdir = o.partition("=")[2]
+        i += 2 if o in GIT_VALUE_OPTIONS else 1
+    if gitdir:
+        return os.path.join(cdir, gitdir) if cdir else gitdir
+    return cdir
 
 
 def unrouted_writes(command, codex_triggers_as_bot=False):
@@ -1513,11 +1622,16 @@ def git_env(token=None, identity=None):
 REMOTE_SUBCOMMANDS = ("push", "fetch", "pull")
 
 
+# git's own options that take their value as the next word
+GIT_VALUE_OPTIONS = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env",
+                     "--attr-source")
+
+
 def git_subcommand(args):
-    """(index, name) of git's subcommand, skipping git's own options such as -C <dir> and -c k=v."""
+    """(index, name) of git's subcommand, skipping git's own options such as -C <dir>, -c k=v and --git-dir <dir>."""
     i = 0
     while i < len(args) and args[i].startswith("-"):
-        i += 2 if args[i] in ("-C", "-c") else 1
+        i += 2 if args[i] in GIT_VALUE_OPTIONS else 1
     return (i, args[i]) if i < len(args) else (len(args), None)
 
 

@@ -101,15 +101,19 @@ counts these as feedback:
 It finds the subcommand after `-R`, `--repo` and `--hostname`, whether they
 come before the command group or between the group and the subcommand. In a
 shell command it splits on `;`, `&`, `|`, parentheses and unquoted newlines
-(so a heredoc line that looks like a feedback write is denied too); skips `then`, `do`,
+(so a heredoc line that looks like a feedback write is denied too); drops
+redirections such as `>/dev/null` and `2>&1` with their targets; skips `then`, `do`,
 `else`, `elif`, `if`, `while`, `until`, `{` and `!` at the start of a command,
 `VAR=value` assignments, and the wrappers `env`, `time`, `command`, `exec`,
 `nohup`, `sudo` and `xargs` together with their options and operands
 (`env -S` strings are split and read as more `env` arguments); and
-looks inside backticks and `bash -c`, `sh -c` and `zsh -c` strings, up to four
+looks inside backticks (unescaping nested ones), `$(...)` within double quotes
+and `bash -c`, `sh -c` and `zsh -c` strings, up to four
 levels deep. This is not a full shell parser. It covers these forms without a
 dependency, and anything past four levels is not inspected. The same parsing
-finds `git commit` and `git push` for the push guard.
+finds `git commit` and `git push` for the push guard, after git's own options
+(`-C`, `-c`, `--git-dir`, `--work-tree` and the like), and checks the repository
+that `-C` and `--git-dir` point at.
 
 Not feedback, so they stay on Kenny's login: reads such as `gh pr view`,
 `gh pr diff` and `gh api` GET calls; `gh pr create`, `gh issue create`,

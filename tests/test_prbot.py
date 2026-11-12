@@ -115,6 +115,19 @@ class Classify(unittest.TestCase):
                 self.assertIs(prbot.is_feedback_write(args, codex_triggers_as_bot=False), False)
                 self.assertIs(prbot.is_feedback_write(args, codex_triggers_as_bot=True), True)
 
+    def test_graphql_route_and_mutation_regressions(self):
+        for name in ("deleteIssueComment", "deletePullRequestReview", "deletePullRequestReviewComment",
+                     "dismissPullRequestReview", "minimizeComment", "unminimizeComment"):
+            with self.subTest(mutation=name):
+                self.assertTrue(prbot.is_feedback_write(
+                    ["api", "graphql", "-f", "query=mutation { %s(input: {id: \"x\"}) { clientMutationId } }" % name]))
+        add = "query=mutation { addComment(input: {subjectId: \"x\", body: \"y\"}) { clientMutationId } }"
+        for endpoint in ("graphql?x=1", "graphql/?x=1", "graphql#x", "https://api.github.com/graphql?x=1"):
+            with self.subTest(endpoint=endpoint):
+                self.assertTrue(prbot.is_feedback_write(["api", endpoint, "-f", add]))
+        self.assertFalse(prbot.is_feedback_write(["api", "graphql?x=1", "-f", "query=query { viewer { login } }"]))
+        self.assertFalse(prbot.is_feedback_write(["api", "graphql?x=1", "-XGET", "-f", add]))
+
     def test_graphql_payload_file_regressions(self):
         mutation = 'mutation { addComment(input: {subjectId: "x", body: "y"}) { clientMutationId } }'
         viewer = "query { viewer { login } }"
@@ -189,6 +202,35 @@ class ShellCommands(unittest.TestCase):
         self.assertEqual(self.count('echo "gh pr comment 1 -b x"'), 0)
         self.assertEqual(self.count("gh pr view 15 --comments"), 0)
         self.assertEqual(self.count('gh pr comment 1 -b "unbalanced'), 1)
+
+    def test_redirection_and_substitution_regressions(self):
+        once = [
+            "gh >/dev/null pr comment 13 -b x",
+            "gh > /dev/null pr comment 13 -b x",
+            "gh 2>&1 pr comment 13 -b x",
+            "gh 2>/dev/null pr comment 13 -b x",
+            "gh &>/dev/null pr comment 13 -b x",
+            "gh <in pr comment 13 -b x",
+            "gh pr comment 13 -b x >log 2>&1",
+            "gh pr comment 13 -b x >",
+            "nohup >/tmp/log gh pr comment 13 -b x",
+            "env >/dev/null gh pr comment 13 -b x",
+            "echo hi;>x gh pr comment 13 -b x",
+            "diff <(gh pr comment 13 -b x) y",
+            'echo "$(gh pr comment 13 -b x)"',
+            'x="$(gh pr comment 13 -b x)"',
+            'echo "$(echo $(gh pr comment 13 -b x))"',
+            "echo `echo \\`gh pr comment 13 -b x\\``",
+            "x=`echo \\`echo \\\\\\`gh pr comment 13 -b x\\\\\\`\\``",
+        ]
+        for cmd in once:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(prbot.unrouted_writes(cmd), [["pr", "comment", "13", "-b", "x"]])
+        self.assertEqual(prbot.unrouted_writes("gh pr comment 13 -b 'a>b'"), [["pr", "comment", "13", "-b", "a>b"]])
+        for cmd in ("gh pr view 13 > out.txt", "gh pr view 13 2>&1 | cat", "echo '$(gh pr comment 13 -b x)'",
+                    'echo "\\$(gh pr comment 13 -b x)"', "echo '`gh pr comment 13 -b x`'", "cat <in >out"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.count(cmd), 0)
 
     def test_guarded_shell_regressions(self):
         positives = [
@@ -361,6 +403,24 @@ class GitPush(unittest.TestCase):
         self.assertEqual(found, [(["commit", "-m", "x"], None), (["-C", "repo", "push", "origin", "main"], "repo")])
         self.assertEqual(list(prbot.git_writes("prbot git claude -- commit -m x && prbot git claude -- push")), [])
         self.assertEqual(list(prbot.git_writes('echo "git push"')), [])
+
+    def test_git_option_and_redirection_regressions(self):
+        cases = [
+            ("git >/dev/null push origin HEAD", [(["push", "origin", "HEAD"], None)]),
+            ("git 2>&1 commit -m x", [(["commit", "-m", "x"], None)]),
+            ("git --git-dir .git push origin HEAD", [(["--git-dir", ".git", "push", "origin", "HEAD"], ".git")]),
+            ("git --git-dir=other/.git push", [(["--git-dir=other/.git", "push"], "other/.git")]),
+            ("git -C repo --git-dir .git push", [(["-C", "repo", "--git-dir", ".git", "push"], "repo/.git")]),
+            ("git --work-tree . commit -m x", [(["--work-tree", ".", "commit", "-m", "x"], None)]),
+            ("git --namespace n push", [(["--namespace", "n", "push"], None)]),
+            ("git --config-env a.b=C push", [(["--config-env", "a.b=C", "push"], None)]),
+            ("git log > push", []),
+            ("git --git-dir push status", []),
+        ]
+        for cmd, want in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(list(prbot.git_writes(cmd)), want)
+        self.assertEqual(prbot.git_subcommand(["--work-tree", "push", "status"]), (2, "status"))
 
     def test_nested_git_write_regressions(self):
         commit, push = ["commit", "-m", "x"], ["-C", "repo", "push", "origin", "main"]
