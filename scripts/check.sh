@@ -78,10 +78,10 @@ import subprocess
 import sys
 
 mode = sys.argv[1]
-DASHES = {"–": "en dash", "—": "em dash"}
+DASHES = {"\u2013": "en dash", "\u2014": "em dash"}
 SECRETS = [
     ("private key block", re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
-    ("GitHub token", re.compile(rb"(?:ghp|gho)_[A-Za-z0-9]{36,}")),
+    ("GitHub token", re.compile(rb"(?:ghp|gho)_[A-Za-z0-9_]{36,}")),
     # Installation tokens: the legacy 36-character form and the stateless
     # ghs_APPID_JWT form, whose body also holds underscores, dots and dashes.
     ("GitHub App installation token", re.compile(rb"ghs_[A-Za-z0-9_.-]{36,}")),
@@ -102,14 +102,14 @@ for record in listing.split(b"\0"):
     if not record:
         continue
     meta, _, raw_path = record.partition(b"\t")
-    mode_bits = meta.split(b" ", 1)[0]
+    mode_bits, blob = meta.split(b" ")[:2]
     if mode_bits == b"160000":
         continue  # submodule: its files belong to another repository
-    entries.append((mode_bits, os.fsdecode(raw_path)))
+    entries.append((mode_bits, blob, os.fsdecode(raw_path)))
 
 findings = []
 errors = []
-for mode_bits, path in entries:
+for mode_bits, blob, path in entries:
     try:
         if mode_bits == b"120000":
             data = os.fsencode(os.readlink(path))
@@ -117,7 +117,12 @@ for mode_bits, path in entries:
             with open(path, "rb") as handle:
                 data = handle.read()
     except FileNotFoundError:
-        continue  # deleted in the working tree, so there is nothing to scan
+        # Deleted in the working tree but still staged: scan the staged copy.
+        shown = subprocess.run(["git", "cat-file", "blob", blob.decode()], capture_output=True)
+        if shown.returncode != 0:
+            errors.append("%s: missing and cannot read the staged copy" % path)
+            continue
+        data = shown.stdout
     except OSError as exc:
         errors.append("%s: cannot read (%s)" % (path, exc.strerror or exc))
         continue

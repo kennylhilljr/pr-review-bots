@@ -176,6 +176,7 @@ class CheckScriptTest(unittest.TestCase):
             ("ghs_" + "12345_" + token("eyJ", 30) + "." + token("eyJ", 60) + "." + token("x-_", 43),
              "GitHub App installation token"),
             (token("gho_", 40), "GitHub token"),
+            (token("ghp_", 36, "a_B3"), "GitHub token"),
             (token("github_pat_", 82, "aB3_"), "GitHub fine-grained token"),
         ]
         for value, kind in cases:
@@ -204,6 +205,11 @@ class CheckScriptTest(unittest.TestCase):
     def test_secret_in_binary_file_fails(self):
         self.write("blob.bin", b"\x00\xff" + token("ghp_", 36).encode() + b"\x00")
         self.assert_fails("secrets", "blob.bin:1: GitHub token")
+
+    def test_staged_file_deleted_from_working_tree_is_still_scanned(self):
+        path = self.write("config.txt", token("ghp_", 40) + "\n")
+        path.unlink()
+        self.assert_fails("secrets", "config.txt:1: GitHub token")
 
     def test_git_listing_error_fails_scans(self):
         shutil.rmtree(self.repo / ".git")
