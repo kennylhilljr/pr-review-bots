@@ -98,18 +98,22 @@ gh, prbot or git token, and any command it cannot prove makes no such call.
 Bash can spell gh without those letters in a row (`g\h`, `'g'h`, `${x}h`, a glob,
 base64 piped to sh), so a command passes only when it has no `$`, backtick or
 parentheses and every simple command in it starts with a program from a short
-list that cannot start another program (ls, cat, grep, head, wc and similar).
-`ls` still works while the guard is broken; `sh`, `env`, `make` and scripts do
+list that cannot start another program or write a file (ls, cat, grep, head,
+wc and similar). It also has no output redirection except a descriptor copy or
+close (`2>&1`, `>&2`, `2>&-`) or a write to `/dev/null`, because `echo > file`
+could truncate the hook itself and leave the next write unguarded. `ls` still
+works while the guard is broken; `sh`, `env`, `make`, scripts and `> file` do
 not. The guard's denial reason names the error type and its message, never the
 config contents.
 
 Every other prbot command (review, whoami, gh, git and the rest) exits 2 with
 one line on stderr when the config is bad, never a traceback. `load_config`
 raises ConfigError for anything the guard can't trust: JSON the parser rejects
-(huge integers and deep nesting included), invalid UTF-8, a non-object, a
-dangling symlink, a `claude` or `codex` entry that is not an object or whose
+(deep nesting, and integers over 1000 digits on every Python version), invalid
+UTF-8, a non-object, a dangling symlink for the file or for any directory above
+it (a config directory that links to a missing folder may hide a real config), a `claude` or `codex` entry that is not an object or whose
 `owner` is missing or not a non-empty string, and a `codex_triggers_as_bot`
-that is not a boolean. Only a missing file means `{}`. It lets an OSError from
+that is not a boolean. Only a missing file in a real directory means `{}`. It lets an OSError from
 reading the file (a directory, no permission, a symlink loop) through so the
 guard can name it. `main` turns an OSError into the one line only when its
 filename is the config path; any other OSError still raises. That line names

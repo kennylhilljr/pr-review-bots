@@ -1612,8 +1612,7 @@ class Hook(unittest.TestCase):
             "dangling symlink": lambda: config.symlink_to(Path(self.tmp.name, "missing.json")),
             "symlink loop": lambda: config.symlink_to(config),
         }
-        if hasattr(sys, "get_int_max_str_digits"):  # 3.11+ refuses huge integers; 3.9 parses them as valid JSON
-            cases["huge integer"] = lambda: config.write_text('{"x": ' + "9" * 5000 + "}")
+        cases["huge integer"] = lambda: config.write_text('{"x": ' + "9" * 5000 + "}")  # refused on every Python
         for name, make in cases.items():
             with self.subTest(name):
                 make()
@@ -1640,6 +1639,48 @@ class Hook(unittest.TestCase):
                 r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertEqual(r.stdout, "")
+
+    def test_broken_guard_cannot_overwrite_hook(self):
+        """(j6) While the guard is broken, redirections and output-file options that could overwrite the hook
+        (or any file) are refused; descriptor copies and writes to /dev/null still pass."""
+        setup = "module.load_prbot = lambda: (_ for _ in ()).throw(ImportError('simulated'))\n"
+        hook = str(self.HOOK)
+        for command in (f"echo > {hook}", f"echo >{hook}", f": > {hook}", f"cat /dev/null >> {hook}",
+                        f"ls >| {hook}", f"ls &> {hook}", f"ls 2> {hook}", f"echo x 1>{hook}", f"ls >& {hook}",
+                        f"cat <> {hook}", f"ls 2>&1 > {hook}", f"ls > /dev/null.py", f"ls 2>&1x",
+                        f"uniq /dev/null {hook}", f"tree -o {hook}", f"echo hi | tee {hook}"):
+            with self.subTest(command=command):
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                reason = self.reason(json.loads(r.stdout))
+                self.assertTrue(reason.startswith("prbot guard failed (ImportError: simulated)"), reason)
+        for command in ("ls 2>&1 | head", "ls 2>/dev/null", "ls >&2", "ls > /dev/null 2>&1", "ls &>/dev/null",
+                        "ls 2>&-"):
+            with self.subTest(command=command):
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_broken_config_refuses_overwriting_the_hook(self):
+        """(j7) The same with a real broken config instead of a stub: `echo > hook` is denied."""
+        self.break_config()
+        reason = self.reason(self.run_hook(f"echo > {self.HOOK}"))
+        self.assertIn("prbot guard failed (ConfigError", reason)
+
+    def test_dangling_config_dir_fails_closed(self):
+        """(j8) PRBOT_CONFIG_DIR (or a parent) is a symlink to a missing directory: the guard has no owners to
+        trust, so it fails closed instead of reading the config as empty and allowing a personal push."""
+        repo = self.make_repo("kennylhilljr")
+        for depth in ("dir", "parent"):
+            with self.subTest(depth):
+                link = Path(tempfile.mkdtemp(dir=self.tmp.name)) / "prbot"
+                link.symlink_to(Path(self.tmp.name, "gone", "prbot"))
+                cfg_dir = link if depth == "dir" else link / "nested"
+                self.env["PRBOT_CONFIG_DIR"] = str(cfg_dir)
+                for command in ("git push origin main", 'git commit -m "x"'):
+                    reason = self.reason(self.run_hook_in(command, repo))
+                    self.assertIn("prbot guard failed (ConfigError", reason)
+                    self.assertIn("is a symlink to something that does not exist", reason)
 
     def test_load_config_oserror_with_unrouted_writes_runtimeerror_still_denies(self):
         """(k) When load_config and unrouted_writes both raise, the hook still denies and names only the first error."""
@@ -1812,6 +1853,34 @@ class CodexShim(unittest.TestCase):
             link = Path(tmp) / "gh"
             link.symlink_to(shim)
             for target in (shim, link):
+                with self.subTest(target=str(target)):
+                    env = {k: v for k, v in os.environ.items() if k != "PRBOT_ACTIVE"}
+                    env["PRBOT_CONFIG_DIR"] = tmp
+                    env["PRBOT_REAL_GH"] = str(target)
+                    env["PATH"] = f"{os.path.dirname(sys.executable)}:/usr/bin:/bin"
+                    r = subprocess.run([str(shim), "pr", "comment", "1", "-R", "o/r", "-b", "x"],
+                                       capture_output=True, text=True, env=env, timeout=30)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("PRBOT_REAL_GH points at the Codex gh shim", r.stderr)
+
+    def test_real_gh_override_with_other_case_or_hardlink_is_refused(self):
+        """(e2) The shim is recognised by file identity: a differently cased path (same file on a case-insensitive
+        filesystem such as macOS) or a hard link to the shim is refused too."""
+        shim = ROOT / "integrations/codex/bin/gh"
+        targets = []
+        swapped = Path(str(shim).swapcase())
+        if swapped.exists() and os.path.samefile(swapped, shim):
+            targets.append(swapped)
+        with tempfile.TemporaryDirectory() as tmp:
+            hard = Path(tmp) / "gh"
+            try:
+                os.link(shim, hard)
+                targets.append(hard)
+            except OSError:
+                pass
+            if not targets:
+                self.skipTest("case-sensitive filesystem and no hard links")
+            for target in targets:
                 with self.subTest(target=str(target)):
                     env = {k: v for k, v in os.environ.items() if k != "PRBOT_ACTIVE"}
                     env["PRBOT_CONFIG_DIR"] = tmp
@@ -2067,8 +2136,8 @@ class ClassifyCli(unittest.TestCase):
             "string flag": (json.dumps({"codex_triggers_as_bot": "false"}), "codex_triggers_as_bot is not true or false"),
             "dangling symlink": (None, "a symlink to a file that does not exist"),
         }
-        if hasattr(sys, "get_int_max_str_digits"):  # 3.11+ refuses huge integers; 3.9 parses them as valid JSON
-            cases["huge integer"] = ('{"x": ' + "9" * 5000 + "}", "not valid JSON")
+        cases["huge integer"] = ('{"x": ' + "9" * 5000 + "}", "not valid JSON")  # refused on every Python
+        cases["huge integer under the 3.11 limit"] = ('{"x": ' + "9" * 2000 + "}", "not valid JSON")
         for name, (text, why) in cases.items():
             with self.subTest(name):
                 if text is None:
@@ -2082,6 +2151,21 @@ class ClassifyCli(unittest.TestCase):
                 self.assertEqual(r.returncode, 4, r.stderr)
                 self.assertNotIn("Traceback", r.stderr)
                 self.config.unlink()
+
+    def test_dangling_config_dir_exits_2(self):
+        """(m2) The config directory is a symlink to a missing directory: whoami exits 2, classify exits 4."""
+        link = self.dir / "linked"
+        link.symlink_to(self.dir / "missing")
+        env = {"PRBOT_CONFIG_DIR": str(link)}
+        env_run = dict(os.environ, **env)
+        r = subprocess.run([sys.executable, "-B", str(ROOT / "prbot"), "whoami", "claude"], env=env_run,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("is a symlink to something that does not exist", r.stderr)
+        r = subprocess.run([sys.executable, "-B", str(ROOT / "prbot"), "classify", "--", "pr", "comment", "1"],
+                           env=env_run, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
     def test_symlink_loop_config_exits_2(self):
         """(n) config.json is a symlink to itself: whoami exits 2 with the fixed read-failure line."""

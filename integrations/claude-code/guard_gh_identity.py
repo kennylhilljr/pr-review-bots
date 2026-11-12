@@ -17,17 +17,21 @@ TOKEN = re.compile(r"(?<![A-Za-z0-9_])(?:[^\s'\"]*/)?(gh|prbot|git)(?![A-Za-z0-9
 GIT_WRITE_FALLBACK = re.compile(
     r"(?<![A-Za-z0-9_])(?:[^\s'\"]*/)?git\s+(?:-\S+\s+|[A-Za-z0-9=./][A-Za-z0-9=./-]*\s+)*(commit|push)\b")
 # While the guard is broken, a command passes only if every simple command in it starts with one of these
-# programs, none of which can start another program (rg --pre, sort --compress-program, file -z and diff -l
-# can, and printf -v can set PATH, so they are out). Bash can spell gh without the letters in a row (g\h,
+# programs, none of which can start another program or write a file (rg --pre, sort --compress-program,
+# file -z and diff -l can start one, printf -v can set PATH, and uniq IN OUT and tree -o write a file, so they
+# are out). Bash can spell gh without the letters in a row (g\h,
 # 'g'h, ${x}h, a glob, base64 piped to sh), so a token check alone cannot prove a command unrelated.
 SAFE_WHEN_BROKEN = frozenset("""
-    ls pwd cd cat head tail wc echo grep which stat cmp uniq cut tr
-    true false date whoami id uname basename dirname realpath du df tree
+    ls pwd cd cat head tail wc echo grep which stat cmp cut tr
+    true false date whoami id uname basename dirname realpath du df
 """.split())
 # Command and process substitution, subshells, $'..' and ${..} can run or build any program, even inside an
 # argument, and {NAME}>file assigns a file descriptor number to a variable such as PATH, so these characters
 # are never allowed while the guard is broken.
 RUNS_CODE = re.compile(r"[$`(){}]")
+# Output redirections can overwrite any file, the guard hook itself included, so while the guard is broken a
+# command may hold a > only as a file descriptor copy or close (2>&1, >&2, 2>&-) or a write to /dev/null.
+HARMLESS_REDIRECT = re.compile(r"(?<![^\s;|&])[0-9]*>(?:&(?:[0-9]+|-)|>?[ \t]*/dev/null)(?=[\s;|&]|$)")
 SEPARATOR = re.compile(r"\|\||&&|[;|\n]|(?<![<>])&(?!>)")
 
 
@@ -96,8 +100,9 @@ def decide(payload):
 
 
 def provably_unrelated(command):
-    """True only when every simple command starts with a SAFE_WHEN_BROKEN program and nothing can run code."""
-    if RUNS_CODE.search(command):
+    """True only when every simple command starts with a SAFE_WHEN_BROKEN program, nothing can run code and no
+    redirection writes a file."""
+    if RUNS_CODE.search(command) or ">" in HARMLESS_REDIRECT.sub(" ", command):
         return False
     for segment in SEPARATOR.split(command):
         try:

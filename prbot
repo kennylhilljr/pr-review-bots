@@ -142,11 +142,15 @@ def load_config():
     except FileNotFoundError:
         if os.path.lexists(CONFIG):
             raise ConfigError(f"{CONFIG}: a symlink to a file that does not exist; fix or remove it") from None
+        dangling = _dangling_ancestor(CONFIG)
+        if dangling:  # the config directory is a broken symlink: there may be a config we can't see, not none
+            raise ConfigError(f"{CONFIG}: {dangling} is a symlink to something that does not exist; "
+                              "fix or remove it") from None
         return {}
     except UnicodeDecodeError:
         raise ConfigError(f"{CONFIG}: not valid UTF-8 text; fix or remove it") from None
     try:
-        cfg = json.loads(text)
+        cfg = json.loads(text, parse_int=_bounded_int)
     except (ValueError, RecursionError):  # JSONDecodeError, huge integers, very deep nesting
         raise ConfigError(f"{CONFIG}: not valid JSON; fix or remove it") from None
     if not isinstance(cfg, dict):
@@ -160,6 +164,24 @@ def load_config():
     if not isinstance(cfg.get("codex_triggers_as_bot", False), bool):
         raise ConfigError(f"{CONFIG}: codex_triggers_as_bot is not true or false; fix or remove it")
     return cfg
+
+
+MAX_INT_DIGITS = 1000
+
+
+def _bounded_int(digits):
+    """json parse_int that refuses huge integers on every Python version (3.9 has no digit limit of its own)."""
+    if len(digits) > MAX_INT_DIGITS:
+        raise ValueError("integer too long")
+    return int(digits)
+
+
+def _dangling_ancestor(path):
+    """The first of path's parent directories that is a symlink whose target does not exist, else None."""
+    for p in Path(os.path.abspath(path)).parents:
+        if os.path.islink(p) and not os.path.exists(p):
+            return p
+    return None
 
 
 def save_config(cfg):
@@ -451,8 +473,9 @@ def _real_gh():
     back through prbot, so that would loop forever."""
     override = os.environ.get("PRBOT_REAL_GH")
     if override:
-        shim = os.path.realpath(ROOT / "integrations" / "codex" / "bin")
-        if os.path.dirname(os.path.realpath(override)) == shim:
+        # Compare by file identity, not path text: macOS paths are case-insensitive, so /users/... and /Users/...
+        # name the same shim.
+        if _same_file(os.path.dirname(os.path.realpath(override)), SHIM_DIR) or _same_file(override, SHIM_DIR / "gh"):
             die(f"PRBOT_REAL_GH points at the Codex gh shim ({override}); set it to the real gh or unset it")
         return override
     gh = shutil.which("gh", path=_path_without_shims())
@@ -1234,9 +1257,19 @@ def cmd_register(bot, org=None, spec_path=None):
     print(f"Upload the logo: https://github.com/settings/apps/{result['slug']}  ({spec['logo_path']})")
 
 
+SHIM_DIR = ROOT / "integrations" / "codex" / "bin"
+
+
+def _same_file(a, b):
+    """True when a and b name the same file or directory (same device and inode); False if either is missing."""
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
 def _path_without_shims():
-    shim = os.path.realpath(ROOT / "integrations" / "codex" / "bin")
-    return os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if os.path.realpath(p) != shim)
+    return os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if not _same_file(p or ".", SHIM_DIR))
 
 
 def split_gh_args(args):
