@@ -51,7 +51,7 @@ agent (Claude Code / Codex CLI)
    |  gh pr review 15 --comment -b "..."
    v
 guard  (Claude Code PreToolUse hook, or the gh shim for Codex)
-   |  write to a PR?  yes -> run: prbot gh <bot> -- pr review ...
+   |  PR or issue feedback?  yes -> run: prbot gh <bot> -- pr review ...
    v
 prbot
    1. read App id and private key (macOS Keychain)
@@ -72,16 +72,47 @@ Instructions in `CLAUDE.md` or `AGENTS.md` are easy for an agent to skip, so
 each agent also gets a mechanical check.
 
 - Claude Code: a PreToolUse hook on Bash (`integrations/claude-code/guard_gh_identity.py`).
-  It denies any `gh` command that writes to a PR or issue unless it already
-  goes through `prbot gh`, and the denial message gives Claude the exact
-  command to run instead.
+  It denies `gh` commands that post PR or issue feedback (reviews and
+  comments) unless they already go through `prbot gh`, and the denial message
+  gives Claude the exact command to run instead. It also denies a plain
+  `git commit` or `git push` in repositories the bots' owner owns.
 - Codex CLI: a `gh` shim placed first on `PATH` when Codex starts
   (`integrations/codex/bin/gh`, launched by `integrations/codex/codex-as-bot`).
-  Write commands go through `prbot gh codex`; reads go straight to the real
-  `gh`.
+  Feedback writes go through `prbot gh codex`; every other call goes straight
+  to the real `gh`.
 
-Both use the same classifier in `prbot`, so the rules cannot drift apart. Reads
-such as `gh pr view`, `gh pr diff` and `gh api` GET calls stay on Kenny's login.
+Both use the same classifier in `prbot`, so the rules cannot drift apart. It
+counts these as feedback:
+
+- `gh pr review`, `gh pr comment` and `gh issue comment`.
+- `gh pr close` and `gh issue close` with `-c`/`--comment`, which post the
+  comment before closing.
+- `gh api` writes to review, comment and reply endpoints: `POST`, `PATCH`,
+  `PUT` or `DELETE`, or fields with no method, in any of gh's flag forms
+  (`-f body=x`, `-fbody=x`, `--field=body=x`, `-XPOST`).
+- `gh api graphql` with a review or comment mutation, inline or in a payload
+  file. The classifier reads the files named by `query=@file` (in any
+  `-f`, `-F`, `--field` or `--raw-field` form) or `--input file`, relative to
+  the current directory, and checks JSON bodies string by string. It opens
+  them without blocking and never reads stdin. A payload it can't read
+  (missing, not a regular file, stdin, too large or not UTF-8) counts as a
+  write, because its contents are unknown.
+
+It finds the subcommand after `-R`, `--repo` and `--hostname`, whether they
+come before the command group or between the group and the subcommand. In a
+shell command it splits on `;`, `&`, `|` and parentheses; skips `then`, `do`,
+`else`, `elif`, `if`, `while`, `until`, `{` and `!` at the start of a command,
+`VAR=value` assignments, and the wrappers `env`, `time`, `command`, `exec`,
+`nohup`, `sudo` and `xargs` together with their options and operands; and
+looks inside backticks and `bash -c`, `sh -c` and `zsh -c` strings, up to four
+levels deep. This is not a full shell parser. It covers these forms without a
+dependency, and anything past four levels is not inspected. The same parsing
+finds `git commit` and `git push` for the push guard.
+
+Not feedback, so they stay on Kenny's login: reads such as `gh pr view`,
+`gh pr diff` and `gh api` GET calls; `gh pr create`, `gh issue create`,
+`gh pr merge` and `gh pr edit`; and `@codex` trigger comments, including a
+close comment that starts with `@codex` (see "What stays on Kenny's account").
 
 Agents editing this repository also get project hooks from
 `.claude/settings.json`, which runs `.claude/hooks/check_edit.py` on
