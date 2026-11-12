@@ -83,7 +83,7 @@ mode = sys.argv[1]
 DASHES = {"\u2013": "en dash", "\u2014": "em dash"}
 SECRETS = [
     ("private key block", re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
-    ("GitHub token", re.compile(rb"(?:ghp|gho)_[A-Za-z0-9_]{36,}")),
+    ("GitHub token", re.compile(rb"(?:ghp|gho|ghu|ghr)_[A-Za-z0-9_]{36,}")),
     # Installation tokens: the legacy 36-character form, and the stateless
     # ghs_APPID_JWT form, whose JWT has three dot-separated base64url parts.
     # The legacy pattern skips anything shaped like a stateless token, so the

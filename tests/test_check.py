@@ -180,6 +180,8 @@ class CheckScriptTest(unittest.TestCase):
             (token("gho_", 40), "GitHub token"),
             (token("ghp_", 36, "a_B3"), "GitHub token"),
             (token("gho_", 36, "a_B3"), "GitHub token"),
+            (token("ghu_", 36), "GitHub token"),
+            (token("ghr_", 36, "a_B3"), "GitHub token"),
             (token("ghs_", 36, "a_B3"), "GitHub App installation token"),
             (token("github_pat_", 82, "aB3_"), "GitHub fine-grained token"),
         ]
@@ -193,6 +195,7 @@ class CheckScriptTest(unittest.TestCase):
     def test_short_token_lookalikes_pass_secrets(self):
         self.write("config.txt", "\n".join([
             token("ghp_", 35), token("ghs_", 35), token("gho_", 35),
+            token("ghu_", 35), token("ghr_", 35),
             token("github_pat_", 81, "aB3_"), "ghp_" + "-" * 40, "ghs_" + "1_a.b-" * 5,
             # Long runs of dots or dashes are neither installation token form.
             "ghs_" + "." * 40, "ghs_" + "-" * 40, "ghs_" + "a.b-" * 12,
