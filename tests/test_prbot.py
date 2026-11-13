@@ -69,6 +69,7 @@ ISSUE_20_BYPASSES = [
      "aliases:\n  'pr human-review': '!gh pr review 1 --approve'\n"),
     ("shell alias named gh", ["gh", "--version"], "aliases:\n  gh: '!gh pr review 1 --approve'\n"),
     ("help runs an extension", ["help", "reviewer"], None),
+    ("--web starts the configured browser", ["pr", "view", "1", "--web"], "browser: gh human-review\n"),
     ("help runs an extension named like a subcommand", ["help", "view"], None),
     ("help runs an extension named like a subcommand alias", ["help", "co"], None),
 ]
@@ -268,7 +269,10 @@ class Classify(unittest.TestCase):
                 self.assertIs(prbot.classify_gh(args), want)
         for args in self.CODEX_BYPASSES:
             with self.subTest(args=args):
-                self.assertIs(prbot.classify_gh(args), True)
+                if "--web" in args:  # never runs as Kenny either way: --web is refused before the write check
+                    self.assertRaises(prbot.Undecided, prbot.classify_gh, args)
+                else:
+                    self.assertIs(prbot.classify_gh(args), True)
         for args in self.CODEX_TRIGGERS:
             with self.subTest(args=args):
                 self.assertIs(prbot.classify_gh(args), False)
@@ -333,11 +337,19 @@ class Classify(unittest.TestCase):
                      ["skill", "install", "x"], ["pr", "human-review"], ["pr", "--foo", "view", "1"], ["--foo", "pr", "view"],
                      ["help", "human-review"], ["accessibility", "human-review"], ["PR", "review", "1", "--approve"],
                      ["browse"], ["browse", "1"], ["help", "pr", "human-review"], ["help", "pr", "view", "x"],
-                     ["help", "--help"], ["help", "codespace"], ["help", "browse"]):
+                     ["help", "--help"], ["help", "codespace"], ["help", "browse"],
+                     # -w/--web starts the browser from gh's config, like gh browse
+                     ["pr", "view", "1", "--web"], ["pr", "view", "1", "-w"], ["issue", "view", "1", "--web=true"],
+                     ["repo", "view", "-w"], ["run", "view", "1", "--web"], ["workflow", "view", "x", "-w"],
+                     ["pr", "create", "-w"], ["pr", "comment", "1", "-w"], ["search", "prs", "x", "--web"],
+                     ["pr", "close", "1", "-dw"], ["-R", "o/r", "release", "view", "v1", "--web"]):
             with self.subTest(args=args):
                 with self.assertRaises(prbot.Undecided):
                     prbot.classify_gh(args)
         self.assertIs(prbot.classify_gh(["auth", "status", "-h", "github.com"]), False)
+        self.assertIs(prbot.classify_gh(["pr", "checks", "1", "--watch"]), False)
+        self.assertIs(prbot.classify_gh(["pr", "view", "1", "--", "--web"]), False)
+        self.assertIs(prbot.classify_gh(["pr", "comment", "1", "-b", "--web please"]), True)
         self.assertIs(prbot.classify_gh(["auth", "status", "--hostname", "github.com", "--active"]), False)
 
     def test_classify_gh_never_reads_gh_config(self):

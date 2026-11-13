@@ -211,7 +211,8 @@ every alias whatever the config says. Built-in names such as `ext` for
 refused. Everything else exits 4: unknown words (aliases, extensions, `gh gh`
 after `--`), unlisted subcommands (`gh pr human-review`, `gh ext human-review`,
 `gh extension exec`, `gh alias set` and `import`, `gh config set`, `gh auth
-token`, `gh browse`), `gh help` with a name that is not gh's own (gh turns
+token`, `gh browse`), `-w` or `--web` (gh starts the browser named in its
+config), `gh help` with a name that is not gh's own (gh turns
 `gh help <extension>` into `<extension> --help` and runs it) and a flag before
 the command (`gh --help human-review`), since gh hands the rest of the line to
 a shell alias unparsed. Like the hook, the shim stops mistakes and is not a
