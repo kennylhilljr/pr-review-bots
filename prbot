@@ -160,15 +160,17 @@ class Undecided(Exception):
 # through only when its first word after the global options is a built-in gh command below and, for a command
 # group, its subcommand is listed under it. The config is never read: every alias, the default `co` included,
 # and every extension is refused, whatever config.yml says. A gh call that is not listed is refused, not guessed.
-# Runnable top-level commands without subcommands; nothing can be nested under them.
-GH_LEAF_COMMANDS = {"api", "browse", "status", "version", "completion", "licenses"}
+# Runnable top-level commands without subcommands; nothing can be nested under them. `browse` is left off: it
+# starts the browser named in gh's config.
+GH_LEAF_COMMANDS = {"api", "status", "version", "completion", "licenses"}
 # gh's help topics: they only print text
 GH_HELP_TOPICS = {"accessibility", "actions", "environment", "exit-codes", "formatting", "mintty", "reference",
                   "telemetry"}
 # command groups (gh's own spelling, built-in aliases resolve to it) and the subcommands the shim may run; gh's
 # built-in subcommand aliases such as `pr ls` and `pr co` are listed by name. Commands that change gh's aliases,
-# extensions, config or login, print a token, or run another program (alias set, extension exec, config set,
-# auth token, copilot, codespace) are left off.
+# extensions, config or login, print a token, or run a program other than git (alias set, extension exec, config
+# set, auth token, browse, copilot, codespace) are left off. gh's pager and editor settings are out of reach, as
+# for the Claude Code hook: the shim stops mistakes and is not a sandbox.
 GH_SAFE_SUBCOMMANDS = {
     "pr": {"view", "diff", "list", "ls", "checks", "status", "create", "new", "merge", "edit", "checkout", "co",
            "ready", "close", "reopen", "comment", "review", "lock", "unlock", "update-branch", "revert"},
@@ -219,9 +221,13 @@ def classify_gh(args, codex_triggers_as_bot=False):
     if first in GH_HELP_TOPICS and not tail:
         return False
     if first == "help":
-        if not tail or (len(tail) <= 2 and all(_gh_known_name(t) for t in tail)):
+        # gh turns `help <extension>` into `<extension> --help`, which runs the extension, so only built-in names
+        top = GH_GROUP_ALIASES.get(tail[0], tail[0]) if tail else None
+        if (not tail or (len(tail) == 1 and (top in GH_LEAF_COMMANDS or top in GH_HELP_TOPICS
+                                             or top in GH_SAFE_SUBCOMMANDS))
+                or (len(tail) == 2 and tail[1] in GH_SAFE_SUBCOMMANDS.get(top, ()))):
             return False
-        raise Undecided("gh help with a name gh does not own (an alias or an extension)")
+        raise Undecided("gh help is only run for gh's own commands (gh runs an extension for gh help <extension>)")
     group = GH_GROUP_ALIASES.get(first, first)
     if group not in GH_SAFE_SUBCOMMANDS:
         if first in GH_UNSAFE_GROUPS:
@@ -260,12 +266,6 @@ def _shows_token(rest):
                 if ch in "hqT":  # takes a value: the rest of the word is that value
                     break
     return False
-
-
-def _gh_known_name(word):
-    """True for a name gh owns at the top level or a subcommand listed above, used to let `gh help pr view` print."""
-    return (word in GH_LEAF_COMMANDS or word in GH_HELP_TOPICS or word in GH_SAFE_SUBCOMMANDS
-            or word in GH_GROUP_ALIASES or any(word in subs for subs in GH_SAFE_SUBCOMMANDS.values()))
 
 
 def is_codex_trigger(text):

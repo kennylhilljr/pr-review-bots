@@ -68,6 +68,9 @@ ISSUE_20_BYPASSES = [
     ("--help between group and alias", ["pr", "--help", "human-review"],
      "aliases:\n  'pr human-review': '!gh pr review 1 --approve'\n"),
     ("shell alias named gh", ["gh", "--version"], "aliases:\n  gh: '!gh pr review 1 --approve'\n"),
+    ("help runs an extension", ["help", "reviewer"], None),
+    ("help runs an extension named like a subcommand", ["help", "view"], None),
+    ("help runs an extension named like a subcommand alias", ["help", "co"], None),
 ]
 # what the bots and skills run with plain gh: (gh argv, expected classify answer, True for a feedback write)
 BOT_READS = [
@@ -275,13 +278,62 @@ class Classify(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertIs(prbot.classify_gh(args), True)
 
+    # every gh call the shim may run; a new entry in prbot's safe list is added here too, with its reason in review
+    SAFE_LIST = {
+        "pr": {"view", "diff", "list", "ls", "checks", "status", "create", "new", "merge", "edit", "checkout", "co",
+               "ready", "close", "reopen", "comment", "review", "lock", "unlock", "update-branch", "revert"},
+        "issue": {"view", "list", "ls", "status", "create", "new", "close", "reopen", "comment", "edit", "lock",
+                  "unlock", "pin", "unpin", "develop"},
+        "repo": {"view", "list", "ls", "clone", "fork", "sync", "set-default", "read-file", "read-dir", "create",
+                 "new"},
+        "run": {"view", "list", "ls", "watch", "download", "rerun", "cancel"},
+        "workflow": {"view", "list", "ls", "run", "enable", "disable"},
+        "release": {"view", "list", "ls", "download", "verify", "verify-asset"},
+        "label": {"list", "ls", "create", "edit", "clone"},
+        "search": {"code", "commits", "issues", "prs", "repos"},
+        "auth": {"status"}, "cache": {"list", "ls"}, "gist": {"view", "list", "ls"}, "org": {"list", "ls"},
+        "ruleset": {"view", "list", "ls", "check"}, "secret": {"list", "ls"}, "variable": {"get", "list", "ls"},
+        "alias": {"list", "ls"}, "extension": {"list", "ls", "search"}, "config": {"get", "list", "ls"},
+        "attestation": {"verify", "download", "trusted-root"}, "discussion": {"view", "list"},
+        "project": {"view", "list", "ls", "field-list", "item-list"},
+    }
+    LEAVES = {"api", "status", "version", "completion", "licenses"}
+
+    def test_every_safe_list_entry_is_pinned_and_passes(self):
+        """The safe list is exactly the one pinned here, and every entry (plain, after -R, and through a built-in
+        group name) gets is_feedback_write's answer instead of a refusal."""
+        self.assertEqual(prbot.GH_SAFE_SUBCOMMANDS, self.SAFE_LIST)
+        self.assertEqual(prbot.GH_LEAF_COMMANDS, self.LEAVES)
+        self.assertEqual(prbot.GH_GROUP_ALIASES, {"ext": "extension", "extensions": "extension", "rs": "ruleset",
+                                                  "at": "attestation"})
+        names = {g: [g] for g in self.SAFE_LIST}
+        for alias, group in prbot.GH_GROUP_ALIASES.items():
+            names[group].append(alias)
+        for group, subs in self.SAFE_LIST.items():
+            for name in names[group]:
+                for sub in sorted(subs):
+                    for args in ([name, sub, "1"], ["-R", "o/r", name, sub, "1"], [name, "--repo", "o/r", sub, "1"]):
+                        with self.subTest(args=args):
+                            self.assertIs(prbot.classify_gh(args), prbot.is_feedback_write(args))
+                    with self.subTest(help=[name, sub]):
+                        self.assertIs(prbot.classify_gh(["help", name, sub]), False)
+                with self.subTest(group=name):
+                    self.assertIs(prbot.classify_gh([name]), False)
+                    self.assertIs(prbot.classify_gh(["help", name]), False)
+        for leaf in self.LEAVES:
+            with self.subTest(leaf=leaf):
+                self.assertIs(prbot.classify_gh([leaf]), prbot.is_feedback_write([leaf]))
+                self.assertIs(prbot.classify_gh(["help", leaf]), False)
+
     def test_safe_list_refuses_gh_setup_tokens_and_unknown_subcommands(self):
         for args in (["auth", "token"], ["auth", "status", "-t"], ["auth", "status", "--show-token"],
                      ["auth", "status", "-at"], ["auth", "login"], ["auth", "setup-git"], ["config", "set", "pager", "x"],
                      ["config", "set", "editor", "x"], ["extension", "install", "o/gh-x"], ["ext", "upgrade", "--all"],
                      ["copilot"], ["codespace", "ssh"], ["cs", "list"], ["preview", "prompter"], ["agent-task", "create"],
                      ["skill", "install", "x"], ["pr", "human-review"], ["pr", "--foo", "view", "1"], ["--foo", "pr", "view"],
-                     ["help", "human-review"], ["accessibility", "human-review"], ["PR", "review", "1", "--approve"]):
+                     ["help", "human-review"], ["accessibility", "human-review"], ["PR", "review", "1", "--approve"],
+                     ["browse"], ["browse", "1"], ["help", "pr", "human-review"], ["help", "pr", "view", "x"],
+                     ["help", "--help"], ["help", "codespace"], ["help", "browse"]):
             with self.subTest(args=args):
                 with self.assertRaises(prbot.Undecided):
                     prbot.classify_gh(args)
