@@ -37,6 +37,7 @@ PERMISSIONS = {"pull_requests": "write", "issues": "write", "contents": "read", 
 
 WRITE_SUBCOMMANDS = {("pr", "review"), ("pr", "comment"), ("issue", "comment")}
 CLOSE_SUBCOMMANDS = {("pr", "close"), ("issue", "close")}  # feedback only when they carry -c/--comment
+CODEX_TRIGGER = re.compile(r"@codex(\s.*)?", re.S)  # `@codex` first, alone or followed by whitespace
 FEEDBACK_PATH = re.compile(r"/(comments|reviews|replies)(/|$|\?|#)|/reviews/\d+/(events|dismissals)")
 FEEDBACK_MUTATION = re.compile(r"\b(addPullRequestReview\w*|submitPullRequestReview|addComment|updateIssueComment|"
                                r"updatePullRequestReview\w*|resolveReviewThread|unresolveReviewThread|"
@@ -119,21 +120,61 @@ def _option_values(args, short, long, value_short, value_long):
     return out
 
 
+def _only_options(args, allowed_short, allowed_long, value_short, value_long):
+    """True when every option in args (up to `--`) is one of allowed_short or allowed_long. value_short and
+    value_long name the options that take a value, so their operands are never read as options."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return True
+        if a.startswith("--"):
+            name, eq, _ = a.partition("=")
+            if name not in allowed_long:
+                return False
+            i += 2 if not eq and name in value_long else 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            step = 1
+            for k in range(1, len(a)):
+                ch = a[k]
+                if ch not in allowed_short:
+                    return False
+                if ch in value_short:
+                    step = 1 if a[k + 1:] else 2
+                    break
+            i += step
+            continue
+        i += 1
+    return True
+
+
+def is_codex_trigger(text):
+    """True for a body that is a Codex Cloud trigger: `@codex` at the very start, followed by the end of the text
+    or whitespace."""
+    return text is not None and CODEX_TRIGGER.fullmatch(text) is not None
+
+
 def is_feedback_write(args, codex_triggers_as_bot=False):
-    """args: the gh argv without the leading 'gh'."""
+    """args: the gh argv without the leading 'gh'. Only a plain comment or close comment whose text is a Codex
+    trigger stays on the human account; a `pr review` is always a feedback write, whatever its body or verdict."""
     group, sub, rest = gh_command(args)
     if group == "api":
         return _api_feedback_write(rest)
+    if (group, sub) == ("pr", "review"):
+        return True  # an approval or change request from the human account is what the guard most needs to stop
     if (group, sub) in WRITE_SUBCOMMANDS:
         values = _option_values(rest, "b", "--body", COMMENT_VALUE_SHORT, COMMENT_VALUE_LONG)
+        plain = _only_options(rest, "bR", ("--body", "--repo", "--hostname"), "bFR", COMMENT_VALUE_LONG + ("--body",))
     elif (group, sub) in CLOSE_SUBCOMMANDS:
         values = _option_values(rest, "c", "--comment", CLOSE_VALUE_SHORT, CLOSE_VALUE_LONG)
         if not values:
             return False  # closing without a comment posts no feedback
+        plain = True
     else:
         return False
     text = values[-1] if values else None  # gh keeps the last value when an option repeats
-    if text is not None and text.lstrip().startswith("@codex") and not codex_triggers_as_bot:
+    if plain and is_codex_trigger(text) and not codex_triggers_as_bot:
         return False  # Codex Cloud triggers stay on the human account until tested
     return True
 
@@ -1331,7 +1372,7 @@ class _Guard:
         if (group, sub) in WRITE_SUBCOMMANDS | CLOSE_SUBCOMMANDS:
             if is_feedback_write(texts, self.codex):
                 self.feedback.append(texts)
-            return  # closing without a comment, or an @codex trigger
+            return  # closing without a comment, or a plain @codex trigger comment
         self.gh_other.append(texts)
 
     def git_call(self, args):

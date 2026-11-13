@@ -48,6 +48,65 @@ class Classify(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(prbot.is_feedback_write(args), want)
 
+    # issue #19: every bypass of the @codex exemption, each a feedback write that must go through a bot
+    CODEX_BYPASSES = [
+        ["pr", "review", "1", "--approve", "-b", "@codex looks good"],
+        ["pr", "review", "1", "-a", "-b", "@codex looks good"],
+        ["pr", "review", "1", "--request-changes", "-b", "@codex P1: broken"],
+        ["pr", "review", "1", "-r", "--body=@codex P1: broken"],
+        ["pr", "review", "1", "--comment", "-b", "@codex review"],
+        ["pr", "review", "1", "-b", "@codex review"],
+        ["pr", "review", "1", "-b@codex"],
+        ["-R", "o/r", "pr", "review", "1", "--approve", "-b", "@codex"],
+        ["pr", "--repo", "o/r", "review", "1", "--body", "@codex review", "--approve"],
+        ["pr", "comment", "1", "-b", "@codexfoo hi"],
+        ["pr", "comment", "1", "-b", "@codex: review"],
+        ["pr", "comment", "1", "-b", "@codex-bot review"],
+        ["issue", "comment", "1", "-b", "@codex, please look"],
+        ["pr", "close", "1", "-c", "@codexfoo"],
+        ["pr", "comment", "1", "-b", " @codex P1: the parser drops quotes"],
+        ["pr", "comment", "1", "-b", "\n@codex review"],
+        ["issue", "close", "1", "-c", "\t@codex go"],
+        # a trigger body with an option that changes what is posted or where it comes from
+        ["pr", "comment", "1", "-b", "@codex review", "--body-file", "notes.md"],
+        ["pr", "comment", "1", "-b", "@codex review", "-F", "notes.md"],
+        ["pr", "comment", "1", "-b", "@codex review", "--edit-last"],
+        ["pr", "comment", "1", "-b", "@codex review", "--delete-last"],
+        ["pr", "comment", "1", "-eb", "@codex review"],
+        ["pr", "comment", "1", "-b", "@codex review", "--web"],
+        # gh api calls never get the exemption
+        ["api", "repos/o/r/pulls/1/reviews", "-f", "event=APPROVE", "-f", "body=@codex looks good"],
+        ["api", "repos/o/r/issues/1/comments", "-f", "body=@codex review"],
+        ["api", "graphql", "-f", "query=mutation { addComment(input: {subjectId: \"x\", body: \"@codex review\"}) "
+                                    "{ clientMutationId } }"],
+    ]
+    CODEX_TRIGGERS = [
+        ["pr", "comment", "1", "-b", "@codex review"],
+        ["pr", "comment", "1", "-b", "@codex"],
+        ["pr", "comment", "1", "-b", "@codex\nreview the parser"],
+        ["pr", "comment", "1", "-b@codex review"],
+        ["pr", "comment", "1", "--body", "@codex review", "-R", "o/r"],
+        ["issue", "comment", "1", "--hostname=h", "-b", "@codex look"],
+        ["pr", "close", "1", "-d", "-c", "@codex review"],
+    ]
+
+    def test_codex_exemption_covers_only_plain_trigger_comments(self):
+        for args in self.CODEX_BYPASSES:
+            with self.subTest(args=args):
+                self.assertIs(prbot.is_feedback_write(args), True)
+        for args in self.CODEX_TRIGGERS:
+            with self.subTest(args=args):
+                self.assertIs(prbot.is_feedback_write(args), False)
+                self.assertIs(prbot.is_feedback_write(args, codex_triggers_as_bot=True), True)
+
+    def test_issue_19_acceptance(self):
+        w = prbot.is_feedback_write
+        self.assertTrue(w(["pr", "review", "1", "--approve", "-b", "@codex looks good"]))
+        self.assertTrue(w(["pr", "review", "1", "-b", "@codex review"]))
+        self.assertTrue(w(["pr", "comment", "1", "-b", "@codexfoo hi"]))
+        self.assertFalse(w(["pr", "comment", "1", "-b", "@codex review"]))
+        self.assertFalse(w(["pr", "comment", "1", "-b", "@codex"]))
+
     def test_codex_trigger_moves_to_bot_when_enabled(self):
         self.assertTrue(prbot.is_feedback_write(["pr", "comment", "1", "-b", "@codex review"], codex_triggers_as_bot=True))
 
@@ -2098,6 +2157,21 @@ class Hook(unittest.TestCase):
         out = self.run_hook_in('git commit -m "fix"', mine)
         self.assertIn("git claude -- commit -m fix", out["hookSpecificOutput"]["permissionDecisionReason"])
 
+    def test_codex_exemption_bypasses_denied(self):
+        """issue #19: an @codex body never lets a review or a non-trigger comment through on the human account."""
+        for command in ("gh pr review 1 --approve -b '@codex looks good'",
+                        "gh pr review 1 --request-changes -b '@codex P1: broken'",
+                        "gh pr review 1 -b '@codex review'",
+                        "gh -R o/r pr review 1 --approve --body='@codex'",
+                        "gh pr comment 1 -b '@codexfoo hello'",
+                        "gh pr comment 1 -b ' @codex P1: the parser drops quotes'",
+                        "gh pr comment 1 -b '@codex review' --edit-last",
+                        "gh api repos/o/r/pulls/1/reviews -f event=APPROVE -f body='@codex looks good'"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(command)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.run_hook("gh pr comment 1 -b '@codex review'"))
+        self.assertIsNone(self.run_hook("gh pr comment 1 -b '@codex'"))
+
     def test_allows_reads_and_routed_writes(self):
         self.assertIsNone(self.run_hook("gh pr view 15 --json reviews"))
         self.assertIsNone(self.run_hook("prbot gh claude -- pr comment 15 -b ok"))
@@ -2583,6 +2657,24 @@ class CodexShim(unittest.TestCase):
             self.assertNotIn("{bad", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_codex_exemption_bypasses_never_reach_real_gh(self):
+        """issue #19: an approval or non-trigger comment with an @codex body goes to prbot, never the real gh."""
+        for argv in (["pr", "review", "1", "--approve", "-b", "@codex looks good"],
+                     ["pr", "review", "1", "--request-changes", "-b", "@codex P1: broken"],
+                     ["pr", "comment", "1", "-b", "@codexfoo hello"]):
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as fake:
+                calls = Path(fake, "calls.log")
+                gh = Path(fake, "gh")  # stands in for the real gh, so nothing can post even if classification fails
+                gh.write_text(f"#!/bin/sh\necho \"$@\" >> {shlex.quote(str(calls))}\nexit 0\n")
+                gh.chmod(0o755)
+                env = dict(os.environ, PRBOT_CONFIG_DIR=cfg, PRBOT_BOT="codex",
+                           PATH=os.pathsep.join([str(ROOT / "integrations/codex/bin"), fake, os.environ["PATH"]]))
+                env.pop("PRBOT_ACTIVE", None)
+                r = subprocess.run(["gh", "-R", "o/r", *argv], capture_output=True, text=True, env=env, timeout=30)
+                self.assertFalse(calls.exists(), "the shim passed a feedback write to gh")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("bot 'codex' is not registered", r.stderr)
+
     def test_routes_global_repo_feedback(self):
         with tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as fake:
             calls = Path(fake, "calls.log")
@@ -2760,6 +2852,13 @@ class ClassifyCli(unittest.TestCase):
         r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x")
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "write"), r.stderr)
         r = self.run_prbot("classify", "--", "pr", "view", "1")
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "read"), r.stderr)
+
+    def test_codex_review_is_a_write(self):
+        """issue #19: classify, which the Codex shim trusts, calls an @codex approval a write."""
+        r = self.run_prbot("classify", "--", "pr", "review", "1", "--approve", "-b", "@codex looks good")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "write"), r.stderr)
+        r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "@codex review")
         self.assertEqual((r.returncode, r.stdout.strip()), (1, "read"), r.stderr)
 
     def test_config_is_a_directory(self):
