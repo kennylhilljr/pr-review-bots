@@ -49,7 +49,7 @@ Reading is fine with plain `gh`: `gh pr view`, `gh pr diff`, `gh api` GET calls.
 
 Exceptions that stay on Kenny's account:
 
-- Plain `gh pr comment` or `gh issue comment` triggers whose body is `@codex` alone or followed by whitespace (they trigger Codex Cloud, which may ignore other bots). Never `gh pr review`: an approval or change request with an `@codex` body still goes through your bot.
+- Plain `gh pr comment` or `gh issue comment` triggers, and `gh pr close -c` or `gh issue close -c` comments, whose body starts with `@codex` and is `@codex` alone or followed by whitespace (they trigger Codex Cloud, which may ignore other bots). Never `gh pr review`: an approval or change request with an `@codex` body still goes through your bot.
 - Merges, and approvals or posts Kenny makes himself.
 
 ## Open a PR of your own

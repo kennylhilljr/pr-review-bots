@@ -64,6 +64,9 @@ class Classify(unittest.TestCase):
         ["pr", "comment", "1", "-b", "@codex-bot review"],
         ["issue", "comment", "1", "-b", "@codex, please look"],
         ["pr", "close", "1", "-c", "@codexfoo"],
+        ["pr", "comment", "1", "-b", " @codex P1: the parser drops quotes"],
+        ["pr", "comment", "1", "-b", "\n@codex review"],
+        ["issue", "close", "1", "-c", "\t@codex go"],
         # a trigger body with an option that changes what is posted or where it comes from
         ["pr", "comment", "1", "-b", "@codex review", "--body-file", "notes.md"],
         ["pr", "comment", "1", "-b", "@codex review", "-F", "notes.md"],
@@ -2161,6 +2164,7 @@ class Hook(unittest.TestCase):
                         "gh pr review 1 -b '@codex review'",
                         "gh -R o/r pr review 1 --approve --body='@codex'",
                         "gh pr comment 1 -b '@codexfoo hello'",
+                        "gh pr comment 1 -b ' @codex P1: the parser drops quotes'",
                         "gh pr comment 1 -b '@codex review' --edit-last",
                         "gh api repos/o/r/pulls/1/reviews -f event=APPROVE -f body='@codex looks good'"):
             with self.subTest(command=command):

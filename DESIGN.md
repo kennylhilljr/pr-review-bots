@@ -451,7 +451,7 @@ Kenny to add, with the full list of checks and token thresholds.
   `~/.config/prbot/config.json` and those triggers move to the bot too. Until
   then the guard lets a trigger through on Kenny's account: a plain
   `gh pr comment`, `gh issue comment` or close `-c` whose last body or
-  comment is `@codex` alone or followed by whitespace. A comment with any
+  comment starts with `@codex`, alone or followed by whitespace. A comment with any
   option besides `-b`/`--body`, `-R`/`--repo` and `--hostname` (such as
   `--edit-last`, `--body-file` or `--web`) is not a trigger. A `gh pr review`
   (an approval or change request above all), a body such as `@codexfoo` or

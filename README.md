@@ -294,7 +294,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 - Bot tokens last one hour, cover a single repository, and exist only in the environment of one `gh` process. prbot never prints or saves them, and it clears `GITHUB_TOKEN` before calling `gh` so a personal token cannot leak into a bot post.
 - Each App asks for the least it needs: read and write on pull requests and issues, read on contents and metadata. No webhooks.
 - Reviewing agents run read-only: Claude with only Read, Grep and Glob and no MCP servers, Codex with `-s read-only`. They return text; only prbot posts.
-- Plain comments that are `@codex` triggers (`@codex` alone or followed by whitespace) stay on your account by default, because the Codex Cloud connector may ignore other bots. Set `"codex_triggers_as_bot": true` in `~/.config/prbot/config.json` once you've confirmed it responds to `claude-pr-gh`.
+- Plain comments that are `@codex` triggers (the body starts with `@codex`, alone or followed by whitespace) stay on your account by default, because the Codex Cloud connector may ignore other bots. Set `"codex_triggers_as_bot": true` in `~/.config/prbot/config.json` once you've confirmed it responds to `claude-pr-gh`.
 
 ## Troubleshooting
 

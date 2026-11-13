@@ -37,7 +37,7 @@ PERMISSIONS = {"pull_requests": "write", "issues": "write", "contents": "read", 
 
 WRITE_SUBCOMMANDS = {("pr", "review"), ("pr", "comment"), ("issue", "comment")}
 CLOSE_SUBCOMMANDS = {("pr", "close"), ("issue", "close")}  # feedback only when they carry -c/--comment
-CODEX_TRIGGER = re.compile(r"\s*@codex(\s.*)?", re.S)  # `@codex` alone or followed by whitespace
+CODEX_TRIGGER = re.compile(r"@codex(\s.*)?", re.S)  # `@codex` first, alone or followed by whitespace
 FEEDBACK_PATH = re.compile(r"/(comments|reviews|replies)(/|$|\?|#)|/reviews/\d+/(events|dismissals)")
 FEEDBACK_MUTATION = re.compile(r"\b(addPullRequestReview\w*|submitPullRequestReview|addComment|updateIssueComment|"
                                r"updatePullRequestReview\w*|resolveReviewThread|unresolveReviewThread|"
@@ -150,7 +150,8 @@ def _only_options(args, allowed_short, allowed_long, value_short, value_long):
 
 
 def is_codex_trigger(text):
-    """True for a body that is a Codex Cloud trigger: `@codex` followed by the end of the text or whitespace."""
+    """True for a body that is a Codex Cloud trigger: `@codex` at the very start, followed by the end of the text
+    or whitespace."""
     return text is not None and CODEX_TRIGGER.fullmatch(text) is not None
 
 
