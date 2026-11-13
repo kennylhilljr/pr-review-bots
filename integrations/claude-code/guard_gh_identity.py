@@ -82,21 +82,34 @@ def decide(payload):
         cfg = prbot.load_config()
         owners = {cfg[b]["owner"] for b in prbot.AGENTS if b in cfg and cfg[b].get("owner")}
         cwd = payload.get("cwd") or os.getcwd()
-        pushes = []
-        for args, cdir in prbot.git_writes(command):
-            repo = prbot.repo_from_git(os.path.join(cwd, cdir) if cdir else cwd)
-            if repo and repo.split("/")[0] in owners:  # only repos the bots are installed on
-                pushes.append(args)
-        if pushes:
-            fixes = "\n".join(f"  {shlex.quote(str(PRBOT))} git {BOT} -- {shlex.join(a)}" for a in pushes)
+        found = prbot.guard_bash(command, cwd, owners, cfg.get("codex_triggers_as_bot", False))
+        if not found:
+            return None
+        if found["feedback"]:
+            return deny(routing_fix(found["feedback"]))
+        if found["git"]:
+            fixes = "\n".join(f"  {shlex.quote(str(PRBOT))} git {BOT} -- {shlex.join(a)}" for a in found["git"])
             return deny("Commits and pushes in Kenny's repos must come from the Claude bot (claude-pr-gh[bot]), "
                         f"not his account. Run them through prbot, which sets the bot identity and token:\n{fixes}")
-        offending = prbot.unrouted_writes(command, cfg.get("codex_triggers_as_bot", False))
-        if offending:
-            return deny(routing_fix(offending))
-        return None
+        return deny(safe_list_fix(found))
     except BaseException as e:  # prbot's die() raises SystemExit, and SystemExit(0) would end the hook as allow
         return fail_closed(payload, e)
+
+
+def safe_list_fix(found):
+    """The denial for a command off the safe list: why, and the prbot route for any gh call in it."""
+    lines = [f"- {r}" for r in found["reasons"]]
+    lines += [f"- gh {shlex.join(a)} is not a gh read on the safe list" for a in found["gh"]]
+    msg = ("The gh/git guard refused this command. A Bash command that names gh, git or prbot may only use the "
+           "guard's safe list: gh reads (pr view/diff/list/checks, issue view/list, api GET), git reads and local "
+           "changes, simple programs such as ls, cat, grep and jq, and the repo's test runners, with no "
+           "if/for blocks, wrappers or output redirection to a file. Shell tricks that hide the program name "
+           "(eval or sh -c of text only known at run time, $x as a command) are refused everywhere.\n"
+           + "\n".join(lines))
+    if found["gh"]:
+        fixes = "\n".join(f"  {shlex.quote(str(PRBOT))} gh {BOT} -- {shlex.join(a)}" for a in found["gh"])
+        msg += f"\nRun other gh calls as the Claude bot:\n{fixes}"
+    return msg + "\nOtherwise split the command into simple steps, or write files with the editing tools."
 
 
 def provably_unrelated(command):
