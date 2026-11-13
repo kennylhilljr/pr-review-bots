@@ -52,6 +52,7 @@ agent (Claude Code / Codex CLI)
    v
 guard  (Claude Code PreToolUse hook, or the gh shim for Codex)
    |  PR or issue feedback?  yes -> run: prbot gh <bot> -- pr review ...
+   |  (the hook also refuses any gh/git command off its safe list)
    v
 prbot
    1. read App id and private key (macOS Keychain)
@@ -72,24 +73,24 @@ Instructions in `CLAUDE.md` or `AGENTS.md` are easy for an agent to skip, so
 each agent also gets a mechanical check.
 
 - Claude Code: a PreToolUse hook on Bash (`integrations/claude-code/guard_gh_identity.py`).
-  It denies `gh` commands that post PR or issue feedback (reviews and
-  comments) unless they already go through `prbot gh`, and the denial message
-  gives Claude the exact command to run instead. It also denies a plain
-  `git commit` or `git push` in repositories the bots' owner owns.
+  It checks every Bash command against a safe list (below). Feedback writes
+  and commits or pushes in the bots' repositories are denied with the exact
+  `prbot gh` or `prbot git` command to run instead.
 - Codex CLI: a `gh` shim placed first on `PATH` when Codex starts
   (`integrations/codex/bin/gh`, launched by `integrations/codex/codex-as-bot`).
   Feedback writes go through `prbot gh codex`; every other call goes straight
   to the real `gh`.
 
-Both use the same classifier in `prbot`, so the rules cannot drift apart. It
-counts these as feedback:
+The shim sees gh's own argv, so it only has to tell feedback from everything
+else. `prbot classify` counts these as feedback:
 
 - `gh pr review`, `gh pr comment` and `gh issue comment`.
 - `gh pr close` and `gh issue close` with `-c`/`--comment`, which post the
   comment before closing.
 - `gh api` writes to review, comment and reply endpoints: `POST`, `PATCH`,
   `PUT` or `DELETE`, or fields with no method, in any of gh's flag forms
-  (`-f body=x`, `-fbody=x`, `--field=body=x`, `-XPOST`).
+  (`-f body=x`, `-fbody=x`, `--field=body=x`, `-XPOST`), with or without a
+  `?query` or `#fragment` after the path.
 - `gh api graphql` with a review or comment mutation, inline or in a payload
   file. The classifier reads the files named by `query=@file` (in any
   `-f`, `-F`, `--field` or `--raw-field` form) or `--input file`, relative to
@@ -99,26 +100,107 @@ counts these as feedback:
   write, because its contents are unknown.
 
 It finds the subcommand after `-R`, `--repo` and `--hostname`, whether they
-come before the command group or between the group and the subcommand. In a
-shell command it splits on `;`, `&`, `|`, parentheses and unquoted newlines
-(so a heredoc line that looks like a feedback write is denied too); drops
-redirections such as `>/dev/null` and `2>&1` with their targets; skips `then`, `do`,
-`else`, `elif`, `if`, `while`, `until`, `{` and `!` at the start of a command,
-`VAR=value` assignments, and the wrappers `env`, `time`, `command`, `exec`,
-`nohup`, `sudo` and `xargs` together with their options and operands
-(`env -S` strings are split and read as more `env` arguments); and
-looks inside backticks (unescaping nested ones), `$(...)` within double quotes
-and `bash -c`, `sh -c` and `zsh -c` strings, up to four
-levels deep. This is not a full shell parser. It covers these forms without a
-dependency, and anything past four levels is not inspected. The same parsing
-finds `git commit` and `git push` for the push guard, after git's own options
-(`-C`, `-c`, `--git-dir`, `--work-tree` and the like), and checks the repository
-that `-C` and `--git-dir` point at.
+come before the command group or between the group and the subcommand.
 
-Not feedback, so they stay on Kenny's login: reads such as `gh pr view`,
-`gh pr diff` and `gh api` GET calls; `gh pr create`, `gh issue create`,
-`gh pr merge` and `gh pr edit`; and `@codex` trigger comments, including a
-close comment that starts with `@codex` (see "What stays on Kenny's account").
+The hook sees a whole shell command, and a deny list over shell text kept
+missing forms: four review rounds each found new ways to hide a write (a `#`
+comment holding an apostrophe, `gh $(true) pr comment`, `env -C`, a `#`
+fragment on an API path). So the hook works the other way round and only lets
+through what it can read and knows is safe:
+
+1. `shell_commands` in `prbot` is one hand-written lexer for the shell
+   subset agents use. It tracks single and double quotes, backslashes, `#`
+   comments, line continuations, `$(...)`, backticks, `<(...)` and `>(...)`,
+   `${...}`, `$'...'`, here-documents and redirections in one pass, and
+   returns every simple command, the ones inside substitutions included. A
+   word built at run time is marked as such. Anything it doesn't fully
+   understand (unbalanced quotes, `case`, functions, arrays, arithmetic
+   commands, a here-document with a substitution in it) is unparseable.
+2. Some shell forms can start gh without the text ever naming it, so they are
+   refused in every command: a program name only known at run time (`$x`,
+   `${x}h`, `$'\x67h'`, a glob or brace pattern), `eval` and `sh -c`/`bash -c`/
+   `zsh -c` of text only known at run time, a shell reading commands from
+   stdin (`base64 -d | sh`, `bash -s`, any `/dev/` or `/proc/` script path,
+   `bash <(...)`), any of about twenty shells (csh and tcsh included), an
+   interpreter such as `python3` reading its program from a pipe or running
+   `-c` code only known at run time, a program that runs its arguments as a
+   command (`find -exec`, `arch`, `ssh`, `watch`, `script`, `awk` and the like)
+   given run-time or glob text, `xargs` whose command comes from stdin,
+   `xargs -I`, option clusters such as `env -iS`, `env -S`, `env -C` and
+   `sudo -D`. Text stored for bash to expand again is refused too: a value or
+   `read`/`printf`/`declare` input holding `$(` or a backtick, a `$'...'` value
+   with `\x`, octal or `\u` escapes, `PS4` and the other prompt and startup
+   variables, `$[ ]`, `$(( ))` and `(( ))` with names, `${a[name]}`, `let`,
+   `declare -i`, `[[ ... -eq ... ]]`, an array subscript holding `$(` or a
+   backtick, and `${x@P}`, since arithmetic on a variable holding `a[$(cmd)]`
+   runs cmd. A backslash inside `${...}` is unparseable. Literal `sh -c` and
+   `eval` text is read like the outer command, with the outer command's rules.
+3. A command whose text names gh, git or prbot in any letter case (after quotes,
+   backslashes and line continuations are removed, so `g\h`, `'g'h` and `GH`
+   count, as macOS finds the same binary) runs only when
+   every simple command in it is on the safe list:
+   - `gh` reads: `pr view/diff/list/checks/status`, `issue view/list/status`,
+     `repo view`, `run view/list/watch`, `workflow list/view`,
+     `release list/view`, `label list`, `auth status`, `search`, and
+     `gh api` GET calls with one endpoint, no `-f`, `-F`, `--field`,
+     `--raw-field` or `--input` and no method but GET, all with literal
+     arguments.
+   - `gh pr create`, `gh issue create`, `gh pr merge` and `gh pr edit`, which
+     are not feedback, `gh pr checkout`, `gh pr ready`, `gh repo clone`, `gh pr close` and `gh issue close` without a comment,
+     and `@codex` trigger comments.
+   - `git` with only `-C`, `--no-pager` and similar global options, running a
+     read (`status`, `log`, `diff`, `show`, `rev-parse`, `grep` and the like),
+     a read-only `config`, or local work that makes no commit (`add`,
+     `checkout`, `switch`, `restore`, `reset`, `stash`, `worktree`, `branch`,
+     `tag`, `remote`, `fetch`, `clone`). Options that run a program or write a
+     named file (`--upload-pack`, `--exec`, `rebase -x`, `grep -O`,
+     `clone -u`, `--output` and the like) are refused, and so is any prefix of
+     them, since git accepts `--upl` for `--upload-pack`.
+   - `git commit`, `push`, `merge`, `pull`, `rebase`, `cherry-pick`, `revert`,
+     `am`, `commit-tree` and `notes` outside the bots' repositories. In a repo
+     the bots' owner owns they are denied with the `prbot git` command. The
+     repo comes from `cd` (followed logically, as bash does; after `cd -P` or `set -P` the
+     directory counts as unknown), `-C`, every
+     remote URL of the repo and any branch remote or `remote.pushDefault` given
+     as a URL; a push, pull or fetch also counts every word that looks like a
+     remote URL. The owner is the URL's first path segment whatever the host (ssh
+     aliases, IP addresses, ports), compared without letter case. They are refused
+     when the directory is only known at run time (`cd $D`, `cd -`, `popd`,
+     `pushd -n`, a `cd` after `&&`, `||` or in a pipe, background job or
+     substitution, where it may not run in this shell), does not exist yet, or an earlier `git clone`, `init`,
+     `worktree`, `remote` or `gh repo clone` in the same command may have changed the repo.
+   - `prbot`, the route the guard points to.
+   - `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg` (not `--pre`), `echo`,
+     `printf` (not `-v`), `jq`, `sort` (not `-o`), `uniq` (no output file),
+     `mkdir`, `set` options, `cd` and other programs that neither start a
+     program nor write a file the guard has to protect, and the test runners `python3 -m unittest`, `pytest`,
+     `scripts/check.sh`, `npm test`, and `make test` or `make check` with no
+     other arguments.
+
+   On top of that, such a command may not hold `if`/`for`/`while` blocks,
+   subshells or `{ }` groups, wrappers (`env`, `sudo`, `nohup`, `xargs`,
+   `time`), `VAR=value` prefixes other than pager and locale settings, or output
+   redirection to a file (`2>&1`, `>&2` and `/dev/null` are fine). A
+   double-quoted `$(...)` is allowed only as the value of a message option
+   (`git commit -m "$(cat <<'EOF' ...)"`, `gh pr create --body "$(...)"`); a
+   gh read or a gh or git argument known only at run time is refused. A plain
+   assignment such as `SHA=$(git rev-parse HEAD)` is fine, except to `PATH`,
+   `IFS`, `HOME` and `GH_`, `GIT_`, `LD_`, `DYLD_` or `BASH_` names.
+4. Commands that never name gh, git or prbot and pass step 2 are not checked
+   further: `npm install`, `python3 x.py > out` and `for f in *.py` loops run as
+   before.
+
+The denial lists each reason and gives the `prbot gh claude -- ...` or
+`prbot git claude -- ...` command for any gh or git call in the command. The
+safe list closes the shell-level gaps; the hook stops mistakes and is not a sandbox. A
+program that builds the gh command itself (a script file, `python3 -c` with
+string pieces, an executable copied under another name) is out of reach, as
+before. `prbot classify` and the Codex shim keep the feedback classifier above,
+because they see argv, not shell text.
+
+What stays on Kenny's login: `gh pr create`, `gh issue create`, `gh pr merge`
+and `gh pr edit`, and `@codex` trigger comments, including a close comment that
+starts with `@codex` (see "What stays on Kenny's account").
 
 Both the Claude Code hook and the Codex gh shim fail closed for feedback writes
 when the classifier cannot decide. The shim captures classify's stdout and exit
@@ -128,9 +210,9 @@ and stdout is read. Anything else, including a missing, non-executable or
 crashing prbot, is refused with a non-zero exit. There is no bypass: the shim
 classifies every call whatever the environment holds (`PRBOT_ACTIVE` included),
 because prbot runs the real gh itself with the shim directory taken off PATH and
-so never comes back through the shim. The hook uses the same
-classifier, with one exception: when prbot itself can't be loaded or decide()
-raises, the hook falls back to a stricter check. It denies any command with a
+so never comes back through the shim. The hook's safe list
+lives in prbot too. When prbot itself can't be loaded or decide()
+raises, the hook falls back to a stricter check that needs no prbot code. It denies any command with a
 gh, prbot or git token, and any command it cannot prove makes no such call.
 Bash can spell gh without those letters in a row (`g\h`, `'g'h`, `${x}h`, a glob,
 base64 piped to sh), so a command passes only when it has no `$`, backtick or

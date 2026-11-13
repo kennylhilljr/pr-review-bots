@@ -1,5 +1,6 @@
 """Tests for prbot, the Claude Code guard hook and the Codex gh shim. Run: python3 -B -m unittest discover -s tests -t . -v"""
-import base64, importlib.util, json, os, shutil, subprocess, sys, tempfile, time, unittest
+import base64, importlib.util, json, os, shlex, shutil, subprocess, sys, tempfile, time, unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -130,6 +131,7 @@ class Classify(unittest.TestCase):
         for endpoint in ("graphql?x=1", "graphql/?x=1", "graphql#x", "https://api.github.com/graphql?x=1"):
             with self.subTest(endpoint=endpoint):
                 self.assertTrue(prbot.is_feedback_write(["api", endpoint, "-f", add]))
+        self.assertTrue(prbot.is_feedback_write(["api", "-XPOST", "repos/o/r/issues/1/comments#f", "-f", "body=x"]))
         self.assertFalse(prbot.is_feedback_write(["api", "graphql?x=1", "-f", "query=query { viewer { login } }"]))
         self.assertFalse(prbot.is_feedback_write(["api", "graphql?x=1", "-XGET", "-f", add]))
 
@@ -389,6 +391,253 @@ class ShellCommands(unittest.TestCase):
         self.assertEqual(prbot.unrouted_writes('gh pr comment 1 \\\n  -b "two\nlines"'),
                          [["pr", "comment", "1", "-b", "two\nlines"]])  # a quoted newline stays in the body
         self.assertEqual(self.count('echo "gh pr comment 1\n-b x"'), 0)
+
+
+class Guard(unittest.TestCase):
+    """guard_bash: the safe list the Claude Code hook applies to Bash commands that name gh, git or prbot."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mine = self.repo("kennylhilljr")
+        self.theirs = self.repo("someone-else")
+
+    def repo(self, owner):
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        subprocess.run(["git", "init", "-q", d], check=True)
+        subprocess.run(["git", "-C", d, "remote", "add", "origin", f"https://github.com/{owner}/demo.git"], check=True)
+        return d
+
+    def guard(self, command, cwd=None):
+        return prbot.guard_bash(command, cwd or self.mine, {"kennylhilljr"})
+
+    def test_safe_list_allows_reads_tests_and_routed_calls(self):
+        for command in (
+                "gh pr view 12 --json body,comments", "gh pr diff 12 | head -100", "gh pr list --state open",
+                "gh pr checks 12", "gh issue view 4 --comments", "gh issue list -l bug", "gh -R o/r pr view 1",
+                "gh pr view 1 -R o/r --json title --jq .title", "gh api repos/o/r/pulls/1",
+                "gh api -XGET repos/o/r/issues/1/comments", "gh api --method GET repos/o/r/issues",
+                "gh api repos/o/r/pulls --paginate --jq '.[].number'", "gh api -i repos/o/r", "gh search prs foo",
+                "gh run view 1 --log", "gh auth status", "gh --version",
+                "git status", "git log --oneline -5 origin/main..HEAD", "git diff origin/main...HEAD --stat",
+                "git show HEAD:prbot | head", "git rev-parse HEAD", "git -C sub status", "git --no-pager log -1",
+                "git add -A", "git checkout -b x", "git fetch -q origin", "git worktree add /tmp/x origin/main",
+                "git branch -a", "git config --get remote.origin.url", "git stash list",
+                "cat README.md | grep -n gh", "rg -n 'git push' DESIGN.md", "ls -la .git", "wc -l prbot",
+                "echo 'run gh pr comment later'", "gh pr view 1 2>&1 | jq .", "git log > /dev/null 2>&1",
+                "cd sub && git status && cd ..", "python3 -B -m unittest discover -s tests -t . -v",
+                "scripts/check.sh && git status", "./scripts/check.sh --check tests", "GH_PAGER=cat gh pr view 1",
+                "prbot gh claude -- pr comment 1 -b x", "./prbot git claude -- push origin main",
+                "bash -c 'prbot git claude -- push origin main'", "command -v gh", "which git",
+                "gh pr comment 1 -b '@codex review'", "gh pr close 3", "gh pr create -t x -b y",
+                "gh pr merge 3 --squash --delete-branch", "gh pr create --title x --body \"$(cat <<'EOF'\nbody\nEOF\n)\"",
+                "git log -1  # it's the last one", "gh pr view 1 <<< x"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command))
+
+    def test_commits_and_pushes_go_through_prbot_only_in_bot_repos(self):
+        for command in ("git push origin main", "git commit -m x", "git add -A && git commit -m x",
+                        "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"", "git merge x", "git pull", "git rebase main",
+                        "git cherry-pick abc", "git revert HEAD"):
+            with self.subTest(command=command):
+                self.assertTrue(self.guard(command)["git"])
+                self.assertIsNone(self.guard(command, self.theirs))
+        self.assertTrue(self.guard(f"git -C {shlex.quote(self.mine)} push", self.theirs)["git"])
+        self.assertTrue(self.guard(f"cd {shlex.quote(self.mine)} && git push", self.theirs)["git"])
+        self.assertTrue(self.guard("git push https://github.com/kennylhilljr/x.git main", self.theirs)["git"])
+        for command in ("cd $D && git push", "cd .. && cd - && git push", "git push", "git commit -m x",
+                        "git worktree add ../w && cd ../w && git push",
+                        "git clone https://github.com/kennylhilljr/x && cd x && git push",
+                        "git remote set-url origin https://github.com/kennylhilljr/x && git push origin"):
+            with self.subTest(command=command):
+                cwd = os.path.join(self.tmp.name, "missing") if command in ("git push", "git commit -m x") else self.theirs
+                self.assertIn("cannot tell which repository", self.guard(command, cwd)["reasons"][0])
+
+    def test_feedback_writes_are_named_for_the_routing_fix(self):
+        for command, args in (
+                ("gh pr comment 1 -b x", ["pr", "comment", "1", "-b", "x"]),
+                ("g\\h pr comment 1 -b x", ["pr", "comment", "1", "-b", "x"]),
+                ("'g'h pr comment 1 -b x", ["pr", "comment", "1", "-b", "x"]),
+                ("bash -c 'gh pr comment 1 -b x'", ["pr", "comment", "1", "-b", "x"]),
+                ("eval 'gh pr comment 1 -b x'", ["pr", "comment", "1", "-b", "x"]),
+                ("gh api repos/o/r/issues/1/comments -fbody=x", ["api", "repos/o/r/issues/1/comments", "-fbody=x"]),
+                ("gh pr comment 1 -b \"$(cat f)\"", ["pr", "comment", "1", "-b", "<run-time value>"])):
+            with self.subTest(command=command):
+                self.assertEqual(self.guard(command)["feedback"], [args])
+
+    def test_bypasses_found_in_review_are_blocked(self):
+        """Every reproducer from the deny-list review rounds on #4, and the obvious variants, is refused."""
+        commands = [
+            "# don't post yet\ngh pr comment 13 -b x  # it's fine", "# don't push yet\ngit push origin HEAD",
+            "gh $(true) pr comment 13 -b x", "git $(true) push origin HEAD", "gh >$(printf /dev/null) pr comment 13 -b x",
+            "env -C /repo git push", "env --chdir=/repo git push", "sudo -D /repo git push",
+            "gh api -XPOST 'repos/o/r/issues/1/comments#f' -f body=x", "echo \"$( # )\ngh pr comment 13 -b x\n)\"",
+            "echo start\ngh pr comment 1 -b hi", "echo hi\ngit push origin main",
+            "gh api repos/a/b/issues/1/comments -Fbody=@f", "gh api -XPATCH repos/o/r/issues/comments/1",
+            "for i in 1; do gh pr comment 1 -b x; done", "{ gh pr comment 1 -b x; }", "(gh pr comment 1 -b x)",
+            "env -i gh pr comment 1 -b x", "nohup gh pr comment 1 -b x", "`gh pr comment 1 -b x`",
+            "echo `gh pr comment 1 -b x`", "x=$(gh pr comment 1 -b x)", "time gh pr comment 1 -b x",
+            "xargs gh pr comment 1 -b < /dev/null", "env -S 'gh pr comment 1 -b x'", "gh pr view 1 > out.txt",
+            "gh api graphql -f query='mutation { addComment(input: {}) { clientMutationId } }'",
+            "gh api graphql --input q.json", "gh api -X POST repos/o/r/issues/1/comments",
+            "gh api repos/o/r/issues/1/comments -H 'X-HTTP-Method-Override: POST'", "gh label create x",
+            "git -c alias.x='!gh pr comment 1 -b x' x", "git --git-dir=/repo/.git push",
+            "git rebase -x 'gh pr comment 1 -b x' main", "git grep -Ogh pr", "git clone -u 'gh pr comment' u",
+            "git fetch --upload-pack='gh pr comment' origin", "git diff --output=/tmp/hook.py",
+            "git config alias.x '!gh'", "git x", "GH_TOKEN=t gh pr view 1", "PATH=/tmp gh pr view 1",
+            "gh pr view 1 && make post", "python3 -c \"import os; os.system('gh pr comment 1 -b x')\"",
+            "cat > post.sh <<'EOF'\ngh pr comment 1 -b x\nEOF", "if true; then git push origin main; fi",
+            "case x in x) gh pr comment 1 -b x;; esac", "gh pr view 1 'unclosed",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command))
+
+    def test_review_round_one_bypasses_are_blocked(self):
+        """Safe-list review round 1: case-insensitive names, bash -co, git long-option prefixes, globs in
+        unparseable text, remote URL variants, rg --pre and pushd -n."""
+        k = subprocess.run(["git", "-C", self.theirs, "remote", "add", "k", "git@github.com:KennyLHillJr/x.git"])
+        self.assertEqual(k.returncode, 0)
+        for command in (
+                "GH pr comment 1 -b hi", "Gh pr comment 1 -b hi", "GIT push https://github.com/kennylhilljr/x HEAD",
+                "bash -co pipefail 'gh pr comment 1 -b hi'", "bash -oc pipefail 'gh pr comment 1 -b hi'",
+                "sh -Oc extglob 'gh pr comment 1 -b hi'", "git clone --upl 'gh pr comment 1 -b hi #' /tmp/x y",
+                "git fetch --upl 'gh pr comment 1 -b hi #' /tmp/x", "git grep --open-f 'gh pr comment 1 -b x #' foo",
+                "git clone --conf core.sshCommand='gh pr comment 1 -b hi #' git@github.com:a/b.git",
+                "git rebase --exe 'gh pr comment 1 -b hi #' HEAD~1",
+                "f(){ :; }; /opt/homebrew/bin/g? pr comment 1 -b hi",
+                "case x in x) ;; esac; /opt/homebrew/bin/g[h] pr comment 1 -b hi",
+                "f(){ :; }; /opt/homebrew/bin/g* pr comment 1 -b hi",
+                "git push https://github.com/KennyLHillJr/foo.git HEAD", "git push https://GITHUB.COM/kennylhilljr/foo.git HEAD",
+                "git push https://github.com:443/kennylhilljr/foo.git HEAD",
+                "git push ssh://git@github.com:22/kennylhilljr/foo.git HEAD",
+                "git push -o x https://github.com/kennylhilljr/foo.git HEAD",
+                "git push --push-option x https://github.com/kennylhilljr/foo.git HEAD",
+                "git push https://github.com//kennylhilljr/foo.git HEAD", "git push k", "git push -o x k main",
+                "git push --repo=k", "git status; rg --pre sh . post.sh"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command, self.theirs))
+        for command in ("gh auth status --show-token", "git status; bash -c 'python3 x.py'"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command, self.theirs))
+        for command in ("pushd -n /tmp && git commit -m x", "pushd && git commit -m x"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command))
+
+    def test_review_round_two_bypasses_are_blocked(self):
+        """Safe-list review round 2: stdin path spellings, more shells, runners and xargs with run-time
+        commands, code stored for arithmetic, PS4 or ${x@P}, make with a makefile, cd that may not run, other
+        remotes and remote URL hosts, and env option clusters."""
+        fork = self.repo("someone-else")
+        subprocess.run(["git", "-C", fork, "remote", "add", "up", "https://github.com/kennylhilljr/demo.git"], check=True)
+        other = tempfile.mkdtemp(dir=self.tmp.name)
+        cases = [(c, other) for c in (
+            "printf '\\147h pr comment 1 -b hi' | bash /dev/./stdin", "printf '\\147h pr comment 1 -b hi' | sh /dev//stdin",
+            "printf '\\147h pr comment 1 -b hi' | source /dev/./stdin",
+            "a=$(printf '\\147h'); bash /dev/fd/3 3<<EOF2\n$a pr comment 1 -b hi\nEOF2",
+            "printf '\\147h pr comment 1 -b hi' | csh", "csh -c \"$(printf '\\147h pr comment 1 -b hi')\"",
+            "arch -arm64 $(printf '\\147h') pr comment 1 -b hi",
+            "find . -maxdepth 0 -exec $(printf '\\147h') pr comment 1 -b hi ';'",
+            "printf '\\147h\\0pr\\0comment\\0--help\\0' | xargs -0 nohup",
+            "x='a[$(gh pr comment 1 -b hi)]'; echo $((x))", "x='a[$(gh pr comment 1 -b hi)]'; echo $[x]",
+            "PS4='$(gh pr comment 1 -b hi) '; set -x; true", "x='$(gh pr comment 1 -b hi)'; echo \"${x@P}\"",
+            "make test -f /dev/stdin <<'EOF2'\ntest:\n\t@gh pr comment 1 -b hi\nEOF2",
+            "git push https://github.com./kennylhilljr/x.git main", "git push git@github-kenny:kennylhilljr/x.git main",
+            "git push ssh://git@140.82.112.3/kennylhilljr/x.git main", "y=g z=h env -iS '${y}${z} pr comment 1 -b hi'",
+            "xargs -tI{} {} pr comment 1", "x=$'\\x24(gh)'; [[ x -eq 1 ]]", "read x <<< '$(gh pr comment 1)'",
+            "python3 -c \"$CODE\"")]
+        cases += [(c, self.mine) for c in (
+            "false && cd /tmp; git commit -m x", "true || cd /tmp; git commit -m x", "cd /tmp & git commit -m x",
+            "cd /tmp | cat; git commit -m x", "echo $(cd /tmp); git commit -m x")]
+        cases += [("git push", fork), ("git pull", fork)]
+        for command, cwd in cases:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command, cwd))
+        for command in ("python3 x.py $f", "while IFS= read -r line; do echo \"$line\"; done < f", "echo $((1+2))",
+                        "IFS=$'\\n'; echo x", "git commit -m \"$(cat <<'EOF'\nmsg `code`\nEOF\n)\"",
+                        "x=$(date); echo $x", "find . -name '*.pyc' -delete", "gh repo clone o/r", "gh pr ready 3"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command, other))
+
+    def test_review_round_three_bypasses_are_blocked(self):
+        """Safe-list review round 3: for-do bodies, escaped braces in ${...}, arithmetic on subscripts, logical
+        cd, gh repo clone, branch remotes given as URLs, commits in repos whose only bot remote is not origin."""
+        plain = os.path.join(self.tmp.name, "plain")
+        os.mkdir(plain)
+        os.symlink(plain, os.path.join(self.mine, "link"))
+        empty = tempfile.mkdtemp(dir=self.tmp.name)
+        branch = self.repo("someone-else")
+        subprocess.run(["git", "-C", branch, "config", "branch.main.remote", "https://github.com/kennylhilljr/x.git"],
+                       check=True)
+        upstream = tempfile.mkdtemp(dir=self.tmp.name)
+        subprocess.run(["git", "init", "-q", upstream], check=True)
+        subprocess.run(["git", "-C", upstream, "remote", "add", "upstream", "https://github.com/kennylhilljr/x.git"],
+                       check=True)
+        cases = [(c, self.theirs) for c in (
+            "for x do gh pr comment 1 -b hi; done", "echo ${x:-\\{} ; gh pr comment 1 -b hi ; echo }",
+            "let 'a[$($(printf \"\\147h\") pr comment 1 -b hi)]'", "unset 'a[$($(printf \"\\147h\") pr comment 1 -b hi)]'",
+            "[[ 'a[$($(printf \"\\147h\") pr comment 1 -b hi)]' -eq 0 ]]", "test -v 'a[$(gh pr comment 1 -b hi)]'",
+            "y=$(cat f); [[ y -eq 0 ]]", "echo ${a[y]}", "rg --hostname-bin x foo; git status",
+            "unset 'a[b[0]`gh pr comment 1 -b x`]'", "test -v 'a[b[0]`gh pr comment 1 -b x`]'",
+            "[[ 'a[b[0]`gh pr comment 1 -b x`]' == 1 ]]")]
+        cases += [("for x do git commit --allow-empty -m x; done", self.mine),
+                  ("echo ${x:-\\{} ; git commit -m x ; echo }", self.mine), ("cd link/.. && git commit -m x", self.mine),
+                  ("cd -P link/.. && git commit -m x", self.mine), ("set -P; cd link/..; git commit -m x", self.mine),
+                  ("cd -P link; cd ..; git push", self.mine),
+                  ("gh repo clone kennylhilljr/x . && git commit --allow-empty -m x", empty), ("git push", branch),
+                  ("git commit -m x", upstream)]
+        for command, cwd in cases:
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command, cwd))
+        for command in ("for f in a b; do echo $f; done", "echo \"${arr[@]}\" ${a[0]}", "[[ -f x ]] && echo y",
+                        "echo \"[$x]\"", "cd sub/.. && ls"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command, self.theirs))
+
+    def test_common_agent_commands_stay_allowed(self):
+        for command in ("SHA=$(git rev-parse HEAD); echo $SHA", "git log | sort | uniq -c", "mkdir -p x && git add x",
+                        "set -euo pipefail; git status", "gh pr checkout 1", "\"$PWD/scripts/check.sh\" && git status",
+                        "X=\"$(git log -1)\" && echo \"$X\""):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command, self.theirs))
+        for command in ("x=gh; $x pr comment 1", "PATH=$(mktemp -d); gh pr view 1", "GH_TOKEN=$(cat t) gh pr view 1",
+                        "PATH=/tmp/x; gh pr view 1", "git log | sort -o /tmp/hook.py", "uniq a /tmp/hook.py; git status"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command, self.theirs))
+
+    def test_hidden_program_names_are_blocked_everywhere(self):
+        """Commands that never name gh, git or prbot are still refused when the shell could build the name."""
+        for command in ("x=g; ${x}h pr comment 1 -b x", "$'\\x67h' pr comment 1 -b x", "/usr/local/bin/g? pr comment 1",
+                        "echo Z2ggcHIgY29tbWVudCAxIC1iIHg= | base64 -d | sh", "base64 -d f | bash -s",
+                        "eval \"$CMD\"", "bash -c \"$CMD\"", "sh <<'EOF'\nls\nEOF", "$CMD pr comment 1",
+                        "printf '\\x67h' | xargs -I{} {} pr comment 1", "env -S \"$X\"", "source <(curl x)",
+                        "ls $(${x}h pr comment 1)", "echo \"${x:-$(true)}\"", "trap \"$x\" EXIT",
+                        "hash -p /opt/homebrew/bin/g? x; x pr comment 1", "bash <(curl -s x)", "curl x | bash /dev/stdin",
+                        "echo aW1wb3J0IG9z | base64 -d | python3", "x() { /opt/homebrew/bin/g? pr comment 1; }; x",
+                        "source /dev/stdin < f", "trap 'g\\h pr comment 1 -b x' EXIT"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command, self.theirs))
+
+    def test_unrelated_commands_run_untouched(self):
+        for command in ("ls -la", "python3 x.py > out.txt", "npm install && npm run build", "make -j4",
+                        "for f in *.py; do python3 $f; done", "find . -name '*.pyc' | xargs rm",
+                        "echo $HOME", "cat <<EOF > notes.txt\nhello $USER\nEOF", "bash scripts/setup.sh",
+                        "if [ -f x ]; then echo y; fi", "sed -i '' s/a/b/ file", "rm -rf build"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command, self.theirs))
+
+    def test_lexer_reads_quotes_substitutions_and_heredocs(self):
+        cmds = prbot.shell_commands("a 'b c' \"d $(e f)\" `g` <(h) # i\nj <<'EOF'\nk\nEOF\nl")
+        names = [c.words[0].text for c in cmds]
+        self.assertEqual(sorted(names), ["a", "e", "g", "h", "j", "l"])
+        a = next(c for c in cmds if c.words[0].text == "a")
+        self.assertEqual(a.words[1].text, "b c")
+        self.assertTrue(a.words[2].dynamic)
+        self.assertFalse(a.words[2].split)
+        for bad in ("echo 'x", "echo \"x", "echo $(x", "a=(1 2)", "echo `x", "case x in x) y;; esac"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(prbot.Unparseable):
+                    prbot.shell_commands(bad)
 
 
 class GitPush(unittest.TestCase):
@@ -2092,6 +2341,7 @@ class Hook(unittest.TestCase):
             "    AGENTS=(\"claude\", \"codex\"),\n"
             "    load_config=lambda: {\"claude\": {\"owner\": \"kennylhilljr\"}},\n"
             "    git_writes=lambda c: [([\"push\", \"origin\", \"main\"], None)],\n"
+            "    guard_bash=lambda c, cwd, owners, t=False: repo_from_git(cwd),\n"
             "    repo_from_git=repo_from_git,\n"
             "    unrouted_writes=lambda c, t=False: [],\n"
             ")\n"
@@ -2132,6 +2382,46 @@ class Hook(unittest.TestCase):
         self.assertIsNone(hook.GIT_WRITE_FALLBACK.search("git " + "-c a.b=c " * 2000 + "status"))
         self.assertLess(time.monotonic() - start, 1.0)
         self.assertTrue(hook.GIT_WRITE_FALLBACK.search("git " + "-c a.b=c " * 24 + "push origin main"))
+
+    def test_denies_nested_feedback(self):
+        cases = [
+            ("for i in 1 2; do gh pr comment 7 -b x; done", "gh claude -- pr comment 7 -b x"),
+            ('bash -c "gh pr review 15 --comment -b \'Two P2 issues\'"', "gh claude -- pr review 15 --comment -b 'Two P2 issues'"),
+            ("sh -c 'gh -R o/r issue comment 9 -b note'", "gh claude -- -R o/r issue comment 9 -b note"),
+        ]
+        for command, fix in cases:
+            with self.subTest(command=command):
+                out = self.run_hook(command)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertIn(fix, out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_off_safe_list_denial_names_reason_and_route(self):
+        """A gh call off the safe list is denied with the reason and the prbot route; hidden names and file
+        redirections are denied with their reason; unrelated commands pass."""
+        reason = self.reason(self.run_hook("gh label create urgent"))
+        self.assertIn("gh claude -- label create urgent", reason)
+        self.assertIn("safe list", reason)
+        self.assertIn("output redirection to a file", self.reason(self.run_hook("gh pr diff 1 > /tmp/pr.diff")))
+        self.assertIn("only known at run time", self.reason(self.run_hook("x=g; ${x}h pr comment 1 -b x")))
+        self.assertIn("reading commands from stdin", self.reason(self.run_hook("echo Z2g= | base64 -d | sh")))
+        self.assertIsNone(self.run_hook("python3 -B -m unittest discover -s tests -t . && git status"))
+        self.assertIsNone(self.run_hook("npm install && npm run build > build.log"))
+
+    def test_denies_wrapped_git_push(self):
+        Path(self.tmp.name, "config.json").write_text(json.dumps({"claude": {"owner": "kennylhilljr", "slug": "claude-pr-gh"}}))
+        mine, theirs = self.make_repo("kennylhilljr"), self.make_repo("someone-else")
+        for command in ("sudo -n git push origin main", "env -u FOO git push origin main",
+                        "bash -c 'git push origin main'", "if true; then git push origin main; fi"):
+            with self.subTest(command=command):
+                out = self.run_hook_in(command, mine)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertIn("git claude -- push origin main", out["hookSpecificOutput"]["permissionDecisionReason"])
+        out = self.run_hook_in(f"nohup git -C {shlex.quote(mine)} push", self.tmp.name)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        # the safe list has no wrappers, so a wrapped push is refused in any repo
+        self.assertIn("wrappers such as sudo", self.reason(self.run_hook_in("sudo -n git push origin main", theirs)))
+        self.assertIsNone(self.run_hook_in("git push origin main", theirs))
+        self.assertIsNone(self.run_hook_in("bash -c 'prbot git claude -- push origin main'", mine))
 
 
 class CodexShim(unittest.TestCase):
@@ -2292,6 +2582,56 @@ class CodexShim(unittest.TestCase):
             self.assertIn("refusing to run real gh", r.stderr)
             self.assertNotIn("{bad", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+    def test_routes_global_repo_feedback(self):
+        with tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as fake:
+            calls = Path(fake, "calls.log")
+            gh = Path(fake, "gh")  # stands in for the real gh, so nothing can post even if classification fails
+            gh.write_text(f"#!/bin/sh\necho \"$@\" >> {shlex.quote(str(calls))}\nexit 0\n")
+            gh.chmod(0o755)
+            env = dict(os.environ, PRBOT_CONFIG_DIR=cfg, PRBOT_BOT="codex",
+                       PATH=os.pathsep.join([str(ROOT / "integrations/codex/bin"), fake, os.environ["PATH"]]))
+            env.pop("PRBOT_ACTIVE", None)
+            r = subprocess.run(["gh", "-R", "o/r", "pr", "comment", "1", "-b", "x"], capture_output=True, text=True, env=env)
+            self.assertFalse(calls.exists(), "the shim passed a feedback write to gh")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("bot 'codex' is not registered", r.stderr)
+
+
+class GuardDocs(unittest.TestCase):
+    @staticmethod
+    def norm(text):
+        return " ".join(text.replace("`", "").split())
+
+    def between(self, name, start, end):
+        text = (ROOT / name).read_text()
+        a = text.index(start)
+        return self.norm(text[a:text.index(end, a + len(start))])
+
+    def test_feedback_scope(self):
+        readme = self.between("README.md", "The hook denies", "\n\n")
+        enforcement = self.between("DESIGN.md", "## Enforcement", "\n## ")
+        flow = self.between("DESIGN.md", "## How a post becomes a bot post", "\n## ")
+        for name, text in (("README hook paragraph", readme), ("DESIGN Enforcement", enforcement)):
+            with self.subTest(section=name):
+                self.assertIn("feedback", text)
+                self.assertIn("safe list", text)
+                self.assertIn("@codex", text)
+                self.assertIn("gh pr create, gh issue create, gh pr merge and gh pr edit", text)
+                self.assertIn("sh -c", text)
+                self.assertIn("output redirection to a file", text)
+                self.assertIn("xargs -I", text)
+                self.assertIn("not a sandbox", text)
+        for phrase in ("gh pr close and gh issue close with -c/--comment", "query=@file", "--input file",
+                       "as a write", "graphql", "#fragment", "shell_commands"):
+            self.assertIn(phrase, enforcement)
+        self.assertIn("PR or issue feedback?", flow)
+        for name in ("README.md", "DESIGN.md"):
+            text = self.norm((ROOT / name).read_text())
+            with self.subTest(doc=name):
+                self.assertNotIn("any gh command that writes to a PR or issue", text)
+                self.assertNotIn("write to a PR?", text)
+                self.assertNotIn("not a full shell parser", text)
 
 
 STATE_ATTRS = ("CONFIG_DIR", "CONFIG", "WATCH_STATE", "QUEUE_DIR", "OPENCLAW_EVENTS")

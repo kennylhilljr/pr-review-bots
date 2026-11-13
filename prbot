@@ -37,7 +37,7 @@ PERMISSIONS = {"pull_requests": "write", "issues": "write", "contents": "read", 
 
 WRITE_SUBCOMMANDS = {("pr", "review"), ("pr", "comment"), ("issue", "comment")}
 CLOSE_SUBCOMMANDS = {("pr", "close"), ("issue", "close")}  # feedback only when they carry -c/--comment
-FEEDBACK_PATH = re.compile(r"/(comments|reviews|replies)(/|$|\?)|/reviews/\d+/(events|dismissals)")
+FEEDBACK_PATH = re.compile(r"/(comments|reviews|replies)(/|$|\?|#)|/reviews/\d+/(events|dismissals)")
 FEEDBACK_MUTATION = re.compile(r"\b(addPullRequestReview\w*|submitPullRequestReview|addComment|updateIssueComment|"
                                r"updatePullRequestReview\w*|resolveReviewThread|unresolveReviewThread|"
                                r"deleteIssueComment|deletePullRequestReview\w*|dismissPullRequestReview|"
@@ -561,6 +561,921 @@ def unrouted_writes(command, codex_triggers_as_bot=False):
     return [args for args, routed in gh_calls(command)
             if not routed and is_feedback_write(args, codex_triggers_as_bot)]
 
+# ---------- the Bash guard: a safe-list over one strict shell lexer ----------
+#
+# The Claude Code hook asks guard_bash() about every Bash command. A command whose text names gh, git or prbot
+# runs only when every simple command in it is on the safe list below. Anything the lexer can't read, any
+# if/for/while block, subshell or { } group, wrapper (env, sudo, xargs, nohup, ...), output redirection to a
+# file, or program it doesn't know is refused. Any command at all is refused when shell indirection could build
+# a program name the text never shows: a program name made at run time ($x, ${x}h, $'\x67h', a glob), eval or
+# sh -c with non-literal content, a shell reading commands from stdin, xargs -I and env -S.
+
+class Unparseable(Exception):
+    pass
+
+
+# case-insensitive: the default macOS volume finds the gh binary for GH or Gh too
+GUARD_MENTION = re.compile(r"(?<![A-Za-z0-9_])(gh|git|prbot)(?![A-Za-z0-9_])", re.I)
+# when the lexer gives up, a command is still allowed only if none of these appear in it
+GUARD_SUSPICIOUS = re.compile(r"[$`*?\[{]|\(\(|(?<![A-Za-z0-9_.-])(eval|exec|source|xargs|env|sudo|command|builtin|"
+                              r"sh|bash|zsh|dash|ksh|fish)(?![A-Za-z0-9_.-])|(?:^|[\s;&|(])\.\s")
+GUARD_RESERVED = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "in", "{", "}", "!",
+                  "[[", "]]", "time"}
+GUARD_UNSUPPORTED = {"case", "esac", "select", "function", "coproc"}
+GUARD_REDIRECT = re.compile(r"([0-9]+)?(&>>|&>|>>|>\||>&|<<<|<<-|<<|<>|<&|>|<)")
+GUARD_MAX_DEPTH = 8
+DYN = "\0"  # stands for a part of a word that is only known at run time
+
+
+class Word:
+    __slots__ = ("text", "dynamic", "split", "quoted", "glob", "ansi", "body", "raw")
+
+    def __init__(self):
+        self.text, self.dynamic, self.split, self.quoted, self.glob = "", False, False, False, False
+        self.ansi, self.body, self.raw = False, None, ""  # ansi: has a $'...' part; body: here-document text
+
+    def __repr__(self):
+        return f"Word({self.text!r}{', dynamic' if self.dynamic else ''})"
+
+
+class SimpleCommand:
+    __slots__ = ("words", "assigns", "redirects", "piped", "complex", "op_before", "op_after", "nested",
+                 "dbl_bracket")
+
+    def __init__(self, piped=False, complex_=False, op_before=None, nested=False):
+        self.words, self.assigns, self.redirects = [], [], []
+        self.piped, self.complex, self.op_before, self.op_after = piped, complex_, op_before, None
+        self.nested = nested  # inside $( ), backticks, <( ) or >( ): runs in a subshell
+        self.dbl_bracket = False  # starts with [[
+
+    def empty(self):
+        return not (self.words or self.assigns or self.redirects)
+
+
+class _Lexer:
+    """Reads a bash command string into simple commands, the ones inside $( ), ` `, <( ) and >( ) included,
+    or raises Unparseable for anything it does not fully understand."""
+
+    def __init__(self, src, depth=0):
+        if depth > GUARD_MAX_DEPTH:
+            raise Unparseable("nested too deeply")
+        self.src, self.i, self.depth, self.out, self.heredocs = src, 0, depth, [], []
+
+    def peek(self, k=0):
+        j = self.i + k
+        return self.src[j] if j < len(self.src) else ""
+
+    def parse(self):
+        self.parse_list(None, False)
+        if self.heredocs:
+            self.read_heredocs()
+        return self.out
+
+    def finish(self, cmd):
+        if not cmd.empty():
+            cmd.nested = cmd.nested or self.depth > 0
+            self.out.append(cmd)
+
+    def parse_list(self, stop, complex_):
+        cmd = SimpleCommand(complex_=complex_)
+        skip_words = False  # after `for`: the loop variable and its word list are not commands
+        while True:
+            self.skip_blanks()
+            c = self.peek()
+            if not c:
+                if stop:
+                    raise Unparseable("unclosed parenthesis")
+                self.finish(cmd)
+                return
+            if c == "#":
+                while self.peek() and self.peek() != "\n":
+                    self.i += 1
+                continue
+            if c == "\n":
+                self.i += 1
+                cmd.op_after = "\n"
+                self.finish(cmd)
+                self.read_heredocs()
+                cmd, skip_words = SimpleCommand(complex_=complex_, op_before="\n"), False
+                continue
+            if c == ")":
+                if stop != ")":
+                    raise Unparseable("unmatched )")
+                self.i += 1
+                self.finish(cmd)
+                return
+            m = GUARD_REDIRECT.match(self.src, self.i)
+            if m and not (c in "<>" and self.peek(1) == "("):
+                self.i = m.end()
+                self.redirect(cmd, m.group(2))
+                continue
+            if c in ";&|":
+                op = c
+                if self.peek(1) in ("&", "|", ";") and self.src[self.i:self.i + 2] in ("&&", "||", ";;", "|&"):
+                    op = self.src[self.i:self.i + 2]
+                if op == ";;":
+                    raise Unparseable("case statements are not supported")
+                self.i += len(op)
+                cmd.op_after = op
+                self.finish(cmd)
+                cmd, skip_words = SimpleCommand(piped=op in ("|", "|&"), complex_=complex_, op_before=op), False
+                continue
+            if c == "(":
+                if cmd.words or cmd.assigns:
+                    raise Unparseable("unexpected (")
+                self.i += 1
+                if self.peek() == "(":
+                    raise Unparseable("arithmetic commands are not supported")
+                self.parse_list(")", True)
+                cmd.complex = True
+                continue
+            start = self.i
+            word = self.read_word()
+            if skip_words:
+                if not word.quoted and not word.dynamic and word.text == "do":
+                    skip_words = False  # for x do CMD; done: the body starts here
+                continue
+            if not cmd.words and not word.quoted and not word.dynamic:
+                if word.text in GUARD_UNSUPPORTED:
+                    raise Unparseable(f"`{word.text}` is not supported")
+                if word.text in GUARD_RESERVED:
+                    if word.text == "[[":
+                        cmd.dbl_bracket = True
+                    cmd.complex = complex_ = True
+                    skip_words = word.text == "for"
+                    continue
+            # NAME=value before the program is an assignment when NAME= itself is unquoted, whatever the value
+            if not cmd.words and re.match(r"[A-Za-z_][A-Za-z0-9_]*\+?=", self.src[start:self.i]):
+                cmd.assigns.append(word)
+                continue
+            cmd.words.append(word)
+
+    def skip_blanks(self):
+        while True:
+            c = self.peek()
+            if c in (" ", "\t"):
+                self.i += 1
+            elif c == "\\" and self.peek(1) == "\n":
+                self.i += 2
+            else:
+                return
+
+    def redirect(self, cmd, op):
+        self.skip_blanks()
+        if not self.peek() or self.peek() in "\n;&|()<>":
+            raise Unparseable(f"redirection {op} without a target")
+        target = self.read_word()
+        if op in ("<<", "<<-"):
+            self.heredocs.append((target, op == "<<-"))
+        cmd.redirects.append((op, target))
+
+    def read_heredocs(self):
+        """Consume the bodies of the here-documents opened on the line that just ended."""
+        pending, self.heredocs = self.heredocs, []
+        for target, strip_tabs in pending:
+            delim = target.text
+            if target.dynamic:
+                raise Unparseable("here-document delimiter is not literal")
+            body = []
+            while self.i < len(self.src):
+                end = self.src.find("\n", self.i)
+                end = len(self.src) if end < 0 else end
+                line = self.src[self.i:end]
+                self.i = min(end + 1, len(self.src))
+                if (line.lstrip("\t") if strip_tabs else line) == delim:
+                    break
+                body.append(line)
+            text = "\n".join(body)
+            target.body = text
+            # an unquoted delimiter means the body is expanded, so $( ) and backticks in it run commands
+            if not target.quoted and ("`" in text or "$(" in text or "${" in text):
+                raise Unparseable("here-document with command substitution")
+
+    def read_word(self):
+        w, unquoted, start = Word(), [], self.i
+        try:
+            return self._read_word(w, unquoted)
+        finally:
+            w.raw = self.src[start:self.i]
+
+    def _read_word(self, w, unquoted):
+        while True:
+            c = self.peek()
+            if not c or c in " \t\n;&|)":
+                break
+            if c in "<>":
+                if self.peek(1) == "(":
+                    self.i += 2
+                    self.nested(w)
+                    continue
+                break
+            if c == "(":
+                raise Unparseable("unexpected ( inside a word")
+            if c == "\\":
+                if self.peek(1) == "\n":
+                    self.i += 2
+                    continue
+                if not self.peek(1):
+                    raise Unparseable("trailing backslash")
+                w.text += self.peek(1)
+                w.quoted = True
+                self.i += 2
+                continue
+            if c == "'":
+                end = self.src.find("'", self.i + 1)
+                if end < 0:
+                    raise Unparseable("unclosed single quote")
+                w.text += self.src[self.i + 1:end]
+                w.quoted = True
+                self.i = end + 1
+                continue
+            if c == '"':
+                self.i += 1
+                self.double_quoted(w)
+                w.quoted = True
+                continue
+            if c == "$":
+                self.dollar(w, in_dq=False)
+                continue
+            if c == "`":
+                self.backtick(w, in_dq=False)
+                continue
+            unquoted.append(c)
+            w.text += c
+            self.i += 1
+        bare = "".join(unquoted)
+        # a pattern the shell may expand into other words: * and ?, a [..] class, or a {a,b} / {1..3} brace
+        w.glob = bool(re.search(r"[*?]|\[[^\]]*\]|\{[^}]*(,|\.\.)[^}]*\}", bare))
+        return w
+
+    def double_quoted(self, w):
+        while True:
+            c = self.peek()
+            if not c:
+                raise Unparseable("unclosed double quote")
+            if c == '"':
+                self.i += 1
+                return
+            if c == "\\":
+                n = self.peek(1)
+                if n == "\n":
+                    self.i += 2
+                    continue
+                w.text += n if n in '$`"\\' else "\\" + n
+                self.i += 2
+                continue
+            if c == "$":
+                self.dollar(w, in_dq=True)
+                continue
+            if c == "`":
+                self.backtick(w, in_dq=True)
+                continue
+            w.text += c
+            self.i += 1
+
+    def mark(self, w, in_dq):
+        w.text += DYN
+        w.dynamic = True
+        if not in_dq:
+            w.split = True
+
+    def nested(self, w, in_dq=False):
+        """$( ), <( ) or >( ) body: its commands run too, and the word's value is unknown."""
+        sub = _Lexer(self.src, self.depth + 1)
+        sub.i = self.i
+        sub.parse_list(")", False)
+        if sub.heredocs:
+            raise Unparseable("here-document inside a substitution without a newline")
+        self.i = sub.i
+        self.out.extend(sub.out)
+        self.mark(w, in_dq)
+
+    def dollar(self, w, in_dq):
+        n = self.peek(1)
+        if n == "(":
+            if self.peek(2) == "(":
+                end = self.src.find("))", self.i + 3)
+                if end < 0:
+                    raise Unparseable("unclosed $((")
+                inner = self.src[self.i + 3:end]
+                # a name in arithmetic is evaluated again, so a variable holding 'a[$(cmd)]' runs cmd
+                if "$(" in inner or "`" in inner or "(" in inner or re.search(r"[A-Za-z_]", inner):
+                    raise Unparseable("arithmetic expansion with names")
+                self.i = end + 2
+                self.mark(w, in_dq)
+                return
+            self.i += 2
+            self.nested(w, in_dq)
+            return
+        if n == "[":
+            raise Unparseable("$[ ] arithmetic is not supported")
+        if n == "{":
+            depth, j = 0, self.i + 1
+            while j < len(self.src):
+                if self.src[j] == "\\":
+                    raise Unparseable("backslash inside ${...}")
+                if self.src[j] == "{":
+                    depth += 1
+                elif self.src[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            else:
+                raise Unparseable("unclosed ${")
+            inner = self.src[self.i + 2:j]
+            if "$" in inner or "`" in inner or "'" in inner or '"' in inner or "(" in inner or re.search(
+                    r"@[A-Za-z]$|\[[^\]]*[A-Za-z_]", inner):  # a[name] is arithmetic: name's value is evaluated
+                raise Unparseable("complex parameter expansion")  # ${x@P} expands prompt codes, $(...) included
+            self.i = j + 1
+            self.mark(w, in_dq)
+            return
+        if n == "'" and not in_dq:
+            j = self.i + 2
+            while j < len(self.src) and self.src[j] != "'":
+                j += 2 if self.src[j] == "\\" else 1
+            if j >= len(self.src):
+                raise Unparseable("unclosed $'")
+            self.i = j + 1
+            self.mark(w, True)  # one word, value decoded at run time
+            w.ansi = True
+            return
+        if n == '"' and not in_dq:
+            self.i += 2
+            self.double_quoted(w)
+            self.mark(w, True)
+            return
+        m = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]").match(self.src, self.i + 1)
+        if m:
+            self.i = m.end()
+            self.mark(w, in_dq)
+            return
+        w.text += "$"
+        self.i += 1
+
+    def backtick(self, w, in_dq):
+        j, body = self.i + 1, []
+        while j < len(self.src) and self.src[j] != "`":
+            if self.src[j] == "\\" and j + 1 < len(self.src) and self.src[j + 1] in "`$\\":
+                body.append(self.src[j + 1])
+                j += 2
+                continue
+            body.append(self.src[j])
+            j += 1
+        if j >= len(self.src):
+            raise Unparseable("unclosed backtick")
+        self.out.extend(_Lexer("".join(body), self.depth + 1).parse())
+        self.i = j + 1
+        self.mark(w, in_dq)
+
+
+def shell_commands(command):
+    """Every simple command in a bash command string, the ones in substitutions included. Raises Unparseable."""
+    return _Lexer(command).parse()
+
+
+def _mentions_guarded(command):
+    """True when the text names gh, git or prbot once quotes, backslashes and line continuations are removed."""
+    return GUARD_MENTION.search(re.sub(r"[\\'\"]", "", command.replace("\\\n", ""))) is not None
+
+
+# wrappers that run the program named after their own options; value: options that take an operand
+GUARD_WRAPPERS = {
+    "env": ("-u", "--unset"), "nohup": (), "nice": ("-n", "--adjustment"), "command": (), "builtin": (),
+    "exec": ("-a",), "sudo": ("-u", "-g", "-U", "-h", "-p", "-C", "-T", "--user", "--group"),
+    "timeout": ("-s", "-k", "--signal", "--kill-after"), "gtimeout": ("-s", "-k", "--signal", "--kill-after"),
+    "stdbuf": ("-i", "-o", "-e"), "caffeinate": ("-t", "-w"), "time": (),
+    "xargs": ("-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-lines", "--max-procs",
+              "--max-chars", "--delimiter", "--arg-file", "--eof"),
+}
+# wrapper options after which the program can't be known from the text: they change the directory, split a
+# string into a command, or substitute arguments into the command
+GUARD_OPAQUE = {"env": ("-S", "--split-string", "-C", "--chdir", "-P"), "sudo": ("-D", "--chdir", "-s", "-i"),
+                "xargs": ("-I", "-J", "-i", "--replace")}
+# builtins that store a command or a program path for later: run-time or glob text in them can hide gh
+GUARD_EVAL_LIKE = ("trap", "alias", "hash", "enable", "complete", "bind")
+GUARD_STDIN_PATHS = ("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0")
+GUARD_INTERPRETERS = r"python[0-9.]*|perl[0-9.]*|ruby|node|nodejs|deno|bun|php|lua|tclsh|osascript|Rscript"
+GUARD_SHELLS = ("sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "rbash", "ash", "mksh", "pdksh", "yash",
+                "posh", "oksh", "loksh", "busybox", "elvish", "nu", "xonsh", "pwsh", "rc", "es")
+# programs that run a command named in their arguments; run-time text there could be gh
+GUARD_RUNNERS = {"arch", "find", "setsid", "watch", "script", "flock", "xcrun", "ssh", "awk", "gawk", "nawk", "mawk",
+                 "parallel", "chroot", "doas", "unbuffer", "expect", "osascript", "at", "batch", "launchctl", "su",
+                 "runuser", "unshare", "nsenter", "sandbox-exec", "ionice", "taskset", "chrt", "prlimit",
+                 "systemd-run", "open", "dtruss", "lldb", "gdb", "strace", "ltrace", "valgrind", "sem"}
+GUARD_RISKY_VARS = {"PATH", "IFS", "HOME", "XDG_CONFIG_HOME", "CDPATH"}
+# variables whose value bash runs or expands as code: refused in every command
+GUARD_CODE_VARS = {"PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
+# builtins that store text in a variable; text holding $( or a backtick there can run later through arithmetic
+# (a[$(cmd)]), PS4 or ${x@P}
+# builtins that read a variable name, subscript included, so a[...] in their arguments is evaluated
+GUARD_ARITH_NAMES = {"test", "[", "unset", "let", "declare", "typeset", "local", "export", "readonly", "read",
+                     "printf", "mapfile", "readarray", "wait"}
+GUARD_STORES = {"read", "mapfile", "readarray", "printf", "declare", "typeset", "local", "export", "readonly"}
+GUARD_SAFE_ENV = {"GH_PAGER", "PAGER", "GIT_PAGER", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "LC_ALL", "LANG",
+                  "TERM", "GH_NO_UPDATE_NOTIFIER", "GH_PROMPT_DISABLED", "GH_REPO"}
+# programs that neither start another program nor write a file, so they may sit next to gh, git and prbot
+GUARD_SAFE_PROGRAMS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "echo", "printf", "pwd",
+                       "true", "false", "test", "[", "which", "type", "stat", "cmp", "cut", "tr", "basename",
+                       "dirname", "realpath", "readlink", "date", "whoami", "id", "uname", "du", "df", "jq", "sleep",
+                       "nl", "column", "cd", "pushd", "popd", "sort", "uniq", "mkdir", "set", "touch"}
+GUARD_TEST_MODULES = ("unittest", "pytest", "py_compile", "json.tool")
+GH_SAFE = {("pr", "view"), ("pr", "diff"), ("pr", "list"), ("pr", "checks"), ("pr", "status"),
+           ("issue", "view"), ("issue", "list"), ("issue", "status"), ("repo", "view"), ("run", "view"),
+           ("run", "list"), ("run", "watch"), ("workflow", "list"), ("workflow", "view"), ("release", "list"),
+           ("release", "view"), ("label", "list"), ("auth", "status")}
+GH_SAFE_GROUPS = ("search",)
+# write commands that are not PR or issue feedback; the guard leaves them on the user's account, as before
+GH_UNGUARDED = {("pr", "create"), ("issue", "create"), ("pr", "merge"), ("pr", "edit"), ("pr", "checkout"),
+                ("pr", "ready"), ("repo", "clone")}
+# options whose value may be a double-quoted $(...) such as a heredoc message: one word, so it can't add options
+GUARD_MESSAGE_OPTIONS = ("-m", "--message", "-F", "--file", "-b", "--body", "-t", "--title", "--body-file")
+GIT_SAFE_GLOBALS = ("--no-pager", "-P", "--no-optional-locks", "--literal-pathspecs", "--glob-pathspecs",
+                    "--noglob-pathspecs", "--icase-pathspecs", "--no-replace-objects", "--version", "--help")
+GIT_READ = {"status", "log", "diff", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "blame",
+            "describe", "shortlog", "merge-base", "show-ref", "for-each-ref", "grep", "diff-tree", "diff-files",
+            "diff-index", "name-rev", "count-objects", "check-ignore", "check-attr", "whatchanged", "range-diff",
+            "cherry", "version", "reflog"}
+# local work that makes no commit and talks to no remote as the user, except fetch and clone, which only read
+GIT_LOCAL = {"add", "rm", "mv", "restore", "checkout", "switch", "reset", "clean", "apply", "init", "stash",
+             "worktree", "branch", "tag", "remote", "fetch", "clone"}
+# commits and pushes: through prbot in the bots' repos, as the user elsewhere
+GIT_IDENTITY = {"commit", "push", "merge", "pull", "rebase", "cherry-pick", "revert", "am", "commit-tree", "notes"}
+# options that make git run a program named on the command line, or write a file the guard has to protect
+GIT_RUNS_PROGRAM = ("--upload-pack", "--receive-pack", "--exec", "--output", "--open-files-in-pager", "--config",
+                    "--template", "--ext-diff", "--extcmd", "--tool")
+GIT_RUNS_PROGRAM_SHORT = {"clone": "cu", "grep": "O", "rebase": "x", "pull": "", "fetch": "", "push": ""}
+REMOTE_URL = re.compile(r"github\.com(?::[0-9]+)?[:/]+([^/\s:]+)/", re.I)
+
+
+class _Guard:
+    def __init__(self, cwd, owners, codex_triggers_as_bot):
+        self.dir, self.owners, self.codex = cwd, {o.lower() for o in owners}, codex_triggers_as_bot
+        self.feedback, self.gh_other, self.git, self.reasons = [], [], [], []
+        self.repo_changed = False  # an earlier git clone/init/worktree/remote may have made a bot repo
+        self.cd_seen = False
+        self.physical = False  # set -P or set -o physical: later cds resolve symlinks first
+
+    def block(self, reason):
+        if reason not in self.reasons:
+            self.reasons.append(reason)
+
+    def run(self, command, depth=0, relevant=False):
+        try:
+            cmds = shell_commands(command)
+        except Unparseable as e:
+            if _mentions_guarded(command) or GUARD_SUSPICIOUS.search(command):
+                self.block(f"the guard cannot read this command ({e})")
+            return
+        relevant = relevant or _mentions_guarded(command)  # sh -c text inside a strict command stays strict
+        for cmd in cmds:
+            self.command(cmd, relevant, depth)
+
+    def command(self, cmd, relevant, depth):
+        words = cmd.words
+        if cmd.op_before == "||" and self.cd_seen:
+            self.dir = None  # runs only when what came before failed, a cd included
+        for a in cmd.assigns:
+            name = a.text.split("=", 1)[0].rstrip("+")
+            if name in GUARD_CODE_VARS:
+                self.block(f"setting {name} can run code")
+            if self.stores_code(a):
+                self.block("a value holding $( or a backtick can run later (arithmetic, PS4, ${x@P})")
+        everything = list(words) + list(cmd.assigns) + [t for _, t in cmd.redirects]
+        if any(re.search(r"\[.*(\$\(|`)", a.text.replace(DYN, "")) for a in everything):
+            self.block("an array subscript holding $( or a backtick runs it")
+        first = os.path.basename(words[0].text) if words else ""
+        if cmd.dbl_bracket and any(a.text in ("-eq", "-ne", "-lt", "-le", "-gt", "-ge") for a in words):
+            self.block("[[ ... -eq ... ]] evaluates its operands as arithmetic, which can run code")
+        if first in ("let",) or (first in ("declare", "typeset", "local") and any(
+                a.text.startswith("-") and "i" in a.text for a in words[1:])):
+            self.block(f"{first} evaluates arithmetic, which can run code")
+        if first in GUARD_ARITH_NAMES and any("[" in a.text and (a.dynamic or "$(" in a.text or "`" in a.text)
+                                              for a in words[1:]):
+            self.block(f"{first} with a subscript only known at run time")
+        if words and os.path.basename(words[0].text) in GUARD_STORES and (
+                any(self.stores_code(a) for a in words[1:]) or any(self.stores_code(t) for _, t in cmd.redirects)):
+            self.block("a value holding $( or a backtick can run later (arithmetic, PS4, ${x@P})")
+        if relevant and not words:
+            for a in cmd.assigns:  # x=$(git rev-parse HEAD): the value is checked where it is used
+                name = a.text.split("=", 1)[0].rstrip("+")
+                if name in GUARD_RISKY_VARS or name.startswith(("GH_", "GIT_", "LD_", "DYLD_", "BASH_")):
+                    self.block(f"setting {name} is not on the safe list")
+            cmd.assigns = []
+        if relevant:
+            if cmd.complex:
+                self.block("if/for/while blocks, subshells and { } groups are not on the safe list")
+            for a in cmd.assigns:
+                name = a.text.split("=", 1)[0].rstrip("+")
+                if name not in GUARD_SAFE_ENV or a.dynamic:
+                    self.block(f"setting {name} before a command is not on the safe list")
+            for op, target in cmd.redirects:
+                if not self.safe_redirect(op, target):
+                    self.block("output redirection to a file is not on the safe list (2>&1 and /dev/null are)")
+        if not words:
+            return
+        prog_at, wrappers, opaque = self.unwrap(words)
+        if opaque:
+            self.block(f"cannot tell which program `{opaque}` runs")
+            return
+        if prog_at is None:
+            if "xargs" in wrappers:
+                self.block("xargs running a program named on stdin")
+            return
+        prog, args = words[prog_at], words[prog_at + 1:]
+        head, _, tail = prog.text.rpartition("/")
+        if prog.glob or (prog.dynamic and (DYN in tail or not head)):
+            self.block("the program name is only known at run time")
+            return
+        # $HOME/bin/tool: the directory is only known at run time, the program name is not
+        if wrappers and relevant:
+            self.block(f"wrappers such as {wrappers[0]} are not on the safe list")
+        name = tail.lower()
+        if name in GUARD_SHELLS:
+            self.shell(name, args, cmd, relevant, depth)
+            return
+        if name in GUARD_RUNNERS and any(a.dynamic or a.glob for a in args):
+            self.block(f"{name} running a command made at run time")
+            return
+        if re.fullmatch(GUARD_INTERPRETERS, name) and any(
+                args[k].text in ("-c", "-e", "-E", "--eval", "-r") and k + 1 < len(args) and args[k + 1].dynamic
+                for k in range(len(args))):
+            self.block(f"{name} running code only known at run time")
+            return
+        if name == "eval":
+            if any(a.dynamic for a in args):
+                self.block("eval of text that is only known at run time")
+            elif depth >= GUARD_MAX_DEPTH:
+                self.block("commands nested too deeply")
+            else:
+                self.run(" ".join(a.text for a in args), depth + 1, relevant)
+            return
+        if name in GUARD_EVAL_LIKE:
+            if any(a.dynamic or a.glob for a in args):
+                self.block(f"{name} with text only known at run time")
+            elif name == "trap" and args and not args[0].text.startswith("-"):
+                self.run(args[0].text, depth + 1, relevant) if depth < GUARD_MAX_DEPTH else self.block(
+                    "commands nested too deeply")
+            if relevant:
+                self.block(f"`{name}` is not on the safe list")
+            return
+        if name in ("source", ".") and any(a.dynamic or a.glob or a.text in GUARD_STDIN_PATHS
+                                           or a.text.startswith(("/dev/", "/proc/")) for a in args):
+            self.block("source of a file that is only known at run time")
+            return
+        if re.fullmatch(GUARD_INTERPRETERS, name) and cmd.piped and not any(
+                not a.text.startswith("-") or a.text in ("-c", "-e", "-E", "-m") for a in args):
+            self.block(f"{name} reading a program from a pipe")
+            return
+        if name == "set" and any((a.text[:1] in "-+" and "P" in a.text) or a.text == "physical" for a in args):
+            self.physical = True
+        if name in ("cd", "pushd", "popd"):
+            self.cd_seen = True
+            if cmd.nested or cmd.complex or cmd.op_before not in (None, ";", "\n") or cmd.op_after in ("|", "|&", "&"):
+                self.dir = None  # it may not run, or runs in a subshell: the directory afterwards is unknown
+            else:
+                self.chdir(name, args)
+        if not relevant:
+            return
+        if name == "gh":
+            self.gh(args)
+        elif name == "git":
+            self.git_call(args)
+        elif name == "prbot":
+            pass  # posts as a bot: the route the guard points to
+        elif name in GUARD_SAFE_PROGRAMS:
+            if name == "printf" and any(a.text.startswith("-v") for a in args):
+                self.block("printf -v is not on the safe list")
+            if name == "rg" and any(a.text.startswith(("--pre", "--hostname-bin")) for a in args):
+                self.block("rg --pre runs another program")
+            if name == "sort" and any(a.text.startswith(("-o", "--o", "--compress")) for a in args):
+                self.block("sort -o and --compress-program are not on the safe list")
+            if name == "uniq" and len([a for a in args if not a.text.startswith("-")]) > 1:
+                self.block("uniq with an output file is not on the safe list")
+            if name == "set" and any(not a.text.startswith(("-", "+")) for a in args) and not all(
+                    a.text in ("pipefail", "errexit", "nounset", "xtrace") or a.text.startswith(("-", "+")) for a in args):
+                self.block("set with positional arguments is not on the safe list")
+        elif name == "command":
+            pass  # command -v / -V: a lookup, nothing runs
+        elif self.test_runner(prog.text, name, args):
+            pass
+        else:
+            self.block(f"`{name}` is not on the safe list")
+
+    @staticmethod
+    def stores_code(w):
+        """True when a word or here-document stores text that bash would run if it is expanded again."""
+        text = (w.body or "") + w.text.replace(DYN, "")
+        return "$(" in text or "`" in text or (w.ansi and re.search(r"\\[xuU0-7c]", w.raw) is not None)
+
+    @staticmethod
+    def safe_redirect(op, target):
+        if op in ("<", "<<", "<<-", "<<<"):
+            return True
+        if target.dynamic:
+            return False
+        if op in (">&", "<&") and re.fullmatch(r"[0-9]+-?|-", target.text):
+            return True
+        return op in (">", ">>", "&>", "&>>", ">|", ">&") and target.text == "/dev/null"
+
+    def unwrap(self, words):
+        """(index of the program word or None, wrapper names, opaque wrapper name or None)."""
+        i, wrappers = 0, []
+        while i < len(words):
+            w = words[i]
+            name = os.path.basename(w.text).lower()
+            if w.dynamic or name not in GUARD_WRAPPERS:
+                return i, wrappers, None
+            if name == "command" and i + 1 < len(words) and words[i + 1].text in ("-v", "-V"):
+                return i, wrappers, None  # a lookup: nothing runs
+            wrappers.append(name)
+            i += 1
+            values = GUARD_WRAPPERS[name]
+            opaque = GUARD_OPAQUE.get(name, ())
+            positional = 1 if name in ("timeout", "gtimeout") else 0
+            while i < len(words):
+                a = words[i]
+                if a.dynamic:
+                    return None, wrappers, name
+                t = a.text
+                if t == "--":
+                    i += 1
+                    break
+                if name == "env" and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", t):
+                    i += 1
+                    continue
+                if t.startswith("-") and len(t) > 1:
+                    if any(t == o or (t.startswith(o) and (o.startswith("--") and t[len(o):len(o) + 1] == "="
+                                                         or not o.startswith("--"))) for o in opaque) or (
+                            not t.startswith("--") and any(o[1] in t[1:] for o in opaque if not o.startswith("--"))):
+                        return None, wrappers, name
+                    if t in values:
+                        i += 2
+                    else:
+                        i += 1
+                    continue
+                if positional:
+                    positional -= 1
+                    i += 1
+                    continue
+                break
+        return None, wrappers, None
+
+    def shell(self, name, args, cmd, relevant, depth):
+        script, has_c, from_stdin, i = None, False, False, 0
+        while i < len(args):
+            a = args[i]
+            if a.dynamic:
+                self.block(f"{name} with options only known at run time")
+                return
+            t = a.text
+            if t == "--":
+                i += 1
+                break
+            if t[:1] in "-+" and len(t) > 1 and not t.startswith("--"):
+                has_c = has_c or "c" in t[1:]
+                from_stdin = from_stdin or "s" in t[1:]
+                # every o or O in a cluster (-co, -oc, -euo) takes the next word as its option name
+                i += 1 + t[1:].count("o") + t[1:].count("O")
+                continue
+            if t.startswith("--"):
+                i += 2 if t in ("--rcfile", "--init-file") else 1
+                continue
+            break
+        rest = args[i:]
+        if has_c:
+            if not rest or rest[0].dynamic:
+                self.block(f"{name} -c with a script only known at run time")
+            elif depth >= GUARD_MAX_DEPTH:
+                self.block("commands nested too deeply")
+            else:
+                self.run(rest[0].text, depth + 1, relevant)
+            return
+        if from_stdin or not rest or rest[0].text in GUARD_STDIN_PATHS or rest[0].text.startswith(("/dev/", "/proc/")):
+            self.block(f"{name} reading commands from stdin")
+            return
+        if rest[0].dynamic or rest[0].glob:
+            self.block(f"{name} running a script only known at run time")
+            return
+        if relevant:
+            self.block(f"running a script with {name} is not on the safe list")
+
+    def chdir(self, name, args):
+        if self.physical or any(a.text.startswith("-") and a.text != "-" and "P" in a.text for a in args):
+            self.dir = None  # cd -P or set -P: .. is folded after symlinks, which the guard does not follow
+            return
+        positional = [a for a in args if a.text == "-" or not a.text.startswith("-")]
+        if name == "popd" or (name == "pushd" and (not positional or len(positional) != len(args))) or (
+                positional and (positional[0].dynamic or positional[0].text == "-")):
+            self.dir = None  # popd, pushd -n, pushd with no directory: the guard can't follow the stack
+        elif not positional:
+            self.dir = os.path.expanduser("~")
+        elif self.dir is not None or os.path.isabs(os.path.expanduser(positional[0].text)):
+            # bash cd is logical: link/.. goes back to where it started, so fold .. before any lookup
+            self.dir = os.path.normpath(os.path.join(self.dir or "/", os.path.expanduser(positional[0].text)))
+
+    @staticmethod
+    def test_runner(path, name, args):
+        texts = [a.text for a in args]
+        if path.endswith("scripts/check.sh") or name in ("pytest",):
+            return True
+        if name in ("npm", "pnpm", "yarn") and texts[:1] == ["test"]:
+            return True
+        if name == "make" and texts in (["test"], ["check"]):
+            return True
+        if re.fullmatch(r"python3?(\.[0-9]+)?", name):
+            i = 0
+            while i < len(texts) and texts[i] in ("-B", "-I", "-u", "-q", "-E", "-s"):
+                i += 1
+            return texts[i:i + 1] == ["-m"] and i + 1 < len(texts) and texts[i + 1] in GUARD_TEST_MODULES
+        return False
+
+    def literal_args(self, args, what, allow_messages=False):
+        """Argument texts, or None (and a block) when one is only known at run time. A double-quoted value of a
+        message option (-m "$(cat <<'EOF' ...)") is allowed when allow_messages is true: it stays one word."""
+        out = []
+        for k, a in enumerate(args):
+            if a.dynamic:
+                prev = args[k - 1].text if k else ""
+                if allow_messages and not a.split and prev in GUARD_MESSAGE_OPTIONS:
+                    out.append(a.text)
+                    continue
+                self.block(f"{what} with arguments only known at run time")
+                return None
+            out.append(a.text)
+        return out
+
+    def gh(self, args):
+        texts = self.literal_args(args, "gh", allow_messages=True)
+        if texts is None:
+            return
+        group, sub, rest = gh_command(texts)
+        if group in ("--version", "version", "--help", "help") and len(texts) == 1:
+            return
+        if (group, sub) in GH_SAFE or group in GH_SAFE_GROUPS:
+            if (group, sub) == ("auth", "status") and any(t in ("-t", "--show-token") for t in texts):
+                self.block("gh auth status --show-token prints the token")
+            elif any(a.dynamic for a in args):
+                self.block("gh reads with arguments only known at run time")
+            return
+        if (group, sub) in GH_UNGUARDED:
+            if (group, sub) == ("repo", "clone"):
+                self.repo_changed = True
+            return
+        if group == "api":
+            if any(a.dynamic for a in args):
+                self.block("gh api with arguments only known at run time")
+            elif not gh_api_is_get(rest):
+                self.feedback.append(texts) if is_feedback_write(texts, self.codex) else self.gh_other.append(texts)
+            return
+        if (group, sub) in WRITE_SUBCOMMANDS | CLOSE_SUBCOMMANDS:
+            if is_feedback_write(texts, self.codex):
+                self.feedback.append(texts)
+            return  # closing without a comment, or an @codex trigger
+        self.gh_other.append(texts)
+
+    def git_call(self, args):
+        texts = self.literal_args(args, "git", allow_messages=True)
+        if texts is None:
+            return
+        d, i = self.dir, 0
+        while i < len(texts) and texts[i].startswith("-"):
+            t = texts[i]
+            if t == "-C" and i + 1 < len(texts):
+                d = os.path.join(d, os.path.expanduser(texts[i + 1])) if d is not None else (
+                    texts[i + 1] if os.path.isabs(texts[i + 1]) else None)
+                i += 2
+                continue
+            if t in GIT_SAFE_GLOBALS:
+                i += 1
+                continue
+            self.block(f"git option {t} is not on the safe list")
+            return
+        if i >= len(texts):
+            return
+        sub, rest = texts[i], texts[i + 1:]
+        if any(a.dynamic for a in args) and sub not in ("commit", "tag", "notes", "merge"):
+            self.block("git with arguments only known at run time")
+            return
+        short = GIT_RUNS_PROGRAM_SHORT.get(sub, "")
+        for t in rest:
+            if t == "--":
+                break
+            long_name = t.split("=", 1)[0]
+            # git accepts any unambiguous prefix of a long option, so --upl means --upload-pack
+            if (t.startswith("--") and len(long_name) > 2 and any(o.startswith(long_name) or long_name.startswith(o)
+                                                                  for o in GIT_RUNS_PROGRAM)) \
+                    or (short and t[:1] == "-" and t[1:2] != "-" and any(ch in t[1:] for ch in short)):
+                self.block(f"git {sub} {t.split('=')[0]} can run another program")
+                return
+        if sub == "config":
+            if not any(t in ("--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin") for t in rest) \
+                    or any(t in ("--add", "--unset", "--unset-all", "--replace-all", "--edit", "-e") for t in rest):
+                self.block("git config that changes settings is not on the safe list")
+            return
+        if sub in GIT_READ or sub in GIT_LOCAL:
+            if sub in ("clone", "init", "worktree", "remote"):
+                self.repo_changed = True
+            return
+        if sub in GIT_IDENTITY:
+            if self.bot_repo(d, sub, rest) if d is not None and os.path.isdir(d) else False:
+                self.git.append(texts)
+            elif d is None or not os.path.isdir(d) or self.repo_changed:
+                # the directory is only known at run time, or an earlier step in this command makes or changes
+                # the repository, so its owner can't be checked now
+                self.block(f"cannot tell which repository git {sub} runs in")
+            return
+        self.block(f"git {sub} is not on the safe list")
+
+    def bot_repo(self, d, sub, rest):
+        """True when git runs in, or may push to or pull from, a repository owned by an account the bots are
+        installed on: any remote URL of the repo, a branch remote or remote.pushDefault given as a URL, and, for
+        a push, pull or fetch, any word that looks like a remote URL."""
+        r = subprocess.run(["git", "config", "--get-regexp",
+                            r"^(remote\..*\.(push)?url|branch\..*\.(remote|pushremote)|remote\.pushdefault)$"],
+                           capture_output=True, text=True, cwd=d)
+        values = [line.partition(" ")[2] for line in r.stdout.splitlines()] if r.returncode == 0 else []
+        if any(self.bot_url(v) for v in values):
+            return True
+        if sub not in ("push", "pull", "fetch"):
+            return False
+        return any(self.bot_url(t.split("=", 1)[1] if t.startswith("--repo=") else t) for t in rest)
+
+    def bot_url(self, text):
+        owner = remote_owner(text or "")
+        return owner is not None and owner.lower() in self.owners
+
+
+def remote_owner(url):
+    """The first path segment of a remote URL whatever the host (ssh aliases, IP addresses, ports, a trailing
+    dot), or None when the text is not a URL: https://host/OWNER/repo, ssh://git@host:22/OWNER/repo,
+    git@alias:OWNER/repo."""
+    m = re.match(r"\s*(?:[A-Za-z][A-Za-z0-9+.-]*://[^/\s]*/+|(?:[^/\s@:]+@)?[^/\s:]+:/*)([^/\s]+)/", url)
+    return m.group(1) if m else None
+
+
+def gh_api_is_get(rest):
+    """True when a gh api argv (after `api`) is a plain GET: one endpoint, no fields or input, method GET."""
+    endpoint, i = None, 0
+    plain_long = ("--include", "--paginate", "--slurp", "--silent", "--verbose")
+    value_long = ("--header", "--jq", "--template", "--preview", "--hostname", "--cache")
+
+    def value(k, attached):
+        return attached if attached else (rest[k + 1] if k + 1 < len(rest) else None)
+
+    while i < len(rest):
+        a = rest[i]
+        if a.startswith("--") and a != "--":
+            name, eq, val = a.partition("=")
+            if name in plain_long and not eq:
+                i += 1
+                continue
+            if name == "--method" or name in value_long:
+                v = value(i, val if eq else None)
+                if v is None or (name == "--method" and v != "GET") or (name == "--header" and "override" in v.lower()):
+                    return False
+                i += 1 if eq else 2
+                continue
+            return False
+        if a.startswith("-") and len(a) > 1 and a != "--":
+            k, step = 1, 1
+            while k < len(a):
+                ch = a[k]
+                if ch in "XHqtp":
+                    v = a[k + 1:] or None
+                    if v is None:
+                        v, step = (rest[i + 1] if i + 1 < len(rest) else None), 2
+                    if v is None or (ch == "X" and v != "GET") or (ch == "H" and "override" in v.lower()):
+                        return False
+                    break
+                if ch != "i":
+                    return False
+                k += 1
+            i += step
+            continue
+        if a == "--":
+            if i + 1 < len(rest) and endpoint is None and i + 2 == len(rest):
+                return True
+            return False
+        if endpoint is not None:
+            return False
+        endpoint = a
+        i += 1
+    return endpoint is not None
+
+
+def guard_bash(command, cwd, owners, codex_triggers_as_bot=False):
+    """What the Claude Code hook should refuse in a Bash command, as a dict, or None to let it run.
+
+    Keys: feedback (gh argv lists that post PR feedback), git (git argv lists that commit or push in a bot
+    repo), gh (other gh argv lists not on the safe list) and reasons (why anything else was refused)."""
+    g = _Guard(cwd, set(owners), codex_triggers_as_bot)
+    g.run(command)
+    if g.feedback or g.git or g.gh_other or g.reasons:
+        shown = lambda lists: [[a.replace(DYN, "<run-time value>") for a in args] for args in lists]
+        return {"feedback": shown(g.feedback), "git": shown(g.git), "gh": shown(g.gh_other), "reasons": g.reasons}
+    return None
+
 # ---------- config and key storage ----------
 
 
@@ -757,7 +1672,8 @@ def repo_from_args(args):
 
 def repo_from_git(cwd=None):
     r = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, cwd=cwd)
-    m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(\.git)?\s*$", r.stdout) if r.returncode == 0 else None
+    m = re.search(r"github\.com(?::[0-9]+)?[:/]+([^/\s:]+)/([^/\s]+?)(\.git)?/?\s*$", r.stdout, re.I) \
+        if r.returncode == 0 else None
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 # ---------- review routing: the other agent reviews, unless told otherwise ----------
