@@ -254,11 +254,16 @@ def classify_gh(args, codex_triggers_as_bot=False):
 
 
 def _opens_browser(rest):
-    """True when the options include -w/--web, alone or in a short cluster such as -cw, before any `--`."""
+    """True when the options include -w/--web before any `--`: --web, --web=..., or a short cluster of letters with
+    a w in it, with or without =value (-w, -w=true, -dw, -wwww). An attached value that is all letters and holds a
+    w (-bwow) is refused too; write it as -b wow."""
     for a in rest:
         if a == "--":
             return False
-        if a in ("-w", "--web") or a.startswith("--web=") or (re.fullmatch(r"-[A-Za-z]{2,3}", a) and "w" in a):
+        if a == "--web" or a.startswith("--web="):
+            return True
+        m = re.fullmatch(r"-([A-Za-z]+)(=.*)?", a, re.S)
+        if m and "w" in m.group(1):
             return True
     return False
 

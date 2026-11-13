@@ -342,7 +342,9 @@ class Classify(unittest.TestCase):
                      ["pr", "view", "1", "--web"], ["pr", "view", "1", "-w"], ["issue", "view", "1", "--web=true"],
                      ["repo", "view", "-w"], ["run", "view", "1", "--web"], ["workflow", "view", "x", "-w"],
                      ["pr", "create", "-w"], ["pr", "comment", "1", "-w"], ["search", "prs", "x", "--web"],
-                     ["pr", "close", "1", "-dw"], ["-R", "o/r", "release", "view", "v1", "--web"]):
+                     ["pr", "close", "1", "-dw"], ["-R", "o/r", "release", "view", "v1", "--web"],
+                     ["repo", "view", "o/r", "-w=true"], ["repo", "view", "o/r", "-wwww"], ["pr", "create", "-dftw"],
+                     ["pr", "view", "1", "-w=1"], ["pr", "view", "1", "--web=false"]):
             with self.subTest(args=args):
                 with self.assertRaises(prbot.Undecided):
                     prbot.classify_gh(args)
