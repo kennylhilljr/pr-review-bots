@@ -36,66 +36,485 @@ PERMISSIONS = {"pull_requests": "write", "issues": "write", "contents": "read", 
 # ---------- classification: which gh calls write PR feedback ----------
 
 WRITE_SUBCOMMANDS = {("pr", "review"), ("pr", "comment"), ("issue", "comment")}
+CLOSE_SUBCOMMANDS = {("pr", "close"), ("issue", "close")}  # feedback only when they carry -c/--comment
 FEEDBACK_PATH = re.compile(r"/(comments|reviews|replies)(/|$|\?)|/reviews/\d+/(events|dismissals)")
 FEEDBACK_MUTATION = re.compile(r"\b(addPullRequestReview\w*|submitPullRequestReview|addComment|updateIssueComment|"
-                               r"updatePullRequestReview\w*|resolveReviewThread|unresolveReviewThread)\b")
+                               r"updatePullRequestReview\w*|resolveReviewThread|unresolveReviewThread|"
+                               r"deleteIssueComment|deletePullRequestReview\w*|dismissPullRequestReview|"
+                               r"minimizeComment|unminimizeComment)\b")
 FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+WRITE_METHODS = ("POST", "PATCH", "PUT", "DELETE")
+GH_GLOBAL_VALUE = ("-R", "--repo", "--hostname")
+# options of the comment and close subcommands that take a value, so their operand is never read as a body
+COMMENT_VALUE_SHORT, COMMENT_VALUE_LONG = "FR", ("--body-file", "--repo", "--hostname")
+CLOSE_VALUE_SHORT, CLOSE_VALUE_LONG = "rR", ("--reason", "--repo", "--duplicate-of", "--hostname")
+# gh api options that take a value, so their operand is never taken for the endpoint
+API_VALUE_SHORT = "XfFHqtp"
+API_VALUE_LONG = ("--method", "--field", "--raw-field", "--input", "--header", "--jq", "--template",
+                  "--preview", "--hostname", "--cache")
+PAYLOAD_LIMIT = 4 << 20  # larger payload files count as writes instead of being read
+STDIN_PATHS = ("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0")  # never opened, so stdin is never consumed
 
 
-def _body_arg(args):
-    for i, a in enumerate(args):
-        if a in ("-b", "--body") and i + 1 < len(args):
-            return args[i + 1]
-        if a.startswith("--body="):
-            return a.split("=", 1)[1]
-    return None
+def _skip_gh_globals(args, i):
+    """Index of the first word at or after i that is not -R/--repo/--hostname or their operand."""
+    while i < len(args):
+        a = args[i]
+        if a in GH_GLOBAL_VALUE:
+            i += 2
+        elif a.startswith(("--repo=", "--hostname=")) or (a.startswith("-R") and len(a) > 2):
+            i += 1
+        else:
+            break
+    return i
+
+
+def gh_command(args):
+    """(group, subcommand, rest) of a gh argv. -R/--repo/--hostname may come before the group or between the group
+    and the subcommand, as gh accepts both. For `api` the subcommand is None and rest is everything after it."""
+    i = _skip_gh_globals(args, 0)
+    if i >= len(args):
+        return None, None, []
+    group = args[i]
+    if group == "api":
+        return group, None, args[i + 1:]
+    j = _skip_gh_globals(args, i + 1)
+    if j >= len(args):
+        return group, None, args[i + 1:]
+    return group, args[j], args[i + 1:j] + args[j + 1:]
+
+
+def _option_values(args, short, long, value_short, value_long):
+    """Values given to one option of a gh subcommand, read the way gh's flag parser reads them: -cX, -c X,
+    --comment X, --comment=X and short clusters such as -dc X. value_short and value_long name the subcommand's
+    other options that take a value, so their operands are never mistaken for this option. A missing operand
+    is returned as None."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            takes_next = not eq and (name == long or name in value_long)
+            if name == long:
+                out.append(val if eq else (args[i + 1] if i + 1 < len(args) else None))
+            i += 2 if takes_next else 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            step = 1
+            for k in range(1, len(a)):
+                ch = a[k]
+                if ch == short or ch in value_short:
+                    val = a[k + 1:]
+                    if not val:
+                        val = args[i + 1] if i + 1 < len(args) else None
+                        step = 2
+                    if ch == short:
+                        out.append(val)
+                    break
+            i += step
+            continue
+        i += 1
+    return out
 
 
 def is_feedback_write(args, codex_triggers_as_bot=False):
     """args: the gh argv without the leading 'gh'."""
-    if len(args) >= 2 and (args[0], args[1]) in WRITE_SUBCOMMANDS:
-        body = _body_arg(args)
-        if body is not None and body.lstrip().startswith("@codex") and not codex_triggers_as_bot:
-            return False  # Codex Cloud triggers stay on the human account until tested
+    group, sub, rest = gh_command(args)
+    if group == "api":
+        return _api_feedback_write(rest)
+    if (group, sub) in WRITE_SUBCOMMANDS:
+        values = _option_values(rest, "b", "--body", COMMENT_VALUE_SHORT, COMMENT_VALUE_LONG)
+    elif (group, sub) in CLOSE_SUBCOMMANDS:
+        values = _option_values(rest, "c", "--comment", CLOSE_VALUE_SHORT, CLOSE_VALUE_LONG)
+        if not values:
+            return False  # closing without a comment posts no feedback
+    else:
+        return False
+    text = values[-1] if values else None  # gh keeps the last value when an option repeats
+    if text is not None and text.lstrip().startswith("@codex") and not codex_triggers_as_bot:
+        return False  # Codex Cloud triggers stay on the human account until tested
+    return True
+
+
+def _api_feedback_write(rest):
+    """rest: the gh api argv after 'api'."""
+    method, fields, inputs, endpoint = None, [], [], None
+    i, only_positional = 0, False
+    while i < len(rest):
+        a = rest[i]
+        if only_positional or a == "-" or not a.startswith("-"):
+            endpoint = a if endpoint is None else endpoint
+            i += 1
+            continue
+        if a == "--":
+            only_positional = True
+            i += 1
+            continue
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in API_VALUE_LONG and not eq:
+                val = rest[i + 1] if i + 1 < len(rest) else ""
+                i += 2
+            else:
+                i += 1
+            if name == "--method":
+                method = val.upper()
+            elif name in ("--field", "--raw-field"):
+                fields.append(val)
+            elif name == "--input":
+                inputs.append(val)
+            continue
+        step = 1
+        for k in range(1, len(a)):  # short cluster: a value option takes the rest of the token or the next one
+            ch = a[k]
+            if ch in API_VALUE_SHORT:
+                val = a[k + 1:]
+                if not val:
+                    val = rest[i + 1] if i + 1 < len(rest) else ""
+                    step = 2
+                if ch == "X":
+                    method = val.upper()
+                elif ch in "fF":
+                    fields.append(val)
+                break
+        i += step
+    if not (method in WRITE_METHODS or (method is None and (fields or inputs))):
+        return False  # gh api sends GET without fields or with an explicit GET
+    if endpoint is None:
+        return False
+    if re.split(r"[?#]", endpoint)[0].rstrip("/").endswith("graphql"):  # a query string doesn't change the route
+        return _graphql_feedback_write(rest, fields, inputs)
+    return FEEDBACK_PATH.search(endpoint) is not None
+
+
+def _graphql_feedback_write(rest, fields, inputs):
+    """True when a GraphQL call carries a feedback mutation inline or in a payload file, or when a payload file
+    can't be read safely, since its contents are then unknown."""
+    if any(FEEDBACK_MUTATION.search(a) for a in rest):
         return True
-    if args[:1] == ["api"]:
-        rest = args[1:]
-        method = None
-        for i, a in enumerate(rest):
-            if a in ("-X", "--method") and i + 1 < len(rest):
-                method = rest[i + 1].upper()
-            elif a.startswith("--method="):
-                method = a.split("=", 1)[1].upper()
-        has_fields = any(a in FIELD_FLAGS or (a.startswith("--") and a.split("=", 1)[0] in FIELD_FLAGS) for a in rest)
-        if not (method in ("POST", "PATCH", "PUT", "DELETE") or (method is None and has_fields)):
-            return False
-        positional = [a for a in rest if not a.startswith("-")]
-        if any(p.rstrip("/").endswith("graphql") for p in positional):
-            return any(FEEDBACK_MUTATION.search(a) for a in rest)
-        return any(FEEDBACK_PATH.search(p) for p in positional)
+    files = [f.partition("=")[2][1:] for f in fields if f.partition("=")[2].startswith("@")] + inputs
+    for path in files:
+        text = _read_payload(path)
+        if text is None or _payload_has_mutation(text):
+            return True
     return False
 
 
-def _commands(command):
-    """Yield (program, argv) for each simple command in a shell command string, skipping VAR=... and wrappers."""
-    lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+def _read_payload(path):
+    """Text of a local regular payload file, relative paths taken from the current directory. None for stdin,
+    a missing file, anything that is not a regular file, a read error, a file over PAYLOAD_LIMIT or text that is
+    not UTF-8. The file is opened non-blocking and checked before reading, so a FIFO or device never blocks."""
+    if not path or path in STDIN_PATHS:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
+    except (OSError, ValueError):
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(PAYLOAD_LIMIT + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > PAYLOAD_LIMIT:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _payload_has_mutation(text):
+    """Look for a feedback mutation in raw text and, for a JSON body, in every decoded string."""
+    if FEEDBACK_MUTATION.search(text):
+        return True
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    except RecursionError:
+        return True  # too deep to inspect: treat as a write
+    stack = [data]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, str):
+            if FEEDBACK_MUTATION.search(x):
+                return True
+        elif isinstance(x, dict):
+            stack.extend(x.keys())
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+    return False
+
+
+# Covered shell forms. This is not a shell parser: it splits on ; & | ( ), skips the words below, and looks inside
+# backticks and `bash|sh|zsh -c` strings, at most MAX_NESTING levels deep.
+SHELL_KEYWORDS = ("then", "do", "else", "elif", "{", "!", "if", "while", "until")
+SHELLS = ("bash", "sh", "zsh")
+MAX_NESTING = 4
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# wrapper: (short options with an operand, short options with an optional attached operand,
+#           long options with an operand, long options with an optional attached operand).
+# Option sets cover GNU and BSD/macOS. Every other option is taken as a flag; a word not starting with - (or anything after --) is the command.
+WRAPPERS = {
+    "env": ("uCSP", "", ("--unset", "--chdir", "--split-string"), ()),
+    "time": ("fo", "", ("--format", "--output"), ()),
+    "command": ("", "", (), ()),
+    "exec": ("a", "", (), ()),
+    "nohup": ("", "", (), ()),
+    "sudo": ("CDghprRtTUu", "", ("--close-from", "--chdir", "--group", "--host", "--prompt", "--chroot", "--role",
+                                 "--type", "--command-timeout", "--other-user", "--user"), ("--preserve-env",)),
+    "xargs": ("IanLPsEdJRS", "ile", ("--arg-file", "--max-args", "--max-procs", "--max-chars", "--delimiter",
+                                  "--process-slot-var"), ("--replace", "--max-lines", "--eof")),
+}
+
+
+PUNCTUATION = ";&|()<>\n"
+# one shell operator inside a run of punctuation; process substitution <( and >( first, so it separates
+OPERATOR = re.compile(r"[<>]\(|&>>?|<<<|<<|<>|>>|>&|>\||<&|&&|\|\||;;|[<>;&|()\n]")
+
+
+def _drop_fd_numbers(command):
+    """The command without file descriptor numbers in front of redirections (2>x, 2>&1), outside quotes, so
+    they are never read as words."""
+    out, quote, i = [], None, 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                out.append(command[i:i + 2])
+                i += 2
+                continue
+        elif ch == "\\":
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        elif ch in "'\"":
+            quote = ch
+        elif ch.isdigit() and (i == 0 or command[i - 1] in " \t\r" + PUNCTUATION):
+            j = i
+            while j < len(command) and command[j].isdigit():
+                j += 1
+            if j < len(command) and command[j] in "<>":
+                i = j
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _tokens(command):
+    """Shell words, with ; & | ( ) and unquoted newlines as separate tokens and each redirection operator as one
+    token. A backslash-newline joins lines."""
+    command = _drop_fd_numbers(command.replace("\\\n", ""))
+    lex = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION)
+    lex.whitespace = " \t\r"  # a newline ends a command, like ;
     lex.whitespace_split = True
     lex.commenters = ""
     try:
-        tokens = list(lex)
+        words = list(lex)
     except ValueError:  # unbalanced quotes: fall back to a rough split rather than letting the call through
-        tokens = command.split()
-    seg = []
-    for tok in tokens + [";"]:
-        if tok and set(tok) <= set(";&|()\n"):
-            i = 0
-            while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or seg[i] in ("command", "exec", "env", "time")):
+        words = re.findall(r"[;&|()<>\n]+|[^\s;&|()<>]+", command)
+    out = []
+    for w in words:  # shlex joins neighbouring punctuation (;>, &&>), so split each run into operators
+        out.extend(OPERATOR.findall(w) if w and set(w) <= set(PUNCTUATION) else [w])
+    return out
+
+
+def _is_operator(tok):
+    return bool(tok) and set(tok) <= set(PUNCTUATION)
+
+
+def _is_redirection(tok):
+    return _is_operator(tok) and bool(set(tok) & set("<>")) and "(" not in tok
+
+
+def _closing_paren(command, i):
+    """Index of the ) that closes a $( whose body starts at i, skipping quoted text, or len(command)."""
+    depth, quote = 1, None
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
                 i += 1
-            if i < len(seg):
-                yield os.path.basename(seg[i]), seg[i + 1:]
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return i
+
+
+def _unescape_backticks(body):
+    """A backtick body as the shell runs it: inside `...`, a backslash quotes only $, ` and itself."""
+    return re.sub(r"\\([$`\\])", r"\1", body)
+
+
+def _substitutions(command):
+    """Command strings inside `...` and inside $(...) within double quotes, outside single quotes and not escaped.
+    Unquoted $(...) needs no special case, since ( and ) already split commands. An unclosed substitution yields
+    the rest of the string."""
+    out, quote, start, i = [], None, None, 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\":
+            i += 2
+            continue
+        elif ch == "`":
+            if start is None:
+                start = i + 1
+            else:
+                out.append(_unescape_backticks(command[start:i]))
+                start = None
+        elif start is None and quote == '"' and command.startswith("$(", i):
+            end = _closing_paren(command, i + 2)
+            out.append(command[i + 2:end])
+            i = end + 1
+            continue
+        elif start is None and ch == "'" and quote is None:
+            quote = "'"
+        elif start is None and ch == '"':
+            quote = None if quote == '"' else '"'
+        i += 1
+    if start is not None:
+        out.append(_unescape_backticks(command[start:]))
+    return out
+
+
+def _skip_options(seg, i, spec, split=()):
+    """(index of the wrapped command, [(option, value)], None) for a wrapper's options starting at seg[i].
+    An option named in split (env -S) stops the scan at once: the third item is then (value, start, prefix, end),
+    where seg[start:end] holds the option and its value and prefix is any flags clustered before it."""
+    value_short, optional_short, value_long, optional_long = spec
+    found = []
+    while i < len(seg):
+        t = seg[i]
+        if t == "--":
+            return i + 1, found, None
+        if t.startswith("--"):
+            name, eq, val = t.partition("=")
+            if name in value_long and not eq:
+                val, end = (seg[i + 1] if i + 1 < len(seg) else ""), i + 2
+            else:
+                val, end = (val if eq else None), i + 1
+            found.append((name, val))
+            if name in split:
+                return end, found, (val or "", i, "", end)
+            i = end
+            continue
+        if not t.startswith("-") or t == "-":
+            return i, found, None
+        step = 1
+        for k in range(1, len(t)):
+            ch = t[k]
+            if ch in value_short:
+                val = t[k + 1:]
+                if not val:
+                    val = seg[i + 1] if i + 1 < len(seg) else ""
+                    step = 2
+                found.append((ch, val))
+                if ch in split:
+                    return i + step, found, (val, i, t[:k] if k > 1 else "", i + step)
+                break
+            if ch in optional_short:
+                found.append((ch, t[k + 1:] or None))
+                break
+            found.append((ch, None))
+        i += step
+    return i, found, None
+
+
+def _shell_script(args):
+    """The command string of `bash|sh|zsh [options] -c STRING`, or None."""
+    i, has_c = 0, False
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1
+            break
+        if a in ("--rcfile", "--init-file"):
+            i += 2
+            continue
+        if a.startswith("--"):
+            i += 1
+            continue
+        if len(a) > 1 and a[0] in "-+":
+            has_c = has_c or (a[0] == "-" and "c" in a[1:])
+            i += 2 if ("o" in a[1:] or "O" in a[1:]) else 1  # -o/-O take an option name
+            continue
+        break
+    return args[i] if has_c and i < len(args) else None
+
+
+def _simple_command(seg, depth):
+    i, leading = 0, True
+    while i < len(seg):
+        t = seg[i]
+        if leading and t in SHELL_KEYWORDS:
+            i += 1
+            continue
+        if ASSIGNMENT.match(t):
+            i, leading = i + 1, False
+            continue
+        name = os.path.basename(t)
+        if name not in WRAPPERS:
+            break
+        leading = False
+        at = i
+        i, opts, split = _skip_options(seg, at + 1, WRAPPERS[name], ("S", "--split-string") if name == "env" else ())
+        if name == "command" and any(o in ("v", "V") for o, _ in opts):
+            return  # command -v/-V only looks the program up
+        if split:  # env -S: its string becomes more env arguments in its place, then env is read again
+            value, start, prefix, end = split
+            seg = seg[:start] + ([prefix] if prefix else []) + _tokens(value) + seg[end:]
+            i = at
+    if i >= len(seg):
+        return
+    prog, args = os.path.basename(seg[i]), seg[i + 1:]
+    yield prog, args
+    if prog in SHELLS and depth < MAX_NESTING:
+        script = _shell_script(args)
+        if script is not None:
+            yield from _commands(script, depth + 1)
+
+
+def _commands(command, depth=0):
+    """Yield (program, argv) for each simple command in a shell command string, skipping shell keywords,
+    VAR=... and wrappers, and looking inside backticks and bash|sh|zsh -c strings up to MAX_NESTING deep."""
+    if depth < MAX_NESTING:
+        for inner in _substitutions(command):
+            yield from _commands(inner, depth + 1)
+    seg, toks, k = [], _tokens(command) + [";"], 0
+    while k < len(toks):
+        tok = toks[k]
+        if _is_redirection(tok):  # the shell removes a redirection and its target before running the command
+            k += 1 if _is_operator(toks[k + 1]) else 2
+            continue
+        if _is_operator(tok):
+            yield from _simple_command(seg, depth)
             seg = []
         else:
             seg.append(tok)
+        k += 1
 
 
 def gh_calls(command):
@@ -113,10 +532,28 @@ def git_writes(command):
     for prog, args in _commands(command):
         if prog != "git":
             continue
-        _, sub = git_subcommand(args)
+        at, sub = git_subcommand(args)
         if sub in GUARDED_GIT:
-            cdir = args[args.index("-C") + 1] if "-C" in args[:args.index(sub)] else None
-            yield args, cdir
+            yield args, _git_dir(args[:at])
+
+
+def _git_dir(opts):
+    """The directory git runs in from its own options: -C <dir>, then --git-dir <dir> under it; None for cwd."""
+    cdir = gitdir = None
+    i = 0
+    while i < len(opts):
+        o = opts[i]
+        if o in ("-C", "--git-dir") and i + 1 < len(opts):
+            if o == "-C":
+                cdir = os.path.join(cdir, opts[i + 1]) if cdir else opts[i + 1]
+            else:
+                gitdir = opts[i + 1]
+        elif o.startswith("--git-dir="):
+            gitdir = o.partition("=")[2]
+        i += 2 if o in GIT_VALUE_OPTIONS else 1
+    if gitdir:
+        return os.path.join(cdir, gitdir) if cdir else gitdir
+    return cdir
 
 
 def unrouted_writes(command, codex_triggers_as_bot=False):
@@ -1316,11 +1753,16 @@ def git_env(token=None, identity=None):
 REMOTE_SUBCOMMANDS = ("push", "fetch", "pull")
 
 
+# git's own options that take their value as the next word
+GIT_VALUE_OPTIONS = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env",
+                     "--attr-source")
+
+
 def git_subcommand(args):
-    """(index, name) of git's subcommand, skipping git's own options such as -C <dir> and -c k=v."""
+    """(index, name) of git's subcommand, skipping git's own options such as -C <dir>, -c k=v and --git-dir <dir>."""
     i = 0
     while i < len(args) and args[i].startswith("-"):
-        i += 2 if args[i] in ("-C", "-c") else 1
+        i += 2 if args[i] in GIT_VALUE_OPTIONS else 1
     return (i, args[i]) if i < len(args) else (len(args), None)
 
 

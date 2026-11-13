@@ -50,6 +50,149 @@ class Classify(unittest.TestCase):
     def test_codex_trigger_moves_to_bot_when_enabled(self):
         self.assertTrue(prbot.is_feedback_write(["pr", "comment", "1", "-b", "@codex review"], codex_triggers_as_bot=True))
 
+    def test_feedback_option_regressions(self):
+        cases = [
+            # -R/--repo/--hostname before the group and between the group and the subcommand
+            (["-R", "o/r", "pr", "comment", "1", "-b", "x"], True),
+            (["pr", "-R", "o/r", "comment", "1", "-b", "x"], True),
+            (["issue", "--repo", "o/r", "comment", "1", "-b", "x"], True),
+            (["--repo=o/r", "pr", "review", "1", "--approve"], True),
+            (["pr", "--repo=o/r", "review", "1", "--approve"], True),
+            (["-Ro/r", "pr", "comment", "1", "-b", "x"], True),
+            (["--hostname", "github.example.com", "issue", "comment", "1", "-b", "x"], True),
+            (["pr", "--hostname=github.example.com", "comment", "1", "-b", "x"], True),
+            (["-R", "comment", "pr", "view", "1"], False),  # an operand that looks like a subcommand
+            (["pr", "-R", "comment", "view", "1"], False),
+            (["-R", "o/r", "pr", "view", "1", "--comments"], False),
+            (["pr", "--repo", "o/r", "diff", "1"], False),
+            (["--hostname=h", "issue", "view", "9", "--comments"], False),
+            # close with a comment posts that comment
+            (["pr", "close", "1", "-c", "done"], True),
+            (["issue", "close", "1", "--comment", "done"], True),
+            (["issue", "close", "1", "--comment=done"], True),
+            (["pr", "close", "1", "-cdone"], True),
+            (["pr", "close", "1", "-dc", "done"], True),
+            (["-R", "o/r", "pr", "close", "1", "-c", "done"], True),
+            (["issue", "--repo", "o/r", "close", "1", "--comment", "done"], True),
+            (["issue", "close", "1", "-c", "--reason"], True),  # an option-looking comment is still a comment
+            (["pr", "close", "1", "--comment", "-R"], True),
+            (["pr", "close", "1"], False),
+            (["pr", "close", "1", "--delete-branch"], False),
+            (["-R", "o/r", "issue", "close", "1", "--reason", "completed"], False),
+            (["issue", "close", "1", "--reason", "-c"], False),  # -c is the reason's operand here
+            (["issue", "close", "1", "-r", "--comment"], False),
+            (["pr", "close", "1", "-R", "-c"], False),
+            # attached api fields and methods
+            (["api", "repos/o/r/pulls/1/reviews", "-fbody=x"], True),
+            (["api", "repos/o/r/issues/1/comments", "-Fbody=x"], True),
+            (["api", "-XPOST", "repos/o/r/issues/1/comments"], True),
+            (["api", "-XPATCH", "repos/o/r/issues/comments/7", "-fbody=y"], True),
+            (["api", "--field=body=x", "repos/o/r/pulls/1/comments"], True),
+            (["api", "-XGET", "repos/o/r/pulls/1/comments", "-fper_page=100"], False),
+            (["api", "-X", "GET", "repos/o/r/pulls/1/reviews", "-f", "per_page=1"], False),
+            (["api", "--method=GET", "repos/o/r/issues/1/comments", "-Fpage=2"], False),
+            (["api", "repos/o/r/labels", "-fname=bug"], False),
+            (["api", "-XPOST", "repos/o/r/labels"], False),
+            (["api", "-H", "X-Note: /comments", "repos/o/r/labels", "-fname=bug"], False),  # header operand, not the endpoint
+            (["api", "-f", "x=/comments", "repos/o/r/labels"], False),
+            # create, merge and edit stay on Kenny's account by design
+            (["pr", "create", "-t", "t", "-b", "x"], False),
+            (["issue", "create", "-t", "t", "-b", "x"], False),
+            (["pr", "merge", "1", "--squash"], False),
+            (["pr", "edit", "1", "-b", "x"], False),
+            (["-R", "o/r", "pr", "create", "-b", "x"], False),
+            (["issue", "--repo", "o/r", "edit", "1", "--body", "x"], False),
+        ]
+        for args, want in cases:
+            with self.subTest(args=args):
+                self.assertIs(prbot.is_feedback_write(args), want)
+        codex = [
+            ["-R", "o/r", "pr", "comment", "1", "-b", "@codex review"],
+            ["pr", "--repo", "o/r", "comment", "1", "--body=@codex review"],
+            ["issue", "--hostname", "h", "comment", "1", "-b", "@codex look"],
+            ["pr", "close", "1", "-c", "@codex review"],
+            ["issue", "close", "1", "--comment=@codex fix this"],
+            ["-R", "o/r", "issue", "close", "1", "-c@codex go"],
+        ]
+        for args in codex:
+            with self.subTest(args=args):
+                self.assertIs(prbot.is_feedback_write(args), False)
+                self.assertIs(prbot.is_feedback_write(args, codex_triggers_as_bot=False), False)
+                self.assertIs(prbot.is_feedback_write(args, codex_triggers_as_bot=True), True)
+
+    def test_graphql_route_and_mutation_regressions(self):
+        for name in ("deleteIssueComment", "deletePullRequestReview", "deletePullRequestReviewComment",
+                     "dismissPullRequestReview", "minimizeComment", "unminimizeComment"):
+            with self.subTest(mutation=name):
+                self.assertTrue(prbot.is_feedback_write(
+                    ["api", "graphql", "-f", "query=mutation { %s(input: {id: \"x\"}) { clientMutationId } }" % name]))
+        add = "query=mutation { addComment(input: {subjectId: \"x\", body: \"y\"}) { clientMutationId } }"
+        for endpoint in ("graphql?x=1", "graphql/?x=1", "graphql#x", "https://api.github.com/graphql?x=1"):
+            with self.subTest(endpoint=endpoint):
+                self.assertTrue(prbot.is_feedback_write(["api", endpoint, "-f", add]))
+        self.assertFalse(prbot.is_feedback_write(["api", "graphql?x=1", "-f", "query=query { viewer { login } }"]))
+        self.assertFalse(prbot.is_feedback_write(["api", "graphql?x=1", "-XGET", "-f", add]))
+
+    def test_graphql_payload_file_regressions(self):
+        mutation = 'mutation { addComment(input: {subjectId: "x", body: "y"}) { clientMutationId } }'
+        viewer = "query { viewer { login } }"
+        label = 'mutation { addLabelsToLabelable(input: {labelableId: "x", labelIds: []}) { clientMutationId } }'
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"PRBOT_CONFIG_DIR": d}):
+            try:
+                os.chdir(d)
+                Path("mutation.graphql").write_text(mutation)
+                Path("viewer.graphql").write_text(viewer)
+                Path("label.graphql").write_text(label)
+                Path("body.json").write_text(json.dumps({"query": mutation, "variables": {}}))
+                Path("escaped.json").write_text('{"query": "mutation { \\u0061ddComment(input: {}) { clientMutationId } }"}')
+                Path("viewer.json").write_text(json.dumps({"query": viewer}))
+                Path("label.json").write_text(json.dumps({"query": label}))
+                Path("latin1.graphql").write_bytes(b"query { viewer { login } } \xff\xfe")
+                Path("folder").mkdir()
+                os.mkfifo("pipe")
+                absolute = os.path.join(d, "mutation.graphql")
+
+                def forms(name):
+                    return [["api", "graphql", "-F", f"query=@{name}"], ["api", "graphql", "-f", f"query=@{name}"],
+                            ["api", "graphql", f"-Fquery=@{name}"], ["api", "graphql", f"-fquery=@{name}"],
+                            ["api", "graphql", "--field", f"query=@{name}"], ["api", "graphql", f"--field=query=@{name}"],
+                            ["api", "graphql", "--raw-field", f"query=@{name}"], ["api", "graphql", f"--raw-field=query=@{name}"],
+                            ["api", "-XPOST", "graphql", "-F", f"query=@{name}"]]
+
+                def inputs(name):
+                    return [["api", "graphql", "--input", name], ["api", "graphql", f"--input={name}"],
+                            ["api", "--method", "POST", "graphql", "--input", name]]
+
+                writes = forms("mutation.graphql") + forms(absolute) + inputs("body.json") + inputs("escaped.json")
+                reads = forms("viewer.graphql") + forms("label.graphql") + inputs("viewer.json") + inputs("label.json")
+                unreadable = (forms("missing.graphql") + forms("latin1.graphql") + forms("folder") + forms("pipe")
+                              + forms("-") + forms("/dev/stdin") + inputs("missing.json") + inputs("folder")
+                              + inputs("pipe") + inputs("-") + inputs("/dev/stdin"))
+                gets = [["api", "graphql", "-X", "GET", "-F", "query=@mutation.graphql"],
+                        ["api", "-XGET", "graphql", "-F", "query=@missing.graphql"],
+                        ["api", "--method=GET", "graphql", "--input", "missing.json"],
+                        ["api", "graphql", "--method", "get", "-f", "query=@-"]]
+                for args in writes + unreadable:
+                    with self.subTest(args=args):
+                        self.assertIs(prbot.is_feedback_write(args), True)
+                for args in reads + gets:
+                    with self.subTest(args=args):
+                        self.assertIs(prbot.is_feedback_write(args), False)
+                # the example from the issue, with a relative path
+                self.assertIs(prbot.is_feedback_write(["api", "graphql", "-F", "query=@mutation.graphql"]), True)
+                with mock.patch("os.open", wraps=os.open) as opened:  # stdin references are never opened
+                    for args in forms("-") + forms("/dev/stdin") + inputs("-") + inputs("/dev/stdin"):
+                        self.assertIs(prbot.is_feedback_write(args), True)
+                    self.assertEqual(opened.call_count, 0)
+                with mock.patch("os.fdopen", side_effect=OSError("read failed")):
+                    self.assertIs(prbot.is_feedback_write(["api", "graphql", "-F", "query=@viewer.graphql"]), True)
+                    self.assertIs(prbot.is_feedback_write(["api", "graphql", "--input", "viewer.json"]), True)
+                with mock.patch("os.fstat", side_effect=OSError("stat failed")):
+                    self.assertIs(prbot.is_feedback_write(["api", "graphql", "--input", "viewer.json"]), True)
+            finally:
+                os.chdir(cwd)
+
 
 class ShellCommands(unittest.TestCase):
     def count(self, cmd):
@@ -64,6 +207,188 @@ class ShellCommands(unittest.TestCase):
         self.assertEqual(self.count('echo "gh pr comment 1 -b x"'), 0)
         self.assertEqual(self.count("gh pr view 15 --comments"), 0)
         self.assertEqual(self.count('gh pr comment 1 -b "unbalanced'), 1)
+
+    def test_redirection_and_substitution_regressions(self):
+        once = [
+            "gh >/dev/null pr comment 13 -b x",
+            "gh > /dev/null pr comment 13 -b x",
+            "gh 2>&1 pr comment 13 -b x",
+            "gh 2>/dev/null pr comment 13 -b x",
+            "gh &>/dev/null pr comment 13 -b x",
+            "gh <in pr comment 13 -b x",
+            "gh pr comment 13 -b x >log 2>&1",
+            "gh pr comment 13 -b x >",
+            "nohup >/tmp/log gh pr comment 13 -b x",
+            "env >/dev/null gh pr comment 13 -b x",
+            "echo hi;>x gh pr comment 13 -b x",
+            "diff <(gh pr comment 13 -b x) y",
+            'echo "$(gh pr comment 13 -b x)"',
+            'x="$(gh pr comment 13 -b x)"',
+            'echo "$(echo $(gh pr comment 13 -b x))"',
+            "echo `echo \\`gh pr comment 13 -b x\\``",
+            "x=`echo \\`echo \\\\\\`gh pr comment 13 -b x\\\\\\`\\``",
+        ]
+        for cmd in once:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(prbot.unrouted_writes(cmd), [["pr", "comment", "13", "-b", "x"]])
+        self.assertEqual(prbot.unrouted_writes("gh pr comment 13 -b 'a>b'"), [["pr", "comment", "13", "-b", "a>b"]])
+        for cmd in ("gh pr view 13 > out.txt", "gh pr view 13 2>&1 | cat", "echo '$(gh pr comment 13 -b x)'",
+                    'echo "\\$(gh pr comment 13 -b x)"', "echo '`gh pr comment 13 -b x`'", "cat <in >out"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.count(cmd), 0)
+
+    def test_guarded_shell_regressions(self):
+        positives = [
+            "gh -R o/r pr comment 1 -b x",
+            "gh pr -R o/r comment 1 -b x",
+            "gh issue --repo o/r comment 1 -b x",
+            "for i in 1 2; do gh pr comment $i -b x; done",
+            "if true; then gh pr comment 1 -b x; fi",
+            "if false; then :; elif gh pr comment 1 -b x; then :; fi",
+            "if false; then :; else gh pr comment 1 -b x; fi",
+            "{ gh pr comment 1 -b x; }",
+            "! gh pr comment 1 -b x",
+            "while gh pr comment 1 -b x; do :; done",
+            'bash -c "gh pr comment 1 -b x"',
+            "sh -c 'gh pr comment 1 -b x'",
+            "zsh -c 'gh pr comment 1 -b x'",
+            "bash -lc 'gh pr comment 1 -b x'",
+            "/bin/bash -e -o pipefail -c 'gh pr comment 1 -b x' name",
+            "bash -c 'for i in 1; do gh pr comment $i -b x; done'",
+            "env -u FOO gh pr comment 1 -b x",
+            "env -uFOO gh pr comment 1 -b x",
+            "env --unset FOO gh pr comment 1 -b x",
+            "env --unset=FOO gh pr comment 1 -b x",
+            "env -i PATH=/usr/bin gh pr comment 1 -b x",
+            "env --ignore-environment A=1 gh pr comment 1 -b x",
+            "/usr/bin/env -- gh pr comment 1 -b x",
+            "env -S 'gh pr comment 1' -b x",
+            "time -p gh pr comment 1 -b x",
+            "time gh pr comment 1 -b x",
+            "command -p gh pr comment 1 -b x",
+            "command gh pr comment 1 -b x",
+            "nohup gh pr comment 1 -b x",
+            "nohup -- gh pr comment 1 -b x",
+            "sudo gh pr comment 1 -b x",
+            "sudo -n -E -H gh pr comment 1 -b x",
+            "sudo -nEH gh pr comment 1 -b x",
+            "sudo -u kenny gh pr comment 1 -b x",
+            "sudo -ukenny gh pr comment 1 -b x",
+            "sudo --user kenny gh pr comment 1 -b x",
+            "sudo --user=kenny gh pr comment 1 -b x",
+            "sudo -g staff -h localhost -p pw: -C 3 gh pr comment 1 -b x",
+            "sudo --group=staff --host=h --prompt=p --close-from=3 gh pr comment 1 -b x",
+            "sudo --group staff --host h --prompt p --close-from 3 gh pr comment 1 -b x",
+            "sudo -- gh pr comment 1 -b x",
+            "echo 1 | xargs gh pr comment -b x",
+            "echo 1 | xargs -0 -r -t -p -x gh pr comment -b x",
+            "echo 1 | xargs -0rtx gh pr comment -b x",
+            "echo 1 | xargs -I {} gh pr comment {} -b x",
+            "echo 1 | xargs -I{} gh pr comment {} -b x",
+            "echo 1 | xargs -n 1 -L 1 -P 4 -s 100 -E EOF -d , gh pr comment -b x",
+            "echo 1 | xargs -n1 -L1 -P4 -s100 -EEOF -d, gh pr comment -b x",
+            "echo 1 | xargs --replace gh pr comment {} -b x",
+            "echo 1 | xargs --replace={} gh pr comment {} -b x",
+            "echo 1 | xargs --max-args 1 --max-procs 2 --max-chars 100 --delimiter , gh pr comment -b x",
+            "echo 1 | xargs --max-args=1 --max-procs=2 --max-chars=100 --delimiter=, gh pr comment -b x",
+            "echo 1 | xargs --max-lines --eof gh pr comment -b x",
+            "echo 1 | xargs --max-lines=1 --eof=EOF gh pr comment -b x",
+            "echo 1 | xargs -- gh pr comment -b x",
+            "echo 1 | xargs -J % gh pr comment % -b x",
+            "echo 1 | xargs -R 1 -I % gh pr comment % -b x",
+            "echo 1 | xargs -S 255 -I % gh pr comment % -b x",
+            "echo 1 | xargs -J% -R1 -S255 gh pr comment % -b x",
+            "env -i sudo -n nohup time -p command -p gh pr comment 1 -b x",
+            "sudo -u k env FOO=1 xargs -n1 gh pr comment -b x",
+            "nohup bash -c 'sudo gh pr comment 1 -b x'",
+            "xargs -I{} sh -c 'gh pr comment {} -b x'",
+            "`gh pr comment 1 -b x`",
+            'echo "`gh pr comment 1 -b x`"',
+            "x=`gh pr comment 1 -b x`",
+            'gh pr comment 1 -b "see \\`ls\\`"',
+            "gh api repos/o/r/pulls/1/reviews -fbody=x",
+            "gh api repos/o/r/pulls/1/reviews -Fbody=x",
+            "gh api -XPOST repos/o/r/issues/1/comments -f body=x",
+            'gh pr close 1 -c "done"',
+            'gh issue close 1 --comment "done"',
+            "if true; then sudo gh -R o/r pr close 1 -c done; fi",
+            "echo ok\ngh pr comment 1 -b x",
+            "for i in 1 2\ndo\n  gh pr comment $i -b x\ndone",
+            "if true\nthen\n  gh pr comment 1 -b x\nfi",
+            "{\n  gh pr comment 1 -b x\n}",
+            "gh pr comment 1 \\\n  -b x",
+            "env -S gh -R o/r pr comment 1 -b x",
+            "env -S 'gh -R o/r pr comment 1' -b x",
+            "env -iS 'gh -R o/r pr comment 1 -b x'",
+            "env --split-string='gh --repo o/r pr comment 1 -b x'",
+            "env -S '-u FOO gh -R o/r pr comment 1 -b x'",
+        ]
+        for cmd in positives:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.count(cmd), 1)
+        negatives = [
+            'echo "gh pr comment 1 -b x"',
+            "echo 'bash -c \"gh pr comment 1 -b x\"'",
+            "echo 'sudo gh pr comment 1 -b x'",
+            "echo '`gh pr comment 1 -b x`'",
+            'echo "\\`gh pr comment 1 -b x\\`"',
+            "gh pr view 15 --comments",
+            "sudo gh pr view 1 --comments",
+            "echo 1 | xargs gh pr view",
+            "bash -c 'gh pr view 1 --comments'",
+            "for i in 1; do gh pr view $i; done",
+            "{ gh pr diff 1; }",
+            "`gh pr view 1`",
+            "gh pr close 1",
+            "prbot gh claude -- pr comment 1 -b hi",
+            "bash -c 'prbot gh claude -- pr comment 1 -b hi'",
+            "sudo prbot gh claude -- pr comment 1 -b x",
+            "echo 1 | xargs prbot gh claude -- pr comment -b x",
+            "for i in 1; do prbot gh claude -- pr comment $i -b x; done",
+            "command -v gh",
+            "bash -c 'echo gh pr comment 1 -b x'",
+            "env -u gh echo pr comment 1 -b x",
+            "sudo -u gh echo pr comment 1 -b x",
+            "xargs -I gh echo pr comment 1 -b x",
+            "time -o gh echo pr comment 1 -b x",
+            "gh pr create -b x -t y",
+            "sudo gh pr merge 1 --squash",
+        ]
+        for cmd in negatives:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.count(cmd), 0)
+        codex = [
+            'gh pr comment 1 -b "@codex review"',
+            "bash -c 'gh pr comment 1 -b \"@codex review\"'",
+            "sudo gh -R o/r pr comment 1 -b '@codex review'",
+            "for i in 1; do gh pr close $i -c '@codex review'; done",
+            "`gh pr comment 1 -b '@codex go'`",
+            "echo 1 | xargs gh pr comment -b '@codex review'",
+        ]
+        for cmd in codex:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.count(cmd), 0)
+                self.assertEqual(len(prbot.unrouted_writes(cmd, codex_triggers_as_bot=True)), 1)
+
+        def nest(cmd, levels, shell="bash"):
+            for _ in range(levels):
+                cmd = f"{shell} -c {shlex.quote(cmd)}"
+            return cmd
+        for shell in ("bash", "sh", "zsh"):
+            with self.subTest(shell=shell):
+                for levels in range(1, 5):
+                    self.assertEqual(self.count(nest("gh pr comment 1 -b x", levels, shell)), 1)
+                self.assertEqual(self.count(nest("gh pr comment 1 -b x", 5, shell)), 0)  # recursion stops
+        self.assertEqual(self.count(nest("`gh pr comment 1 -b x`", 3)), 1)
+        self.assertEqual(self.count(nest("`gh pr comment 1 -b x`", 4)), 0)
+        self.assertEqual(self.count(nest("prbot gh claude -- pr comment 1 -b x", 4)), 0)
+        self.assertEqual(prbot.unrouted_writes("bash -c 'gh -R o/r pr comment 1 -b x'"),
+                         [["-R", "o/r", "pr", "comment", "1", "-b", "x"]])
+        self.assertEqual(prbot.unrouted_writes("env -S gh -R o/r pr comment 1 -b x"),
+                         [["-R", "o/r", "pr", "comment", "1", "-b", "x"]])
+        self.assertEqual(prbot.unrouted_writes('gh pr comment 1 \\\n  -b "two\nlines"'),
+                         [["pr", "comment", "1", "-b", "two\nlines"]])  # a quoted newline stays in the body
+        self.assertEqual(self.count('echo "gh pr comment 1\n-b x"'), 0)
 
 
 class GitPush(unittest.TestCase):
@@ -83,6 +408,60 @@ class GitPush(unittest.TestCase):
         self.assertEqual(found, [(["commit", "-m", "x"], None), (["-C", "repo", "push", "origin", "main"], "repo")])
         self.assertEqual(list(prbot.git_writes("prbot git claude -- commit -m x && prbot git claude -- push")), [])
         self.assertEqual(list(prbot.git_writes('echo "git push"')), [])
+
+    def test_git_option_and_redirection_regressions(self):
+        cases = [
+            ("git >/dev/null push origin HEAD", [(["push", "origin", "HEAD"], None)]),
+            ("git 2>&1 commit -m x", [(["commit", "-m", "x"], None)]),
+            ("git --git-dir .git push origin HEAD", [(["--git-dir", ".git", "push", "origin", "HEAD"], ".git")]),
+            ("git --git-dir=other/.git push", [(["--git-dir=other/.git", "push"], "other/.git")]),
+            ("git -C repo --git-dir .git push", [(["-C", "repo", "--git-dir", ".git", "push"], "repo/.git")]),
+            ("git --work-tree . commit -m x", [(["--work-tree", ".", "commit", "-m", "x"], None)]),
+            ("git --namespace n push", [(["--namespace", "n", "push"], None)]),
+            ("git --config-env a.b=C push", [(["--config-env", "a.b=C", "push"], None)]),
+            ("git log > push", []),
+            ("git --git-dir push status", []),
+        ]
+        for cmd, want in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(list(prbot.git_writes(cmd)), want)
+        self.assertEqual(prbot.git_subcommand(["--work-tree", "push", "status"]), (2, "status"))
+
+    def test_nested_git_write_regressions(self):
+        commit, push = ["commit", "-m", "x"], ["-C", "repo", "push", "origin", "main"]
+        cases = [
+            ("for d in a; do git commit -m x; done", [(commit, None)]),
+            ("if true; then git -C repo push origin main; fi", [(push, "repo")]),
+            ("if false; then :; elif true; then :; else git commit -m x; fi", [(commit, None)]),
+            ("{ git -C repo push origin main; }", [(push, "repo")]),
+            ("! git commit -m x", [(commit, None)]),
+            ("env -u FOO git commit -m x", [(commit, None)]),
+            ("env -i A=1 git -C repo push origin main", [(push, "repo")]),
+            ("sudo -u kenny git -C repo push origin main", [(push, "repo")]),
+            ("sudo -n git commit -m x", [(commit, None)]),
+            ("nohup git -C repo push origin main", [(push, "repo")]),
+            ("time -p git commit -m x", [(commit, None)]),
+            ("command -p git -C repo push origin main", [(push, "repo")]),
+            ("echo main | xargs -I{} git -C repo push origin {}", [(["-C", "repo", "push", "origin", "{}"], "repo")]),
+            ("echo x | xargs -n1 git commit -m", [(["commit", "-m"], None)]),
+            ("echo main | xargs -J % git -C repo push origin %", [(["-C", "repo", "push", "origin", "%"], "repo")]),
+            ("bash -c 'git -C repo push origin main'", [(push, "repo")]),
+            ("sh -c 'git commit -m x'", [(commit, None)]),
+            ("zsh -c 'git -C repo push origin main'", [(push, "repo")]),
+            ("bash -lc 'git commit -m x && git -C repo push origin main'", [(commit, None), (push, "repo")]),
+            ("sudo bash -c 'env -u X git -C repo push origin main'", [(push, "repo")]),
+            ("`git commit -m x`", [(commit, None)]),
+            ("git status\ngit commit -m x", [(commit, None)]),
+            ("env -S 'git -C repo push origin main'", [(push, "repo")]),
+            ("bash -c 'echo git push'", []),
+            ("bash -c 'prbot git claude -- push'", []),
+            ("sudo git status", []),
+            ("echo 1 | xargs git log", []),
+            ("for d in a; do prbot git claude -- commit -m x; done", []),
+        ]
+        for cmd, want in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(list(prbot.git_writes(cmd)), want)
 
     def test_commits_get_the_bot_identity(self):
         # regression: commits authored as Claude <noreply@anthropic.com> showed Anthropic's claude account on
