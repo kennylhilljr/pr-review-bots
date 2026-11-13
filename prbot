@@ -178,9 +178,12 @@ def _bounded_int(digits):
 
 def _dangling_ancestor(path):
     """The first of path's parent directories that is a symlink whose target does not exist, else None."""
-    # Join with the working directory without normalising: abspath would fold a/link/.. into a before the
-    # symlink is ever checked.
-    for p in (Path(os.getcwd()) / path).parents:
+    # Join a relative path with the working directory without normalising: abspath would fold a/link/.. into a
+    # before the symlink is ever checked. An absolute path needs no working directory, which may be gone.
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path(os.getcwd()) / path
+    for p in path.parents:
         if os.path.islink(p) and not os.path.exists(p):
             return p
     return None
