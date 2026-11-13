@@ -22,6 +22,70 @@ if "tests" not in sys.modules:
 
 prbot = load("prbot", ROOT / "prbot")
 
+# issue #20: every gh alias and extension bypass from the issue and its plan reviews. Each one was classified as a
+# read on main, so the Codex shim ran the real gh as Kenny. (name, gh argv, gh config.yml or None). The config only
+# shows what real gh would expand; classify never reads it.
+SHELL_ALIAS = "aliases:\n    human-review: '!gh pr review 1 --approve'\n"
+ISSUE_20_BYPASSES = [
+    ("alias set", ["alias", "set", "human-review", "pr review"], None),
+    ("alias set after -R", ["-R", "o/r", "alias", "set", "x", "pr review"], None),
+    ("alias import", ["alias", "import", "aliases.yml"], None),
+    ("alias delete", ["alias", "delete", "co"], None),
+    ("user alias", ["human-review", "19", "--approve", "-b", "looks good"],
+     "aliases:\n    human-review: pr review\n"),
+    ("user alias with no config", ["human-review", "19", "--approve"], None),
+    ("user alias after -R", ["-R", "o/r", "human-review", "19", "--approve"],
+     "aliases:\n    human-review: pr review\n"),
+    ("nested alias", ["nested", "19", "--approve"], "aliases:\n    nested: human-review\n    human-review: pr review\n"),
+    ("alias with $1", ["say", "3"], "aliases:\n    say: 'pr comment $1 -b hi'\n"),
+    ("shell alias", ["human-review"], SHELL_ALIAS),
+    ("default co", ["co", "19"], None),
+    ("co override, quoted aliases key", ["co", "19", "--approve"], "'aliases':\n  co: pr review\n"),
+    ("co override, double-quoted key", ["co", "19", "--approve"], '"aliases":\n  co: pr review\n'),
+    ("co override, space before colon", ["co", "19", "--approve"], "aliases :\n  co: pr review\n"),
+    ("co override, flow mapping", ["co", "19", "--approve"], "aliases: {co: pr review}\n"),
+    ("co override, block scalar", ["co", "19", "--approve"], "aliases:\n  co: |-\n    pr review\n"),
+    ("co override, anchor", ["co", "19", "--approve"], "x: &a pr review\naliases:\n  co: *a\n"),
+    ("subcommand alias", ["pr", "human-review", "19", "--approve"], "aliases:\n  'pr human-review': pr review\n"),
+    ("subcommand alias after -R", ["pr", "-R", "o/r", "human-review", "19", "--approve"],
+     "aliases:\n  'pr human-review': pr review\n"),
+    ("subcommand alias after a leading -R", ["-R", "o/r", "issue", "human-review", "19"],
+     "aliases:\n  'issue human-review': pr review 19 --approve\n"),
+    ("ext subcommand alias", ["ext", "human-review", "19", "--approve"],
+     "aliases:\n  'extension human-review': pr review\n"),
+    ("extension subcommand alias", ["extension", "human-review", "19", "--approve"],
+     "aliases:\n  'ext human-review': pr review\n"),
+    ("extensions subcommand alias", ["extensions", "human-review", "19", "--approve"],
+     "aliases:\n  'extension human-review': pr review\n"),
+    ("nested group alias", ["repo", "autolink", "human-review", "19"],
+     "aliases:\n  'repo autolink human-review': pr review 19 --approve\n"),
+    ("extension exec", ["extension", "exec", "reviewer"], None),
+    ("ext exec", ["ext", "exec", "reviewer"], None),
+    ("extension", ["reviewer", "pr", "review", "19", "--approve"], None),
+    ("--help before a shell alias", ["--help", "human-review"], SHELL_ALIAS),
+    ("-h before a shell alias", ["-h", "human-review"], SHELL_ALIAS),
+    ("--version before a shell alias", ["--version", "human-review"], SHELL_ALIAS),
+    ("--help between group and alias", ["pr", "--help", "human-review"],
+     "aliases:\n  'pr human-review': '!gh pr review 1 --approve'\n"),
+    ("shell alias named gh", ["gh", "--version"], "aliases:\n  gh: '!gh pr review 1 --approve'\n"),
+]
+# what the bots and skills run with plain gh: (gh argv, expected classify answer, True for a feedback write)
+BOT_READS = [
+    ["--version"], ["--help"], ["-h"], [], ["version"], ["help"], ["help", "pr", "review"], ["pr"], ["pr", "--help"],
+    ["pr", "view", "15", "--json", "reviews"], ["pr", "view", "--help"], ["pr", "diff", "15"], ["pr", "list"],
+    ["pr", "ls"], ["pr", "checks", "15"], ["pr", "status"], ["-R", "o/r", "pr", "view", "1", "--comments"],
+    ["pr", "--repo", "o/r", "diff", "1"], ["issue", "view", "9", "--comments"], ["issue", "list"],
+    ["repo", "view"], ["run", "view", "1"], ["run", "list"], ["run", "watch", "1"], ["workflow", "list"],
+    ["release", "list"], ["label", "list"], ["auth", "status"], ["search", "prs", "x"],
+    ["api", "repos/o/r/pulls/15/comments"], ["api", "graphql", "-f", "query=query { viewer { login } }"],
+    ["ext", "list"], ["extension", "ls"], ["alias", "list"], ["config", "get", "git_protocol"],
+    # writes that are not PR feedback stay on the user's account, as before
+    ["pr", "create", "-t", "t", "-b", "x"], ["pr", "merge", "1", "--squash", "--delete-branch"],
+    ["pr", "edit", "1", "-b", "x"], ["pr", "checkout", "1"], ["pr", "co", "1"], ["pr", "ready", "1"],
+    ["pr", "close", "1"], ["issue", "create", "-t", "t", "-b", "x"], ["issue", "close", "1"],
+    ["repo", "clone", "o/r"], ["label", "create", "bot:skip"], ["pr", "comment", "1", "-b", "@codex review"],
+]
+
 
 class Classify(unittest.TestCase):
     cases = [
@@ -179,6 +243,61 @@ class Classify(unittest.TestCase):
                 self.assertIs(prbot.is_feedback_write(args), False)
                 self.assertIs(prbot.is_feedback_write(args, codex_triggers_as_bot=False), False)
                 self.assertIs(prbot.is_feedback_write(args, codex_triggers_as_bot=True), True)
+
+    def test_gh_alias_and_extension_bypasses_are_refused(self):
+        """issue #20: classify_gh refuses every alias and extension bypass, whatever the gh config says."""
+        for name, args, _ in ISSUE_20_BYPASSES:
+            with self.subTest(name, args=args):
+                self.assertIs(prbot.is_feedback_write(args), False, "main's classifier called this a read")
+                with self.assertRaises(prbot.Undecided):
+                    prbot.classify_gh(args)
+                with self.assertRaises(prbot.Undecided):
+                    prbot.classify_gh(args, codex_triggers_as_bot=True)
+
+    def test_safe_list_keeps_every_builtin_answer(self):
+        """Calls on the safe list get is_feedback_write's answer unchanged, so bot reads and routed writes still work."""
+        for args in BOT_READS:
+            with self.subTest(args=args):
+                self.assertIs(prbot.classify_gh(args), False)
+        self.assertIs(prbot.classify_gh(["pr", "comment", "1", "-b", "@codex review"], True), True)
+        for args, want in self.cases:
+            with self.subTest(args=args):
+                self.assertIs(prbot.classify_gh(args), want)
+        for args in self.CODEX_BYPASSES:
+            with self.subTest(args=args):
+                self.assertIs(prbot.classify_gh(args), True)
+        for args in self.CODEX_TRIGGERS:
+            with self.subTest(args=args):
+                self.assertIs(prbot.classify_gh(args), False)
+                self.assertIs(prbot.classify_gh(args, codex_triggers_as_bot=True), True)
+        for args in (["-R", "o/r", "pr", "review", "1", "--approve"], ["pr", "--repo=o/r", "review", "1", "-a"],
+                     ["issue", "close", "1", "-c", "done"], ["api", "-XPOST", "repos/o/r/issues/1/comments"]):
+            with self.subTest(args=args):
+                self.assertIs(prbot.classify_gh(args), True)
+
+    def test_safe_list_refuses_gh_setup_tokens_and_unknown_subcommands(self):
+        for args in (["auth", "token"], ["auth", "status", "-t"], ["auth", "status", "--show-token"],
+                     ["auth", "status", "-at"], ["auth", "login"], ["auth", "setup-git"], ["config", "set", "pager", "x"],
+                     ["config", "set", "editor", "x"], ["extension", "install", "o/gh-x"], ["ext", "upgrade", "--all"],
+                     ["copilot"], ["codespace", "ssh"], ["cs", "list"], ["preview", "prompter"], ["agent-task", "create"],
+                     ["skill", "install", "x"], ["pr", "human-review"], ["pr", "--foo", "view", "1"], ["--foo", "pr", "view"],
+                     ["help", "human-review"], ["accessibility", "human-review"], ["PR", "review", "1", "--approve"]):
+            with self.subTest(args=args):
+                with self.assertRaises(prbot.Undecided):
+                    prbot.classify_gh(args)
+        self.assertIs(prbot.classify_gh(["auth", "status", "-h", "github.com"]), False)
+        self.assertIs(prbot.classify_gh(["auth", "status", "--hostname", "github.com", "--active"]), False)
+
+    def test_classify_gh_never_reads_gh_config(self):
+        """The safe list does not depend on gh's config.yml, so no config, however it is written, changes an answer."""
+        with mock.patch("builtins.open", side_effect=AssertionError("opened a file")), \
+                mock.patch.object(Path, "read_text", side_effect=AssertionError("read a file")):
+            for args in BOT_READS:
+                with self.subTest(args=args):
+                    self.assertIs(prbot.classify_gh(args), False)
+            for _, args, _ in ISSUE_20_BYPASSES:
+                with self.subTest(args=args), self.assertRaises(prbot.Undecided):
+                    prbot.classify_gh(args)
 
     def test_graphql_route_and_mutation_regressions(self):
         for name in ("deleteIssueComment", "deletePullRequestReview", "deletePullRequestReviewComment",
@@ -2675,6 +2794,39 @@ class CodexShim(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn("bot 'codex' is not registered", r.stderr)
 
+    def _fake_gh_env(self, cfg, fake, ghcfg):
+        calls = Path(fake, "calls.log")
+        gh = Path(fake, "gh")  # stands in for the real gh, so nothing can post even if classification fails
+        gh.write_text(f"#!/bin/sh\necho \"$@\" >> {shlex.quote(str(calls))}\nexit 0\n")
+        gh.chmod(0o755)
+        env = dict(os.environ, PRBOT_CONFIG_DIR=cfg, PRBOT_BOT="codex", GH_CONFIG_DIR=ghcfg,
+                   PATH=os.pathsep.join([str(ROOT / "integrations/codex/bin"), fake, os.path.dirname(sys.executable),
+                                         "/usr/bin", "/bin"]))
+        env.pop("PRBOT_ACTIVE", None)
+        return calls, env
+
+    def test_gh_aliases_and_extensions_never_reach_real_gh(self):
+        """issue #20: the shim refuses every alias and extension bypass before the (fake) real gh runs, whatever
+        gh's config.yml holds, and still passes the bots' reads through."""
+        for name, args, config in ISSUE_20_BYPASSES:
+            with self.subTest(name, args=args), tempfile.TemporaryDirectory() as cfg, \
+                    tempfile.TemporaryDirectory() as fake, tempfile.TemporaryDirectory() as ghcfg:
+                if config is not None:
+                    Path(ghcfg, "config.yml").write_text(config)
+                calls, env = self._fake_gh_env(cfg, fake, ghcfg)
+                r = subprocess.run(["gh", *args], capture_output=True, text=True, env=env, timeout=30)
+                self.assertFalse(calls.exists(), "the shim ran the real gh")
+                self.assertEqual(r.returncode, 4, r.stderr)
+                self.assertIn("refusing to run real gh", r.stderr)
+        with tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as fake, \
+                tempfile.TemporaryDirectory() as ghcfg:
+            calls, env = self._fake_gh_env(cfg, fake, ghcfg)
+            for args in BOT_READS:
+                with self.subTest(read=args):
+                    r = subprocess.run(["gh", *args], capture_output=True, text=True, env=env, timeout=30)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(calls.read_text().splitlines(), [" ".join(a) for a in BOT_READS])
+
     def test_routes_global_repo_feedback(self):
         with tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as fake:
             calls = Path(fake, "calls.log")
@@ -2694,6 +2846,18 @@ class GuardDocs(unittest.TestCase):
     @staticmethod
     def norm(text):
         return " ".join(text.replace("`", "").split())
+
+    def test_shim_safe_list_is_documented(self):
+        """issue #20: the docs say the shim refuses aliases and extensions and that classify never reads config.yml."""
+        for name in ("README.md", "DESIGN.md", "AGENTS.md"):
+            text = self.norm((ROOT / name).read_text())
+            with self.subTest(name):
+                self.assertIn("alias", text)
+                self.assertIn("extension", text)
+        design = self.norm((ROOT / "DESIGN.md").read_text())
+        for phrase in ("classify never reads it", "gh alias set human-review 'pr review'", "co is a config alias"):
+            self.assertIn(phrase, design)
+        self.assertIn("GH_SAFE_SUBCOMMANDS", self.norm((ROOT / "AGENTS.md").read_text()))
 
     def between(self, name, start, end):
         text = (ROOT / name).read_text()
@@ -2859,6 +3023,27 @@ class ClassifyCli(unittest.TestCase):
         r = self.run_prbot("classify", "--", "pr", "review", "1", "--approve", "-b", "@codex looks good")
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "write"), r.stderr)
         r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "@codex review")
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "read"), r.stderr)
+
+    def test_gh_alias_and_extension_bypasses_exit_4(self):
+        """issue #20: classify exits 4 for every alias and extension bypass and never prints read; the argv after
+        `--` is kept whole, so `classify -- gh --version` is a command named gh, not gh --version."""
+        ghcfg = self.dir / "gh"
+        ghcfg.mkdir()
+        for name, args, config in ISSUE_20_BYPASSES:
+            with self.subTest(name, args=args):
+                (ghcfg / "config.yml").write_text(config or "")
+                r = self.run_prbot("classify", "--", *args, env={"GH_CONFIG_DIR": str(ghcfg)})
+                self.assertEqual(r.returncode, 4, r.stderr)
+                self.assertEqual(r.stdout, "")
+                self.assertIn("prbot classify: ", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+        r = self.run_prbot("classify", "--", "alias", "set", "human-review", "pr review")
+        self.assertIn("gh alias set", r.stderr)
+        r = self.run_prbot("classify", "--", "human-review", "19")
+        self.assertIn("not a built-in gh command", r.stderr)
+        # without `--` a leading gh is still dropped, as before
+        r = self.run_prbot("classify", "gh", "pr", "view", "1")
         self.assertEqual((r.returncode, r.stdout.strip()), (1, "read"), r.stderr)
 
     def test_config_is_a_directory(self):

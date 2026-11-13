@@ -196,7 +196,23 @@ safe list closes the shell-level gaps; the hook stops mistakes and is not a sand
 program that builds the gh command itself (a script file, `python3 -c` with
 string pieces, an executable copied under another name) is out of reach, as
 before. `prbot classify` and the Codex shim keep the feedback classifier above,
-because they see argv, not shell text.
+because they see argv, not shell text, behind a gh safe list of their own
+(`classify_gh`). Real gh expands aliases from its config.yml and runs
+extensions under any name it does not own, so `gh alias set human-review 'pr
+review'` followed by `gh human-review 19 --approve` would approve a PR as Kenny.
+Parsing config.yml to follow aliases kept missing YAML forms (a quoted
+`'aliases'` key, flow mappings, a redefined `co`), so classify never reads it.
+It lets a call run as a read only when the first word after `-R`, `--repo` and
+`--hostname` is a built-in gh command and, for a command group, the subcommand
+is on that group's list. gh nests aliases only under groups, never under a
+runnable command, and never lets one shadow a built-in name, so this covers
+every alias whatever the config says. Built-in names such as `ext` for
+`extension` count as the group they name; `co` is a config alias and is
+refused. Everything else exits 4: unknown words (aliases, extensions, `gh gh`
+after `--`), unlisted subcommands (`gh pr human-review`, `gh ext human-review`,
+`gh extension exec`, `gh alias set` and `import`, `gh config set`, `gh auth
+token`) and a flag before the command (`gh --help human-review`), since gh
+hands the rest of the line to a shell alias unparsed.
 
 What stays on Kenny's login: `gh pr create`, `gh issue create`, `gh pr merge`
 and `gh pr edit`, and `@codex` trigger comments, including a close comment that

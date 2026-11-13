@@ -250,7 +250,7 @@ Start Codex through the launcher, which puts a `gh` shim first on PATH:
 ~/Documents/GitHub/pr-review-bots/integrations/codex/codex-as-bot
 ```
 
-Feedback writes go through `prbot gh codex`; every other `gh` call reaches the real `gh`.
+Feedback writes go through `prbot gh codex`. Other `gh` calls reach the real `gh` only when they are on the shim's safe list: a built-in gh command and, for a command group such as `pr` or `repo`, a subcommand listed for it in `GH_SAFE_SUBCOMMANDS` in `prbot` (the reads the bots use, `pr create`, `pr merge`, `pr edit`, `pr checkout`, `issue create`, `repo clone` and the like). Everything else is refused with exit 4 and a one-line reason: gh aliases (yours and the default `co`; use `gh pr checkout`), extensions, a subcommand alias such as `gh pr human-review`, `gh alias set`, `gh alias import`, `gh extension exec`, `gh config set`, `gh auth token` and a flag before the command (`gh --help human-review`). Real gh expands aliases from its config.yml, so `gh alias set human-review 'pr review'` would otherwise let a Codex session approve a PR as you. Run those from your own terminal.
 
 ## CLI reference
 
@@ -264,7 +264,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `prbot git <bot> [-R owner/repo] -- <git args>` | Runs `git` (push) with a one-repo contents-write token. | `git`'s own code, or 2 |
 | `prbot review <pr> [-R owner/repo] [--reviewer claude\|codex\|both] [--dry-run\|--route-only]` | Routes, runs and posts a cross-review. | 0, 2 on error, 3 when the author is unclear |
 | `prbot watch [--dry-run] [--limit N] [--baseline] [--from-queue DIR]` | One pass of automatic reviews over open PRs, or over the PRs named in the event files in `DIR`. | 0, or 2 (with `--from-queue`, also when a PR failed) |
-| `prbot classify -- <gh args>` | Used by the hook and shim. Prints write or read on stdout. | 0 if the call posts PR feedback, 1 if it does not (other writes included), 4 when it can't decide (for example an unreadable config) |
+| `prbot classify -- <gh args>` | Used by the hook and shim. Prints write or read on stdout. | 0 if the call posts PR feedback, 1 if it does not (other writes included), 4 when it can't decide (for example an unreadable config) or the call is off the shim's gh safe list (an alias, an extension, `gh alias set`, `gh extension exec`) |
 
 `<bot>` is `claude` or `codex`. `<pr>` is a number or a PR URL.
 
