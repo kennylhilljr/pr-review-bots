@@ -264,7 +264,7 @@ Feedback writes go through `prbot gh codex`; every other `gh` call reaches the r
 | `prbot git <bot> [-R owner/repo] -- <git args>` | Runs `git` (push) with a one-repo contents-write token. | `git`'s own code, or 2 |
 | `prbot review <pr> [-R owner/repo] [--reviewer claude\|codex\|both] [--dry-run\|--route-only]` | Routes, runs and posts a cross-review. | 0, 2 on error, 3 when the author is unclear |
 | `prbot watch [--dry-run] [--limit N] [--baseline] [--from-queue DIR]` | One pass of automatic reviews over open PRs, or over the PRs named in the event files in `DIR`. | 0, or 2 (with `--from-queue`, also when a PR failed) |
-| `prbot classify -- <gh args>` | Used by the hook and shim. | 0 if the call posts PR feedback, else 1 |
+| `prbot classify -- <gh args>` | Used by the hook and shim. Prints write or read on stdout. | 0 if the call posts PR feedback, 1 if it does not (other writes included), 4 when it can't decide (for example an unreadable config) |
 
 `<bot>` is `claude` or `codex`. `<pr>` is a number or a PR URL.
 
@@ -321,6 +321,10 @@ gh auth status
 ### The guard blocks something you meant to post as yourself
 
 Post it from your own terminal; the hook only applies inside Claude Code.
+
+### `prbot guard failed`
+
+While the guard is broken, the Claude Code hook refuses any Bash command containing `gh`, `prbot` or `git`, reads included, and any command it can't prove stays away from them: anything with `$`, a backtick or parentheses, any output redirection to a file (`> file`, `>> file`; `2>&1` and `> /dev/null` still pass), and anything that starts a program other than simple ones such as `ls`, `cat`, `grep`, `head` or `wc` (so `sh`, `env`, `make` and scripts are refused too). Claude can still fix the config with its file tools. The denial names the error type (ConfigError, ImportError, OSError and so on) and its message; for a ConfigError that says the file is not valid JSON, run `python3 -m json.tool ~/.config/prbot/config.json` to find the problem; for any other ConfigError, follow its message about the field or type. Then fix or remove the file. Separately, `prbot classify` exits 4 with its own one-line message when it can't decide, and the Codex shim then refuses the call and shows that message. Every other prbot command exits 2 with a one-line message naming the config path when `config.json` is not valid JSON, is not UTF-8 text, is not a JSON object, has a `claude` or `codex` entry without a string `owner`, is a dangling symlink or sits in a config directory that is one, or can't be read (it is a directory, say, or its permissions block reading), for example `prbot: /Users/you/.config/prbot/config.json: cannot read (PermissionError: permission denied; check the file's mode and owner); fix or remove it`. A queue run prints the same line, exits 2 and leaves every file in the queue until the config is fixed.
 
 ## Contributing
 

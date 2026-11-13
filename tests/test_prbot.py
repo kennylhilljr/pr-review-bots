@@ -1,5 +1,5 @@
 """Tests for prbot, the Claude Code guard hook and the Codex gh shim. Run: python3 -B -m unittest discover -s tests -t . -v"""
-import base64, importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest
+import base64, importlib.util, json, os, shutil, subprocess, sys, tempfile, time, unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -12,6 +12,12 @@ def load(name, path):
     loader.exec_module(mod)
     return mod
 
+
+if "tests" not in sys.modules:
+    _spec = importlib.util.spec_from_file_location("tests", Path(__file__).resolve().parent / "__init__.py")
+    _boot = importlib.util.module_from_spec(_spec)
+    sys.modules["tests"] = _boot
+    _spec.loader.exec_module(_boot)
 
 prbot = load("prbot", ROOT / "prbot")
 
@@ -563,6 +569,134 @@ class WatchQueue(unittest.TestCase):
         code, log = self.run_queue(limit=5)
         self.assertEqual((code, self.runs, self.left()), (0, [(4, "claude")], []))
         self.assertNotIn("skipped", json.loads(prbot.WATCH_STATE.read_text())["o/r#4@" + "d" * 10])
+
+    def test_config_problem_goes_to_stderr_and_moves_nothing(self):
+        """A broken config makes a queue run print the one-line config message on stderr, log it, and exit 2
+        before it moves anything: event, malformed and unsupported files all stay in the queue."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        def broken():
+            raise prbot.ConfigError(f"{prbot.CONFIG}: not valid JSON; fix or remove it")
+        prbot.load_config = broken
+        Path(self.queue, "junk.json").write_text("{bad")
+        os.utime(Path(self.queue, "junk.json"), (0, 0))  # settled long ago, so a healthy run would reject it
+        Path(self.queue, "subdir").mkdir()
+        names = sorted([self.event(2).name, self.event(5).name, "junk.json", "subdir"])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = prbot.cmd_watch(queue=str(self.queue), limit=5)
+        self.assertEqual(code, 2)
+        self.assertEqual(err.getvalue(), f"prbot: {prbot.CONFIG}: not valid JSON; fix or remove it\n")
+        self.assertIn("queue: config problem, leaving every file in the queue", out.getvalue())
+        self.assertNotIn("ConfigError(", out.getvalue())
+        self.assertEqual((self.runs, self.left(), self.names("deferred"), self.names("rejected")),
+                         ([], names, [], []))
+
+    def test_empty_queue_with_a_broken_config_exits_2(self):
+        """An empty queue still reports a broken config: exit 2 with the one line, not a silent 0."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        def broken():
+            raise prbot.ConfigError(f"{prbot.CONFIG}: not valid JSON; fix or remove it")
+        prbot.load_config = broken
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(prbot.main(["watch", "--from-queue", str(self.queue)]), 2)
+        self.assertEqual(err.getvalue(), f"prbot: {prbot.CONFIG}: not valid JSON; fix or remove it\n")
+
+    def test_config_problem_is_reported_even_when_another_run_holds_the_lock(self):
+        """A queue run that finds the lock taken still reports a broken config: exit 2 with the line, not 0."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        def broken():
+            raise prbot.ConfigError(f"{prbot.CONFIG}: not valid JSON; fix or remove it")
+        prbot.load_config = broken
+        self.addCleanup(setattr, prbot, "watch_lock", prbot.watch_lock)
+        prbot.watch_lock = lambda: None
+        name = self.event(2).name
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(prbot.main(["watch", "--from-queue", str(self.queue)]), 2)
+        self.assertEqual(err.getvalue(), f"prbot: {prbot.CONFIG}: not valid JSON; fix or remove it\n")
+        self.assertEqual((self.left(), self.names("deferred")), ([name], []))
+
+    def test_config_breaking_mid_run_is_reported_and_retried(self):
+        """If the config breaks after the check at the start, the line goes to stderr and the events are deferred
+        for a retry, as for any lookup failure: nothing is rejected or reviewed."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        good, calls = prbot.load_config, []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) > 2:
+                raise prbot.ConfigError(f"{prbot.CONFIG}: not valid JSON; fix or remove it")
+            return good()
+        prbot.load_config = flaky
+        names = sorted([self.event(2).name, self.event(5).name])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = prbot.cmd_watch(queue=str(self.queue), limit=5)
+        self.assertEqual(code, 2)
+        self.assertGreater(len(calls), 2)
+        self.assertEqual(err.getvalue(), f"prbot: {prbot.CONFIG}: not valid JSON; fix or remove it\n")
+        self.assertIn("queue: config problem during the run, deferring the event files", out.getvalue())
+        self.assertEqual((self.runs, self.left(), self.names("deferred"), self.names("rejected")),
+                         ([], [], names, []))
+
+    def run_queue_capturing(self, **kw):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = prbot.cmd_watch(queue=str(self.queue), **kw)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_config_problem_in_the_installation_lookup_is_printed_once_and_retried(self):
+        """A config error raised inside the installation lookup prints the config line once on stderr; the events
+        are deferred for a retry as for any lookup failure."""
+        line = f"{prbot.CONFIG}: not valid JSON; fix or remove it"
+
+        def broken(bot):
+            raise prbot.ConfigError(line)
+        prbot.installed_repos = broken
+        names = sorted([self.event(2).name, self.event(5).name])
+        code, _, err = self.run_queue_capturing(limit=5)
+        self.assertEqual(code, 2)
+        self.assertEqual(err, f"prbot: {line}\n")
+        self.assertEqual((self.runs, self.left(), self.names("deferred")), ([], [], names))
+
+    def test_config_problem_during_a_review_is_printed_once_and_retried(self):
+        """A config error raised by a review prints the config line once on stderr, however many PRs hit it."""
+        line = f"{prbot.CONFIG}: not valid JSON; fix or remove it"
+
+        def broken(n, repo, mode, only):
+            self.runs.append((int(n), only[0]))
+            raise prbot.ConfigError(line)
+        prbot.cmd_review = broken
+        names = sorted([self.event(2).name, self.event(5).name])
+        code, _, err = self.run_queue_capturing(limit=5)
+        self.assertEqual(code, 2)
+        self.assertEqual(err, f"prbot: {line}\n")
+        self.assertEqual((self.left(), self.names("deferred")), ([], names))
+
+    def test_full_pass_reports_a_broken_config_even_when_the_lock_is_held(self):
+        """A plain watch run that finds the lock taken still reports a broken config: exit 2 with the line."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        def broken():
+            raise prbot.ConfigError(f"{prbot.CONFIG}: not valid JSON; fix or remove it")
+        prbot.load_config = broken
+        self.addCleanup(setattr, prbot, "watch_lock", prbot.watch_lock)
+        prbot.watch_lock = lambda: None
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(prbot.main(["watch"]), 2)
+        self.assertEqual(err.getvalue(), f"prbot: {prbot.CONFIG}: not valid JSON; fix or remove it\n")
 
     def test_failed_pr_is_deferred_and_the_rest_go_on(self):
         prbot.WATCH_STATE.write_text(json.dumps({"other/repo#1@" + "1" * 10: {"skipped": "x"}}))
@@ -1340,6 +1474,286 @@ class Hook(unittest.TestCase):
         self.assertIsNone(self.run_hook("gh pr view 15 --json reviews"))
         self.assertIsNone(self.run_hook("prbot gh claude -- pr comment 15 -b ok"))
 
+    HOOK = ROOT / "integrations/claude-code/guard_gh_identity.py"
+
+    def reason(self, out):
+        self.assertIsNotNone(out)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def break_config(self):
+        Path(self.tmp.name, "config.json").write_text("{bad")
+
+    def run_raw(self, stdin):
+        r = subprocess.run([sys.executable, self.HOOK], input=stdin, capture_output=True, text=True, env=self.env)
+        return r
+
+    def run_with_stub(self, setup, payload):
+        """Run the hook in a subprocess after `setup` (Python source) patches `module`.
+
+        `payload` is a Python expression, evaluated after `setup`, so it can use `tmp`."""
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        runner = Path(d, "runner.py")
+        runner.write_text(
+            "import importlib.util, io, json, os, sys, types\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            f"loader = SourceFileLoader('guard', {str(self.HOOK)!r})\n"
+            "module = importlib.util.module_from_spec(importlib.util.spec_from_loader('guard', loader))\n"
+            "loader.exec_module(module)\n"
+            f"tmp = {d!r}\n"
+            + setup +
+            f"\nsys.stdin = io.StringIO(json.dumps({payload}))\n"
+            "sys.exit(module.main())\n")
+        return subprocess.run([sys.executable, "-B", runner], capture_output=True, text=True, env=self.env), d
+
+    def test_broken_config_feedback_write_gets_routing_fix_and_guard_note(self):
+        """(a) A broken config still gets the routing fix for a gh write, plus a guard note without config contents."""
+        self.break_config()
+        reason = self.reason(self.run_hook("gh pr comment 1 -b x"))
+        self.assertIn("gh claude -- pr comment 1 -b x", reason)
+        self.assertIn("prbot guard failed", reason)
+        self.assertIn("~/.config/prbot/config.json", reason)
+        self.assertNotIn("{bad", reason)
+        self.assertNotIn("Traceback", reason)
+
+    def test_broken_config_denies_routed_prbot_call_bare_token(self):
+        """(b) With a broken config even a routed prbot call is refused on the bare token."""
+        self.break_config()
+        reason = self.reason(self.run_hook("./prbot gh claude -- pr comment 1 -b x"))
+        self.assertTrue(reason.startswith("prbot guard failed"), reason)
+        self.assertIn("~/.config/prbot/config.json", reason)
+
+    def test_broken_config_denies_executable_path_gh_read(self):
+        """(c) With a broken config a gh read called by its full path is refused."""
+        self.break_config()
+        reason = self.reason(self.run_hook("/usr/bin/gh pr view 1"))
+        self.assertTrue(reason.startswith("prbot guard failed"), reason)
+
+    def test_broken_config_denies_git_push_and_commit(self):
+        """(d) With a broken config git push and commit are refused as candidates; other commands pass."""
+        self.break_config()
+        repo = self.make_repo("kennylhilljr")
+        for command in ("git push origin main", "git commit -m fix"):
+            with self.subTest(command=command):
+                reason = self.reason(self.run_hook_in(command, repo))
+                self.assertIn("prbot guard failed", reason)
+                self.assertIn("git commit/push", reason)
+        self.assertIsNone(self.run_hook_in("ls -la", repo))
+
+    def test_config_is_a_directory_behaves_like_broken_config(self):
+        """(e) A config.json that is a directory is handled like a broken config and named in the reason."""
+        os.makedirs(Path(self.tmp.name, "config.json"))
+        reason = self.reason(self.run_hook("gh pr comment 1 -b x"))
+        self.assertIn("gh claude -- pr comment 1 -b x", reason)
+        self.assertIn("IsADirectoryError", reason)
+
+    def test_non_object_payload_allowed(self):
+        """(f) A JSON payload that is not an object is allowed silently."""
+        for stdin in ("[]", '"string"', "42"):
+            with self.subTest(stdin=stdin):
+                r = self.run_raw(stdin)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_non_string_tool_name_allowed(self):
+        """(g) A tool_name that is not a string is allowed silently."""
+        r = self.run_raw(json.dumps({"tool_name": 42, "tool_input": {"command": "gh pr comment 1 -b x"}}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_non_string_command_treated_as_empty(self):
+        """(h) A command that is not a string is treated as empty and allowed."""
+        r = self.run_raw(json.dumps({"tool_name": "Bash", "tool_input": {"command": 123}}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_non_object_tool_input_allowed(self):
+        """(i) A tool_input that is not an object is allowed silently."""
+        r = self.run_raw(json.dumps({"tool_name": "Bash", "tool_input": "oops"}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_unexpected_import_failure_denies_bash_writes_without_config_wording(self):
+        """(j) A prbot import failure denies gh writes without config advice and allows unrelated commands."""
+        setup = "module.load_prbot = lambda: (_ for _ in ()).throw(ImportError('simulated'))\n"
+        r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1 -b x"}}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        reason = self.reason(json.loads(r.stdout))
+        self.assertTrue(reason.startswith("prbot guard failed (ImportError: simulated)"), reason)
+        self.assertNotIn("~/.config/prbot/config.json", reason)
+        r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": "ls -la"}}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_unloadable_prbot_denies_commands_that_can_spell_gh(self):
+        """(j2) When prbot cannot load, commands that can reach gh without a gh/prbot/git token are denied."""
+        setup = "module.load_prbot = lambda: (_ for _ in ()).throw(ImportError('simulated'))\n"
+        for command in ("g\\h pr comment 12 -b x", "'g'h pr comment 12 -b x", "\"g\"h pr comment 12 -b x",
+                        "x=g; ${x}h pr comment 12 -b x", "$'\\x67h' pr comment 12 -b x", "/usr/local/bin/g? pr comment 1",
+                        "echo Z2ggcHIgY29tbWVudCAxIC1iIHg= | base64 -d | sh", "ls $(echo)", "ls `true`",
+                        "PATH=/tmp ls", "env ls", "bash -c ls", "(ls)", "ls; make post", "grep 'a;b' f",
+                        "rg --pre ./post x", "ls | sort --compress-program=./post", "printf -v PATH .; ls pr comment 1",
+                        "echo x {PATH}>/dev/null; ls pr comment 1", "file -z x.gz", "diff -l a b", "egrep x f"):
+            with self.subTest(command=command):
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                reason = self.reason(json.loads(r.stdout))
+                self.assertTrue(reason.startswith("prbot guard failed (ImportError: simulated)"), reason)
+
+    def test_untrustworthy_configs_deny_git_push_to_bot_repos(self):
+        """(j4) Configs the owner check could silently ignore (wrong owner type, dangling symlink, symlink loop,
+        huge integer) make the guard fail closed for a git push to a bot repo."""
+        config = Path(self.tmp.name, "config.json")
+        repo = self.make_repo("kennylhilljr")
+        cases = {
+            "integer owner": lambda: config.write_text(json.dumps({"claude": {"owner": 17}})),
+            "bot entry not an object": lambda: config.write_text(json.dumps({"claude": "kennylhilljr"})),
+            "missing owner": lambda: config.write_text(json.dumps({"claude": {}})),
+            "dangling symlink": lambda: config.symlink_to(Path(self.tmp.name, "missing.json")),
+            "symlink loop": lambda: config.symlink_to(config),
+        }
+        cases["huge integer"] = lambda: config.write_text('{"x": ' + "9" * 5000 + "}")  # refused on every Python
+        for name, make in cases.items():
+            with self.subTest(name):
+                make()
+                reason = self.reason(self.run_hook_in("git push origin main", repo))
+                self.assertIn("prbot guard failed", reason)
+                config.unlink()
+
+    def test_prbot_raising_systemexit_still_denies(self):
+        """(j5) prbot's die() raises SystemExit; even SystemExit(0) from a broken prbot ends in a denial, not allow."""
+        for code in (0, 2):
+            with self.subTest(code=code):
+                setup = f"module.load_prbot = lambda: (_ for _ in ()).throw(SystemExit({code}))\n"
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1 -b x"}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                reason = self.reason(json.loads(r.stdout))
+                self.assertTrue(reason.startswith(f"prbot guard failed (SystemExit: {code})"), reason)
+
+    def test_unloadable_prbot_allows_simple_unrelated_commands(self):
+        """(j3) When prbot cannot load, simple commands that cannot start another program still run."""
+        setup = "module.load_prbot = lambda: (_ for _ in ()).throw(ImportError('simulated'))\n"
+        for command in ("ls", "ls -la", "cat README.md | head -5", "grep -n 'guard failed' README.md && wc -l README.md",
+                        "ls 2>&1 | head", "pwd; echo done", ""):
+            with self.subTest(command=command):
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_broken_guard_cannot_overwrite_hook(self):
+        """(j6) While the guard is broken, redirections and output-file options that could overwrite the hook
+        (or any file) are refused; descriptor copies and writes to /dev/null still pass."""
+        setup = "module.load_prbot = lambda: (_ for _ in ()).throw(ImportError('simulated'))\n"
+        hook = str(self.HOOK)
+        for command in (f"echo > {hook}", f"echo >{hook}", f": > {hook}", f"cat /dev/null >> {hook}",
+                        f"ls >| {hook}", f"ls &> {hook}", f"ls 2> {hook}", f"echo x 1>{hook}", f"ls >& {hook}",
+                        f"cat <> {hook}", f"ls 2>&1 > {hook}", f"ls > /dev/null.py", f"ls 2>&1x",
+                        f"uniq /dev/null {hook}", f"tree -o {hook}", f"echo hi | tee {hook}"):
+            with self.subTest(command=command):
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                reason = self.reason(json.loads(r.stdout))
+                self.assertTrue(reason.startswith("prbot guard failed (ImportError: simulated)"), reason)
+        for command in ("ls 2>&1 | head", "ls 2>/dev/null", "ls >&2", "ls > /dev/null 2>&1", "ls &>/dev/null",
+                        "ls 2>&-"):
+            with self.subTest(command=command):
+                r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": command}}))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_broken_config_refuses_overwriting_the_hook(self):
+        """(j7) The same with a real broken config instead of a stub: `echo > hook` is denied."""
+        self.break_config()
+        reason = self.reason(self.run_hook(f"echo > {self.HOOK}"))
+        self.assertIn("prbot guard failed (ConfigError", reason)
+
+    def test_dangling_config_dir_fails_closed(self):
+        """(j8) PRBOT_CONFIG_DIR (or a parent) is a symlink to a missing directory: the guard has no owners to
+        trust, so it fails closed instead of reading the config as empty and allowing a personal push."""
+        repo = self.make_repo("kennylhilljr")
+        for depth in ("dir", "parent", "dotdot"):
+            with self.subTest(depth):
+                link = Path(tempfile.mkdtemp(dir=self.tmp.name)) / "prbot"
+                link.symlink_to(Path(self.tmp.name, "gone", "prbot"))
+                cfg_dir = {"dir": link, "parent": link / "nested", "dotdot": link / ".." / "cfg"}[depth]
+                self.env["PRBOT_CONFIG_DIR"] = str(cfg_dir)
+                for command in ("git push origin main", 'git commit -m "x"'):
+                    reason = self.reason(self.run_hook_in(command, repo))
+                    self.assertIn("prbot guard failed (ConfigError", reason)
+                    self.assertIn("is a symlink to something that does not exist", reason)
+
+    def test_load_config_oserror_with_unrouted_writes_runtimeerror_still_denies(self):
+        """(k) When load_config and unrouted_writes both raise, the hook still denies and names only the first error."""
+        setup = (
+            "def load_config():\n"
+            "    raise OSError('simulated')\n"
+            "stub = types.SimpleNamespace(\n"
+            "    AGENTS=('claude', 'codex'),\n"
+            "    load_config=load_config,\n"
+            "    unrouted_writes=lambda c, t=False: (_ for _ in ()).throw(RuntimeError('also bad')),\n"
+            "    git_writes=lambda c: [],\n"
+            "    repo_from_git=lambda p=None: None,\n"
+            ")\n"
+            "module.load_prbot = lambda: stub\n")
+        r, _ = self.run_with_stub(setup, repr({"tool_name": "Bash", "tool_input": {"command": "gh pr comment 1 -b x"}}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        reason = self.reason(json.loads(r.stdout))
+        self.assertTrue(reason.startswith("prbot guard failed (OSError: simulated)"), reason)
+        self.assertNotIn("~/.config/prbot/config.json", reason)
+        self.assertNotIn("RuntimeError", reason)
+
+    def test_repo_from_git_oserror_variant(self):
+        """(l) An OSError from repo_from_git during a git push check is denied and named in the reason."""
+        setup = (
+            "marker = os.path.join(tmp, \"repo_from_git.called\")\n"
+            "def repo_from_git(cwd=None):\n"
+            "    open(marker, \"w\").close()\n"
+            "    raise OSError(\"boom\")\n"
+            "stub = types.SimpleNamespace(\n"
+            "    AGENTS=(\"claude\", \"codex\"),\n"
+            "    load_config=lambda: {\"claude\": {\"owner\": \"kennylhilljr\"}},\n"
+            "    git_writes=lambda c: [([\"push\", \"origin\", \"main\"], None)],\n"
+            "    repo_from_git=repo_from_git,\n"
+            "    unrouted_writes=lambda c, t=False: [],\n"
+            ")\n"
+            "module.load_prbot = lambda: stub\n")
+        payload = "{'tool_name': 'Bash', 'tool_input': {'command': 'git push origin main'}, 'cwd': tmp}"
+        r, tmp = self.run_with_stub(setup, payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(tmp, "repo_from_git.called")))
+        reason = self.reason(json.loads(r.stdout))
+        self.assertIn("prbot guard failed", reason)
+        self.assertIn("OSError: boom", reason)
+        self.assertNotIn("~/.config/prbot/config.json", reason)
+
+    def test_fallback_regex_stays_fast_on_repeated_git_options(self):
+        """(m) Repeated git options before a non-write do not make the fallback check backtrack for seconds."""
+        setup = "module.load_prbot = lambda: (_ for _ in ()).throw(ImportError('simulated'))\n"
+        command = "git " + "-c a.b=c " * 24 + "status; gh pr comment 1 -b x"
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        runner = Path(d, "runner.py")
+        runner.write_text(
+            "import importlib.util, io, json, sys\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            f"loader = SourceFileLoader('guard', {str(self.HOOK)!r})\n"
+            "module = importlib.util.module_from_spec(importlib.util.spec_from_loader('guard', loader))\n"
+            "loader.exec_module(module)\n"
+            + setup +
+            f"sys.stdin = io.StringIO(json.dumps({{'tool_name': 'Bash', 'tool_input': {{'command': {command!r}}}}}))\n"
+            "sys.exit(module.main())\n")
+        r = subprocess.run([sys.executable, "-B", runner], capture_output=True, text=True, env=self.env, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        reason = self.reason(json.loads(r.stdout))
+        self.assertTrue(reason.startswith("prbot guard failed (ImportError: simulated)"), reason)
+        self.assertIn("refusing gh/prbot/git call", reason)
+        loader = SourceFileLoader("guard_regex", str(self.HOOK))
+        hook = importlib.util.module_from_spec(importlib.util.spec_from_loader("guard_regex", loader))
+        loader.exec_module(hook)
+        start = time.monotonic()
+        self.assertIsNone(hook.GIT_WRITE_FALLBACK.search("git " + "-c a.b=c " * 2000 + "status"))
+        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertTrue(hook.GIT_WRITE_FALLBACK.search("git " + "-c a.b=c " * 24 + "push origin main"))
+
 
 class CodexShim(unittest.TestCase):
     def test_routes_writes_and_passes_reads(self):
@@ -1354,6 +1768,151 @@ class CodexShim(unittest.TestCase):
             write = subprocess.run(["gh", "pr", "comment", "1", "-R", "o/r", "-b", "x"], capture_output=True, text=True, env=env)
             self.assertNotEqual(write.returncode, 0)
             self.assertIn("bot 'codex' is not registered", write.stderr)
+
+    WRITE = ["pr", "comment", "1", "-b", "x"]
+
+    def _sandbox(self, tmp, stub=None):
+        """Copy the shim into tmp so it resolves <tmp>/prbot, with a fake real gh that leaves a marker."""
+        bindir = Path(tmp) / "integrations/codex/bin"
+        bindir.mkdir(parents=True)
+        shim = bindir / "gh"
+        shutil.copy2(ROOT / "integrations/codex/bin/gh", shim)
+        os.chmod(shim, 0o755)
+        fakebin = Path(tmp) / "fakebin"
+        fakebin.mkdir()
+        (fakebin / "gh").write_text(f'#!/bin/sh\ntouch "{tmp}/gh.called"\nexit 0\n')
+        os.chmod(fakebin / "gh", 0o755)
+        (Path(tmp) / "cfg").mkdir()
+        if stub is not None:
+            word, code = stub
+            body = f'#!/bin/sh\ntouch "{tmp}/prbot.called"\n'
+            if word:
+                body += f"echo {word}\n"
+            body += f"exit {code}\n"
+            (Path(tmp) / "prbot").write_text(body)
+            os.chmod(Path(tmp) / "prbot", 0o755)
+        env = {k: v for k, v in os.environ.items() if k != "PRBOT_ACTIVE"}
+        env["PRBOT_CONFIG_DIR"] = str(Path(tmp) / "cfg")
+        env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+        return str(shim), env
+
+    def test_classify_result_matrix(self):
+        """(a) Only exit 0 with 'write' or exit 1 with 'read' is trusted; every other classify result refuses."""
+        refused = [(("", 1), 1), (("", 2), 2), (("", 3), 3), (("", 127), 127), (("", 0), 1),
+                   (("read", 2), 2), (("write", 1), 1), (("mischief", 0), 1)]
+        for stub, expected in refused:
+            with self.subTest(stub=stub), tempfile.TemporaryDirectory() as tmp:
+                shim, env = self._sandbox(tmp, stub)
+                r = subprocess.run([shim, *self.WRITE], capture_output=True, text=True, env=env, timeout=30)
+                self.assertTrue(os.path.exists(f"{tmp}/prbot.called"))
+                self.assertFalse(os.path.exists(f"{tmp}/gh.called"), "shim ran the real gh")
+                self.assertEqual(r.returncode, expected, r.stderr)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("refusing to run real gh", r.stderr)
+        with self.subTest(stub=("read", 1)), tempfile.TemporaryDirectory() as tmp:
+            shim, env = self._sandbox(tmp, ("read", 1))
+            r = subprocess.run([shim, *self.WRITE], capture_output=True, text=True, env=env, timeout=30)
+            self.assertTrue(os.path.exists(f"{tmp}/prbot.called"))
+            self.assertTrue(os.path.exists(f"{tmp}/gh.called"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_missing_or_unexecutable_prbot_refuses(self):
+        """(b) A prbot the shim cannot run is refused, never treated as a read."""
+        for case in ("missing", "not executable"):
+            with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
+                shim, env = self._sandbox(tmp)
+                if case == "not executable":
+                    (Path(tmp) / "prbot").write_text("#!/bin/sh\nexit 0\n")
+                    os.chmod(Path(tmp) / "prbot", 0o644)
+                r = subprocess.run([shim, *self.WRITE], capture_output=True, text=True, env=env, timeout=30)
+                self.assertFalse(os.path.exists(f"{tmp}/gh.called"), "shim ran the real gh")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("refusing to run real gh", r.stderr)
+
+    def test_prbot_active_does_not_bypass_classify(self):
+        """(d) A non-empty PRBOT_ACTIVE never skips classify: a missing or failing prbot still refuses."""
+        for stub in (None, ("", 4), ("", 2)):
+            with self.subTest(stub=stub), tempfile.TemporaryDirectory() as tmp:
+                shim, env = self._sandbox(tmp, stub)
+                env["PRBOT_ACTIVE"] = "codex"
+                r = subprocess.run([shim, *self.WRITE], capture_output=True, text=True, env=env, timeout=30)
+                self.assertFalse(os.path.exists(f"{tmp}/gh.called"), "PRBOT_ACTIVE let the shim run the real gh")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("refusing to run real gh", r.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            shim, env = self._sandbox(tmp, ("write", 0))
+            env["PRBOT_ACTIVE"] = "codex"
+            subprocess.run([shim, *self.WRITE], capture_output=True, text=True, env=env, timeout=30)
+            self.assertTrue(os.path.exists(f"{tmp}/prbot.called"), "PRBOT_ACTIVE skipped classify")
+            self.assertFalse(os.path.exists(f"{tmp}/gh.called"))
+
+    def test_real_gh_override_pointing_at_the_shim_is_refused(self):
+        """(e) PRBOT_REAL_GH naming the shim, directly or through a symlink, stops prbot instead of looping."""
+        shim = ROOT / "integrations/codex/bin/gh"
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "gh"
+            link.symlink_to(shim)
+            for target in (shim, link):
+                with self.subTest(target=str(target)):
+                    env = {k: v for k, v in os.environ.items() if k != "PRBOT_ACTIVE"}
+                    env["PRBOT_CONFIG_DIR"] = tmp
+                    env["PRBOT_REAL_GH"] = str(target)
+                    env["PATH"] = f"{os.path.dirname(sys.executable)}:/usr/bin:/bin"
+                    r = subprocess.run([str(shim), "pr", "comment", "1", "-R", "o/r", "-b", "x"],
+                                       capture_output=True, text=True, env=env, timeout=30)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("PRBOT_REAL_GH points at the Codex gh shim", r.stderr)
+
+    def test_real_gh_override_with_other_case_or_hardlink_is_refused(self):
+        """(e2) The shim is recognised by file identity: a differently cased path (same file on a case-insensitive
+        filesystem such as macOS) or a hard link to the shim is refused too."""
+        shim = ROOT / "integrations/codex/bin/gh"
+        targets = []
+        swapped = Path(str(shim).swapcase())
+        if swapped.exists() and os.path.samefile(swapped, shim):
+            targets.append(swapped)
+        with tempfile.TemporaryDirectory() as tmp:
+            hard = Path(tmp) / "gh"
+            try:
+                os.link(shim, hard)
+                targets.append(hard)
+            except OSError:
+                pass
+            if not targets:
+                self.skipTest("case-sensitive filesystem and no hard links")
+            for target in targets:
+                with self.subTest(target=str(target)):
+                    env = {k: v for k, v in os.environ.items() if k != "PRBOT_ACTIVE"}
+                    env["PRBOT_CONFIG_DIR"] = tmp
+                    env["PRBOT_REAL_GH"] = str(target)
+                    env["PATH"] = f"{os.path.dirname(sys.executable)}:/usr/bin:/bin"
+                    r = subprocess.run([str(shim), "pr", "comment", "1", "-R", "o/r", "-b", "x"],
+                                       capture_output=True, text=True, env=env, timeout=30)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("PRBOT_REAL_GH points at the Codex gh shim", r.stderr)
+
+    def test_broken_config_refuses_and_shows_classify_message(self):
+        """(c) A broken config.json stops the shim with exit 4 and passes classify's own message through."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "cfg"
+            cfg.mkdir()
+            (cfg / "config.json").write_text("{bad")
+            fakebin = Path(tmp) / "fakebin"
+            fakebin.mkdir()
+            (fakebin / "gh").write_text(f'#!/bin/sh\ntouch "{tmp}/gh.called"\nexit 0\n')
+            os.chmod(fakebin / "gh", 0o755)
+            env = {k: v for k, v in os.environ.items() if k != "PRBOT_ACTIVE"}
+            env["PRBOT_CONFIG_DIR"] = str(cfg)
+            env["PATH"] = f"{fakebin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin"
+            r = subprocess.run([str(ROOT / "integrations/codex/bin/gh"), "pr", "comment", "1", "-R", "o/r", "-b", "x"],
+                               capture_output=True, text=True, env=env, timeout=30)
+            self.assertFalse(os.path.exists(f"{tmp}/gh.called"), "shim ran the real gh")
+            self.assertEqual(r.returncode, 4, r.stderr)
+            self.assertIn(str(Path(cfg) / "config.json"), r.stderr)
+            self.assertIn("fix or remove it", r.stderr)
+            self.assertIn("refusing to run real gh", r.stderr)
+            self.assertNotIn("{bad", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
 
 STATE_ATTRS = ("CONFIG_DIR", "CONFIG", "WATCH_STATE", "QUEUE_DIR", "OPENCLAW_EVENTS")
@@ -1420,6 +1979,232 @@ class StatePaths(unittest.TestCase):
             self.probe(env)
         except subprocess.CalledProcessError as e:
             self.fail(e.stderr)
+
+
+REGISTER_RUNNER = '''import json, sys, importlib.util
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("prbot_mod", sys.argv[1])
+prbot_mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("prbot_mod", loader))
+loader.exec_module(prbot_mod)
+calls = []
+def rec(name):
+    def f(*a, **kw):
+        calls.append(name)
+        raise AssertionError(name + "-called")
+    return f
+prbot_mod.http.server.HTTPServer = rec("HTTPServer")
+prbot_mod.api = rec("api")
+prbot_mod.store_key = rec("store_key")
+assert prbot_mod.http.server.BaseHTTPRequestHandler.__name__ == "BaseHTTPRequestHandler"
+try:
+    rc = prbot_mod.main(["register", "claude"])
+finally:
+    print(json.dumps({"calls": calls}))
+sys.exit(rc)
+'''
+
+
+class ClassifyCli(unittest.TestCase):
+    """A broken or unreadable config makes classify exit 4 (never write or read) and other commands exit 2."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.config = self.dir / "config.json"
+
+    def run_prbot(self, *args, env=None):
+        env = dict(os.environ, PRBOT_CONFIG_DIR=str(self.dir), **(env or {}))
+        return subprocess.run([sys.executable, "-B", str(ROOT / "prbot"), *args], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def assert_undecided(self, r, content):
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn(str(self.config), r.stderr)
+        self.assertIn("fix or remove it", r.stderr)
+        self.assertNotIn(content, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("write", r.stdout)
+        self.assertNotIn("read", r.stdout)
+
+    def test_invalid_json_is_undecidable(self):
+        """(a) Config `{bad`: classify exits 4, names the config path, and never prints write or read."""
+        self.config.write_text("{bad")
+        self.assert_undecided(self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x"), "{bad")
+
+    def test_non_object_is_undecidable(self):
+        """(b) Config `[]`: classify exits 4, names the config path, and never prints write or read."""
+        self.config.write_text("[]")
+        self.assert_undecided(self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x"), "[]")
+
+    def test_missing_config_still_classifies(self):
+        """(c) No config file: a comment classifies as write (exit 0) and a view as read (exit 1)."""
+        r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "write"), r.stderr)
+        r = self.run_prbot("classify", "--", "pr", "view", "1")
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "read"), r.stderr)
+
+    def test_config_is_a_directory(self):
+        """(d) config.json is a directory: classify exits 4 and reports IsADirectoryError."""
+        self.config.mkdir()
+        r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("cannot decide", r.stderr)
+        self.assertIn("IsADirectoryError", r.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode 000 file")
+    def test_config_unreadable(self):
+        """(e) config.json has mode 000: classify exits 4 and reports PermissionError."""
+        self.config.write_text("{}")
+        self.config.chmod(0o000)
+        self.addCleanup(self.config.chmod, 0o600)
+        r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("cannot decide", r.stderr)
+        self.assertIn("PermissionError", r.stderr)
+
+    def test_whoami_broken_config_exits_2(self):
+        """(f) Config `{bad`: whoami exits 2 with a clear message and no traceback."""
+        self.config.write_text("{bad")
+        r = self.run_prbot("whoami", "claude")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("fix or remove it", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_review_broken_config_exits_2_before_gh(self):
+        """(g) Config `{bad`: review --route-only exits 2 before it runs gh."""
+        self.config.write_text("{bad")
+        fakebin = self.dir / "fakebin"
+        fakebin.mkdir()
+        gh = fakebin / "gh"
+        gh.write_text(f"#!/bin/sh\ntouch '{fakebin / 'gh.called'}'\nexit 0\n")
+        gh.chmod(0o755)
+        r = self.run_prbot("review", "1", "-R", "o/r", "--route-only",
+                           env={"PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}"})
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("fix or remove it", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse((fakebin / "gh.called").exists())
+
+    def assert_review_unreadable(self, error_name, reason):
+        fakebin = self.dir / "fakebin"
+        fakebin.mkdir()
+        gh = fakebin / "gh"
+        gh.write_text(f"#!/bin/sh\ntouch '{fakebin / 'gh.called'}'\nexit 0\n")
+        gh.chmod(0o755)
+        r = self.run_prbot("review", "12", "-R", "o/r", "--route-only",
+                           env={"PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}"})
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.stderr.strip(),
+                         f"prbot: {self.config}: cannot read ({error_name}: {reason}); fix or remove it")
+        self.assertNotIn("Errno", r.stderr)
+        self.assertFalse((fakebin / "gh.called").exists())
+
+    def test_review_config_is_a_directory_exits_2(self):
+        """(i) config.json is a directory: review --route-only exits 2 with one line, not an IsADirectoryError traceback."""
+        self.config.mkdir()
+        self.assert_review_unreadable("IsADirectoryError", "the path is a directory, not a file")
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode 000 file")
+    def test_review_config_unreadable_exits_2(self):
+        """(j) config.json has mode 000: review --route-only exits 2 with one line, not a PermissionError traceback."""
+        self.config.write_text("{}")
+        self.config.chmod(0o000)
+        self.addCleanup(self.config.chmod, 0o600)
+        self.assert_review_unreadable("PermissionError", "permission denied; check the file's mode and owner")
+
+    def test_invalid_utf8_config_exits_2_and_classify_exits_4(self):
+        """(k) config.json is not UTF-8: whoami exits 2 with one line and classify exits 4, never a traceback."""
+        self.config.write_bytes(b'{"claude": "\xff\xfe"}')
+        r = self.run_prbot("whoami", "claude")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(r.stderr.strip(), f"prbot: {self.config}: not valid UTF-8 text; fix or remove it")
+        r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn(r.stdout.strip(), ("write", "read"))
+
+    def test_untrustworthy_configs_exit_2_with_one_line(self):
+        """(m) Huge integers, deep nesting, wrong field types and dangling symlinks: whoami exits 2 with one line
+        and classify exits 4, never a traceback."""
+        cases = {
+            "deep nesting": ("[" * 100000 + "]" * 100000, "not valid JSON"),
+            "integer owner": (json.dumps({"claude": {"owner": 17}}), '"claude".owner is not a non-empty string'),
+            "empty owner": (json.dumps({"codex": {"owner": ""}}), '"codex".owner is not a non-empty string'),
+            "missing owner": (json.dumps({"claude": {"slug": "claude-pr-gh"}}), '"claude".owner is not a non-empty string'),
+            "bot entry not an object": (json.dumps({"codex": []}), '"codex" is not a JSON object'),
+            "string flag": (json.dumps({"codex_triggers_as_bot": "false"}), "codex_triggers_as_bot is not true or false"),
+            "dangling symlink": (None, "a symlink to a file that does not exist"),
+        }
+        cases["huge integer"] = ('{"x": ' + "9" * 5000 + "}", "not valid JSON")  # refused on every Python
+        cases["huge integer under the 3.11 limit"] = ('{"x": ' + "9" * 2000 + "}", "not valid JSON")
+        for name, (text, why) in cases.items():
+            with self.subTest(name):
+                if text is None:
+                    self.config.symlink_to(self.dir / "missing.json")
+                else:
+                    self.config.write_text(text)
+                r = self.run_prbot("whoami", "claude")
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertEqual(r.stderr.strip(), f"prbot: {self.config}: {why}; fix or remove it")
+                r = self.run_prbot("classify", "--", "pr", "comment", "1", "-b", "x")
+                self.assertEqual(r.returncode, 4, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.config.unlink()
+
+    def test_dangling_config_dir_exits_2(self):
+        """(m2) The config directory is a symlink to a missing directory: whoami exits 2, classify exits 4."""
+        link = self.dir / "linked"
+        link.symlink_to(self.dir / "missing")
+        env = {"PRBOT_CONFIG_DIR": str(link)}
+        env_run = dict(os.environ, **env)
+        r = subprocess.run([sys.executable, "-B", str(ROOT / "prbot"), "whoami", "claude"], env=env_run,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("is a symlink to something that does not exist", r.stderr)
+        r = subprocess.run([sys.executable, "-B", str(ROOT / "prbot"), "classify", "--", "pr", "comment", "1"],
+                           env=env_run, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_symlink_loop_config_exits_2(self):
+        """(n) config.json is a symlink to itself: whoami exits 2 with the fixed read-failure line."""
+        self.config.symlink_to(self.config)
+        r = self.run_prbot("whoami", "claude")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(r.stderr.strip(),
+                         f"prbot: {self.config}: cannot read (OSError: the file could not be read); fix or remove it")
+
+    def test_valid_config_still_loads(self):
+        """(o) The shape register writes, plus extra bots and fields, still loads."""
+        cfg = {"claude": {"app_id": 1, "slug": "claude-pr-gh", "client_id": "Iv1", "owner": "kennylhilljr", "user_id": 2},
+               "claude-dev": {"app_id": 3, "owner": "kennylhilljr"}, "codex_triggers_as_bot": True}
+        self.config.write_text(json.dumps(cfg))
+        r = self.run_prbot("classify", "--", "pr", "view", "1")
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "read"), r.stderr)
+
+    def test_unrelated_oserror_is_not_reported_as_a_config_problem(self):
+        """(l) An OSError about another file is not turned into the config message."""
+        self.assertIsNone(prbot.config_problem(FileNotFoundError(2, "gone", "/elsewhere/file")))
+        self.assertIsNone(prbot.config_problem(RuntimeError("x")))
+        self.assertIn("cannot read (IsADirectoryError: the path is a directory, not a file)",
+                      prbot.config_problem(IsADirectoryError(21, "Is a directory", str(prbot.CONFIG))))
+
+    def test_register_broken_config_exits_2_before_server_or_api(self):
+        """(h) Config `{bad`: register exits 2 before it starts a server or calls api or store_key."""
+        self.config.write_text("{bad")
+        helper_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, helper_dir, ignore_errors=True)
+        helper = helper_dir / "register_runner.py"
+        helper.write_text(REGISTER_RUNNER)
+        r = subprocess.run([sys.executable, "-B", str(helper), str(ROOT / "prbot")],
+                           env=dict(os.environ, PRBOT_CONFIG_DIR=str(self.dir)),
+                           timeout=10, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("fix or remove it", r.stderr)
+        self.assertIn(str(self.config), r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(json.loads(r.stdout.strip().splitlines()[-1]), {"calls": []})
 
 
 if __name__ == "__main__":
