@@ -1671,11 +1671,11 @@ class Hook(unittest.TestCase):
         """(j8) PRBOT_CONFIG_DIR (or a parent) is a symlink to a missing directory: the guard has no owners to
         trust, so it fails closed instead of reading the config as empty and allowing a personal push."""
         repo = self.make_repo("kennylhilljr")
-        for depth in ("dir", "parent"):
+        for depth in ("dir", "parent", "dotdot"):
             with self.subTest(depth):
                 link = Path(tempfile.mkdtemp(dir=self.tmp.name)) / "prbot"
                 link.symlink_to(Path(self.tmp.name, "gone", "prbot"))
-                cfg_dir = link if depth == "dir" else link / "nested"
+                cfg_dir = {"dir": link, "parent": link / "nested", "dotdot": link / ".." / "cfg"}[depth]
                 self.env["PRBOT_CONFIG_DIR"] = str(cfg_dir)
                 for command in ("git push origin main", 'git commit -m "x"'):
                     reason = self.reason(self.run_hook_in(command, repo))
