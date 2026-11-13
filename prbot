@@ -18,7 +18,7 @@
                                      one pass: review new commits on open, non-draft PRs on every repo
                                      the bots are installed on; with --from-queue, only the PRs named
                                      in the GitHub event files in DIR
-  prbot classify -- <gh args>        exit 0 if the gh call writes PR feedback
+  prbot classify -- <gh args>        exit 0 if the call posts PR feedback, 1 if it does not, 4 when it can't decide
 
 Standard library plus the openssl and gh binaries. No token is printed or saved.
 """
@@ -564,8 +564,66 @@ def unrouted_writes(command, codex_triggers_as_bot=False):
 # ---------- config and key storage ----------
 
 
+class ConfigError(Exception):
+    pass
+
+
 def load_config():
-    return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    """The config as a dict, {} when there is none. A broken file raises ConfigError; OSError propagates.
+
+    The guard decides from this config, so anything it can't trust is an error, never {}: a dangling symlink, a
+    symlink loop (OSError), bytes that are not UTF-8, JSON the parser rejects for any reason, a non-object, and
+    a bot entry or field whose type would make the guard's owner check silently match nothing."""
+    try:
+        text = CONFIG.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if os.path.lexists(CONFIG):
+            raise ConfigError(f"{CONFIG}: a symlink to a file that does not exist; fix or remove it") from None
+        dangling = _dangling_ancestor(CONFIG)
+        if dangling:  # the config directory is a broken symlink: there may be a config we can't see, not none
+            raise ConfigError(f"{CONFIG}: {dangling} is a symlink to something that does not exist; "
+                              "fix or remove it") from None
+        return {}
+    except UnicodeDecodeError:
+        raise ConfigError(f"{CONFIG}: not valid UTF-8 text; fix or remove it") from None
+    try:
+        cfg = json.loads(text, parse_int=_bounded_int)
+    except (ValueError, RecursionError):  # JSONDecodeError, huge integers, very deep nesting
+        raise ConfigError(f"{CONFIG}: not valid JSON; fix or remove it") from None
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"{CONFIG}: top-level value is not a JSON object; fix or remove it")
+    for bot in AGENTS:
+        entry = cfg.get(bot)
+        if bot in cfg and not isinstance(entry, dict):
+            raise ConfigError(f"{CONFIG}: \"{bot}\" is not a JSON object; fix or remove it")
+        if isinstance(entry, dict) and not (isinstance(entry.get("owner"), str) and entry["owner"]):
+            raise ConfigError(f"{CONFIG}: \"{bot}\".owner is not a non-empty string; fix or remove it")
+    if not isinstance(cfg.get("codex_triggers_as_bot", False), bool):
+        raise ConfigError(f"{CONFIG}: codex_triggers_as_bot is not true or false; fix or remove it")
+    return cfg
+
+
+MAX_INT_DIGITS = 1000
+
+
+def _bounded_int(digits):
+    """json parse_int that refuses huge integers on every Python version (3.9 has no digit limit of its own)."""
+    if len(digits) > MAX_INT_DIGITS:
+        raise ValueError("integer too long")
+    return int(digits)
+
+
+def _dangling_ancestor(path):
+    """The first of path's parent directories that is a symlink whose target does not exist, else None."""
+    # Join a relative path with the working directory without normalising: abspath would fold a/link/.. into a
+    # before the symlink is ever checked. An absolute path needs no working directory, which may be gone.
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path(os.getcwd()) / path
+    for p in path.parents:
+        if os.path.islink(p) and not os.path.exists(p):
+            return p
+    return None
 
 
 def save_config(cfg):
@@ -853,7 +911,16 @@ def review_body(reviewer, reason, pr, text):
 
 
 def _real_gh():
-    gh = os.environ.get("PRBOT_REAL_GH") or shutil.which("gh", path=_path_without_shims())
+    """The gh prbot runs. PRBOT_REAL_GH may not resolve into the Codex shim's directory: the shim sends writes
+    back through prbot, so that would loop forever."""
+    override = os.environ.get("PRBOT_REAL_GH")
+    if override:
+        # Compare by file identity, not path text: macOS paths are case-insensitive, so /users/... and /Users/...
+        # name the same shim.
+        if _same_file(os.path.dirname(os.path.realpath(override)), SHIM_DIR) or _same_file(override, SHIM_DIR / "gh"):
+            die(f"PRBOT_REAL_GH points at the Codex gh shim ({override}); set it to the real gh or unset it")
+        return override
+    gh = shutil.which("gh", path=_path_without_shims())
     if not gh:
         die("gh not found on PATH")
     return gh
@@ -868,7 +935,8 @@ def gh_read(args):
 
 
 def cmd_review(target, repo=None, override=None, mode="post", only=None):
-    repo = repo or repo_from_args([target]) or repo_from_git()
+    load_config()  # a broken config stops here, before any gh call
+    repo =repo or repo_from_args([target]) or repo_from_git()
     if not repo:
         die("cannot tell which repository this PR is in; pass -R owner/repo")
     number = re.sub(r".*/pull/(\d+).*", r"\1", target)
@@ -1081,6 +1149,7 @@ def watch_setup(dry_run, limit, baseline):
         try:
             repos = installed_repos(b)
         except (SystemExit, Exception) as e:
+            note_config_problem(e)
             gaps.append(f"could not read where the {b} bot is installed ({e!r})")
             lookup_failed = True
             continue
@@ -1183,10 +1252,49 @@ def watch_repos(repos, state, seen, ctx, skip=()):
     return outcomes, unlisted
 
 
+def queue_config_problem():
+    """The one-line message when the config is bad or unreadable, else None. Other errors still raise."""
+    try:
+        load_config()
+    except (ConfigError, OSError) as e:
+        problem = config_problem(e)
+        if problem is None:
+            raise
+        return problem
+    return None
+
+
+def report_queue_config_problem(problem, left):
+    print(f"prbot: {problem}", file=sys.stderr)
+    watch_log(f"queue: config problem, leaving {left} in the queue: {problem}")
+
+
+_config_noted = set()
+
+
+def note_config_problem(e):
+    """When a failure caught deep in a watch run is a config problem, print its one line on stderr, once per
+    message. The caller still handles the failure as usual (defer and retry)."""
+    problem = config_problem(e) if isinstance(e, (ConfigError, OSError)) else None
+    if problem is not None and problem not in _config_noted:
+        _config_noted.add(problem)
+        print(f"prbot: {problem}", file=sys.stderr)
+
+
 def cmd_watch(dry_run=False, limit=WATCH_LIMIT, baseline=False, queue=None):
     """One pass over open PRs on every repo the bots are installed on. launchd runs this every hour as a backstop
     for the event queue. --baseline marks the commits open right now as seen without reviewing them, so only new
     ones get reviews. With queue, only the PRs named in that event queue directory are handled."""
+    # before the lock and before anything moves: a bad config is reported on every run, even one that finds the
+    # lock taken, and every queue file stays put. launchd relaunches at most once per ThrottleInterval (60s).
+    _config_noted.clear()
+    problem = queue_config_problem()
+    if problem is not None:
+        if queue is not None:
+            report_queue_config_problem(problem, "every file")
+        else:
+            print(f"prbot: {problem}", file=sys.stderr)
+        return 2
     # the lock is held from before the queue directory is checked until the last file has moved, so another
     # watch run can't change the queue or the deferred directory between a check and the action it allows
     lock = watch_lock()
@@ -1345,6 +1453,10 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
     retry delay, and anything that can never be handled is moved to <queue>-rejected. The hourly full pass
     moves the deferred files back. Returns 2 if any PR failed or the repository lookup failed. The caller holds
     the watch lock and has already checked qdir with checked_queue_dir."""
+    problem = queue_config_problem()  # cmd_watch checked already; this covers a direct call
+    if problem is not None:
+        report_queue_config_problem(problem, "every file")
+        return 2
     if not any(queue_entries(qdir)):
         return 0
     rejected, deferred = queue_sibling(qdir, "rejected"), queue_sibling(qdir, "deferred")
@@ -1409,7 +1521,13 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
         # at least one review per run, so files held back by the limit drain one launchd relaunch at a time
         ctx = watch_setup(dry_run, max(limit, 1), baseline)
     except (SystemExit, Exception) as e:  # can't tell which repos are covered: retry later, never reject
-        watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
+        problem = config_problem(e) if isinstance(e, (ConfigError, OSError)) else None
+        if problem is not None:
+            # the config broke after the check at the start: say why on stderr, then retry like any lookup failure
+            note_config_problem(e)
+            watch_log(f"queue: config problem during the run, deferring the event files: {problem}")
+        else:
+            watch_log(f"queue: could not look up the repositories the bots are installed on ({e!r})")
         for path, _ in events + sweeps:
             defer(path, "repository lookup failed")
         return 2
@@ -1449,6 +1567,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
                                     "number,state,isDraft,headRefOid"]))
             result = watch_pr(repo, p, state, seen, ctx)
         except (SystemExit, Exception) as e:
+            note_config_problem(e)
             watch_log(f"{repo}#{n}: could not handle the PR ({e!r})")
             result = "failed"
         if result == "limit":  # untouched: launchd starts another run after ThrottleInterval
@@ -1467,6 +1586,7 @@ def cmd_watch_queue(qdir, dry_run=False, limit=WATCH_LIMIT, baseline=False):
         try:
             outcomes, unlisted = watch_repos(repos, state, seen, ctx, skip=set(groups))
         except (SystemExit, Exception) as e:
+            note_config_problem(e)
             watch_log(f"queue: sweep failed ({e!r})")
             outcomes, unlisted = {"failed"}, set()
         # each outcome is checked on its own, so one PR's success or wait can't hide another PR's limit block.
@@ -1526,7 +1646,8 @@ def manifest(spec, redirect_url):
 
 def cmd_register(bot, org=None, spec_path=None):
     """GitHub App manifest flow: a local page posts the manifest, GitHub redirects back with a one-hour code."""
-    spec = load_bot_spec(bot, spec_path)
+    load_config()  # a broken config stops here, before the local server starts or GitHub creates an App
+    spec =load_bot_spec(bot, spec_path)
     state = secrets.token_urlsafe(16)
     result = {}
 
@@ -1578,9 +1699,19 @@ def cmd_register(bot, org=None, spec_path=None):
     print(f"Upload the logo: https://github.com/settings/apps/{result['slug']}  ({spec['logo_path']})")
 
 
+SHIM_DIR = ROOT / "integrations" / "codex" / "bin"
+
+
+def _same_file(a, b):
+    """True when a and b name the same file or directory (same device and inode); False if either is missing."""
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
 def _path_without_shims():
-    shim = os.path.realpath(ROOT / "integrations" / "codex" / "bin")
-    return os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if os.path.realpath(p) != shim)
+    return os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if not _same_file(p or ".", SHIM_DIR))
 
 
 def split_gh_args(args):
@@ -1657,12 +1788,27 @@ def cmd_gh(bot, args, repo=None):
     repo = repo or repo_from_args(args) or repo_from_git()
     if not repo:
         die("cannot tell which repository this is for; pass -R owner/repo")
+    gh = _real_gh()  # before the token: a PRBOT_REAL_GH that loops back through the shim is refused first
     env = dict(os.environ, GH_TOKEN=installation_token(bot, repo), PRBOT_ACTIVE=bot)
     env.pop("GITHUB_TOKEN", None)
-    gh = os.environ.get("PRBOT_REAL_GH") or shutil.which("gh", path=_path_without_shims())
-    if not gh:
-        die("gh not found on PATH")
     os.execve(gh, [gh] + args, env)
+
+
+def _classify(rest):
+    """Print write or read for a gh argv. Exit 0 for write, 1 for read, 4 when it can't decide."""
+    args = rest[1:] if rest[:1] == ["--"] else rest
+    args = args[1:] if args[:1] == ["gh"] else args
+    try:
+        cfg = load_config()
+        write = is_feedback_write(args, cfg.get("codex_triggers_as_bot", False))
+    except ConfigError as e:
+        print(f"prbot classify: {e}", file=sys.stderr)
+        return 4
+    except Exception as e:
+        print(f"prbot classify: cannot decide ({type(e).__name__}: {e})", file=sys.stderr)
+        return 4
+    print("write" if write else "read")
+    return 0 if write else 1
 
 
 def main(argv):
@@ -1671,77 +1817,100 @@ def main(argv):
         return 0
     cmd, rest = argv[0], argv[1:]
     if cmd == "classify":
-        args = rest[1:] if rest[:1] == ["--"] else rest
-        args = args[1:] if args[:1] == ["gh"] else args
-        return 0 if is_feedback_write(args, load_config().get("codex_triggers_as_bot", False)) else 1
-    if cmd in ("watch", "review"):
-        review_timeout()  # a bad PRBOT_REVIEW_TIMEOUT stops here with a clear message, before any work
-    if cmd == "watch":
-        limit = WATCH_LIMIT
-        if "--limit" in rest:
-            limit = int(rest[rest.index("--limit") + 1])
-        queue = None
-        if "--from-queue" in rest:
-            i = rest.index("--from-queue")
-            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
-                die("usage: prbot watch --from-queue DIR [--dry-run] [--limit N] [--baseline]")
-            queue = rest[i + 1]
-        return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest, queue=queue)
-    if cmd == "review":
-        opts = {"-R": None, "--repo": None, "--reviewer": None}
-        flags, target, i = set(), None, 0
-        while i < len(rest):
-            a = rest[i]
-            if a in opts and i + 1 < len(rest):
-                opts[a] = rest[i + 1]
-                i += 2
-                continue
-            if a in ("--dry-run", "--route-only"):
-                flags.add(a)
-            elif not a.startswith("-") and target is None:
-                target = a
-            else:
-                die(f"review: unexpected argument '{a}'")
-            i += 1
-        if not target:
-            die("usage: prbot review <pr-number|url> [-R owner/repo] [--reviewer claude|codex|both] "
-                "[--dry-run|--route-only]")
-        if opts["--reviewer"] not in (None, "claude", "codex", "both"):
-            die("--reviewer must be claude, codex or both")
-        mode = "route" if "--route-only" in flags else "dry-run" if "--dry-run" in flags else "post"
-        return cmd_review(target, opts["-R"] or opts["--repo"], opts["--reviewer"], mode)
-    if not rest:
-        die(f"{cmd}: missing bot name")
-    bot = rest[0]
-    if cmd == "register":
-        cmd_register(bot, rest[rest.index("--org") + 1] if "--org" in rest else None,
-                     rest[rest.index("--spec") + 1] if "--spec" in rest else None)
-    elif cmd == "import-key":
-        cfg = load_config()
-        if bot not in cfg:
-            if len(rest) < 4:
-                die("first import needs: prbot import-key <bot> <pem> <app_id> <owner>")
-            cfg[bot] = {"app_id": int(rest[2]), "owner": rest[3]}
-            save_config(cfg)
-        print("stored in", store_key(bot, Path(rest[1]).read_text()))
-    elif cmd == "install-url":
-        print(f"https://github.com/apps/{bot_config(bot)['slug']}/installations/new")
-    elif cmd == "whoami":
-        cfg = bot_config(bot)
-        jwt = app_jwt(cfg.get("client_id") or cfg["app_id"], read_key(bot))
-        app = api("GET", "/app", auth=jwt)
-        print(f"{app['slug']}[bot]  app_id={app['id']}  owner={app['owner']['login']}")
-        for i in api("GET", "/app/installations", auth=jwt):
-            print(f"  installed on {i['account']['login']} ({i['repository_selection']} repos)")
-    elif cmd == "gh":
-        repo, args = split_gh_args(rest[1:])
-        cmd_gh(bot, args, repo)
-    elif cmd == "git":
-        repo, args = split_gh_args(rest[1:])
-        cmd_git(bot, args, repo)
+        return _classify(rest)
+    try:
+        if cmd in ("watch", "review"):
+            review_timeout()  # a bad PRBOT_REVIEW_TIMEOUT stops here with a clear message, before any work
+        if cmd == "watch":
+            limit = WATCH_LIMIT
+            if "--limit" in rest:
+                limit = int(rest[rest.index("--limit") + 1])
+            queue = None
+            if "--from-queue" in rest:
+                i = rest.index("--from-queue")
+                if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                    die("usage: prbot watch --from-queue DIR [--dry-run] [--limit N] [--baseline]")
+                queue = rest[i + 1]
+            return cmd_watch(dry_run="--dry-run" in rest, limit=limit, baseline="--baseline" in rest, queue=queue)
+        if cmd == "review":
+            opts = {"-R": None, "--repo": None, "--reviewer": None}
+            flags, target, i = set(), None, 0
+            while i < len(rest):
+                a = rest[i]
+                if a in opts and i + 1 < len(rest):
+                    opts[a] = rest[i + 1]
+                    i += 2
+                    continue
+                if a in ("--dry-run", "--route-only"):
+                    flags.add(a)
+                elif not a.startswith("-") and target is None:
+                    target = a
+                else:
+                    die(f"review: unexpected argument '{a}'")
+                i += 1
+            if not target:
+                die("usage: prbot review <pr-number|url> [-R owner/repo] [--reviewer claude|codex|both] "
+                    "[--dry-run|--route-only]")
+            if opts["--reviewer"] not in (None, "claude", "codex", "both"):
+                die("--reviewer must be claude, codex or both")
+            mode = "route" if "--route-only" in flags else "dry-run" if "--dry-run" in flags else "post"
+            return cmd_review(target, opts["-R"] or opts["--repo"], opts["--reviewer"], mode)
+        if not rest:
+            die(f"{cmd}: missing bot name")
+        bot = rest[0]
+        if cmd == "register":
+            cmd_register(bot, rest[rest.index("--org") + 1] if "--org" in rest else None,
+                         rest[rest.index("--spec") + 1] if "--spec" in rest else None)
+        elif cmd == "import-key":
+            cfg = load_config()
+            if bot not in cfg:
+                if len(rest) < 4:
+                    die("first import needs: prbot import-key <bot> <pem> <app_id> <owner>")
+                cfg[bot] = {"app_id": int(rest[2]), "owner": rest[3]}
+                save_config(cfg)
+            print("stored in", store_key(bot, Path(rest[1]).read_text()))
+        elif cmd == "install-url":
+            print(f"https://github.com/apps/{bot_config(bot)['slug']}/installations/new")
+        elif cmd == "whoami":
+            cfg = bot_config(bot)
+            jwt = app_jwt(cfg.get("client_id") or cfg["app_id"], read_key(bot))
+            app = api("GET", "/app", auth=jwt)
+            print(f"{app['slug']}[bot]  app_id={app['id']}  owner={app['owner']['login']}")
+            for i in api("GET", "/app/installations", auth=jwt):
+                print(f"  installed on {i['account']['login']} ({i['repository_selection']} repos)")
+        elif cmd == "gh":
+            repo, args = split_gh_args(rest[1:])
+            cmd_gh(bot, args, repo)
+        elif cmd == "git":
+            repo, args = split_gh_args(rest[1:])
+            cmd_git(bot, args, repo)
+        else:
+            die(f"unknown command '{cmd}'")
+        return 0
+    except (ConfigError, OSError) as e:
+        problem = config_problem(e)
+        if problem is None:
+            raise
+        print(f"prbot: {problem}", file=sys.stderr)
+        return 2
+
+
+def config_problem(e):
+    """The one-line message for a bad or unreadable config, or None when e is about something else.
+
+    load_config lets read errors through so the guard hook can name them; only the config's own are turned into
+    a message here. The raw OS error text is never shown, only a fixed reason."""
+    if isinstance(e, ConfigError):
+        return str(e)
+    if not isinstance(e, OSError) or e.filename is None or Path(e.filename) != CONFIG:
+        return None
+    if isinstance(e, IsADirectoryError):
+        reason = "the path is a directory, not a file"
+    elif isinstance(e, PermissionError):
+        reason = "permission denied; check the file's mode and owner"
     else:
-        die(f"unknown command '{cmd}'")
-    return 0
+        reason = "the file could not be read"
+    return f"{CONFIG}: cannot read ({type(e).__name__}: {reason}); fix or remove it"
 
 
 if __name__ == "__main__":

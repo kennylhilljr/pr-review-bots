@@ -14,12 +14,20 @@ This repository holds `prbot`, the CLI behind Kenny's two GitHub review bots (`c
 - `skills/cross-review/`: the skill Claude Code and Codex use to review PRs and post through the bots. It is linked into `~/.claude/skills` and `~/.codex/skills`.
 - `.claude/settings.json` and `.claude/hooks/check_edit.py`: project Claude Code hooks. They refuse writes to `*.pem`, `*.key` and `.env*` files, run the unit tests after an edit to `prbot`, `integrations/` or `tests/`, and flag em and en dashes after an edit to a `*.md` file or `skills/`. Tested in `tests/test_claude_hooks.py`.
 - `tests/test_prbot.py`: unit tests. Fixtures copy the shape of real PRs from `openclaw-ecc-orchestrator`.
+- `scripts/check.sh`: the before-PR check; `tests/test_check.py` tests it and `tests/test_ci_docs.py` tests `docs/ci.md`.
+- `docs/ci.md`: what the check script does and the CI workflow Kenny adds.
 - `docs/assets/`: the README header.
 
 ## Tests
 
 ```bash
 python3 -B -m unittest discover -s tests -t . -v
+```
+
+Before opening a PR, run every check with `scripts/check.sh`. It runs the tests in an isolated temp folder, compiles the Python files, runs `bash -n` on the shell scripts, rejects em and en dashes in tracked Markdown and `prbot`, and rejects private keys and literal GitHub tokens in tracked files. `docs/ci.md` lists the checks and the `--check` flags.
+
+```bash
+scripts/check.sh
 ```
 
 The tests make no network calls. To try a change against real repos without posting anything, use the read-only modes:

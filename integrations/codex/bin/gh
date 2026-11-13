@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
-# gh shim for Codex sessions. Feedback writes go through prbot as the review bot;
-# every other gh call runs the real gh unchanged.
+# gh shim for Codex sessions. Feedback writes go through prbot as the review bot,
+# reads run the real gh unchanged, and anything classify can't answer is refused.
 set -euo pipefail
 shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 prbot="$shim_dir/../../../prbot"
 bot="${PRBOT_BOT:-codex}"
 
-if [ -z "${PRBOT_ACTIVE:-}" ] && "$prbot" classify -- "$@"; then
+# Every call is classified, whatever the environment says. prbot runs the real gh itself with this directory
+# taken off PATH, so it never comes back through here and needs no bypass (PRBOT_ACTIVE is not trusted).
+out=""
+rc=0
+out="$("$prbot" classify -- "$@")" || rc=$?
+if [ "$rc" = "0" ] && [ "$out" = "write" ]; then
   exec "$prbot" gh "$bot" -- "$@"
+elif [ "$rc" = "1" ] && [ "$out" = "read" ]; then
+  :
+else
+  echo "gh shim: classify did not return a trusted answer (exit $rc, stdout '$out'); refusing to run real gh" >&2
+  if [ "$rc" = "0" ]; then rc=1; fi
+  exit "$rc"
 fi
 
 clean_path=""
