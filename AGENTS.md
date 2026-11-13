@@ -53,3 +53,27 @@ The tests make no network calls. To try a change against real repos without post
 - Never print, log or commit a token or a private key. App keys live in macOS Keychain under service `prbot`; `*.pem` is ignored.
 - Never post to GitHub while testing. Use `--route-only`, `--dry-run`, or the unit tests. Real posts happen through `prbot review`, `prbot gh` and the launchd job only.
 - Changing App permissions, installing the launchd job, or anything that posts as a bot needs Kenny's go-ahead in the conversation.
+
+## Review rules
+
+Review bots check every PR against these rules, as well as Conventions and Safety above. Each rule names the code it covers. A change that breaks one fixes the code or updates the rule in the same PR.
+
+**Identity**
+- `is_feedback_write` decides whether a `gh` argv posts PR feedback. The Claude Code hook (`decide` in `guard_gh_identity.py`) reaches it through `guard_bash`, which reads the command with `shell_commands` and refuses any command naming `gh`, `git` or `prbot` that is off its safe list. The Codex shim (`integrations/codex/bin/gh`) reaches it through `prbot classify` and refuses to run `gh` when classify gives no trusted answer. A new kind of feedback write adds a case to `Classify` and a `Guard`, `Hook` or `CodexShim` test.
+- When the hook's check raises, `fail_closed` refuses feedback writes found by `unrouted_writes` (which splits commands with the older `_commands` scanner), then any `gh`, `git` or `prbot` call and any command it cannot prove unrelated. Only tests call `git_writes`.
+- `_Guard.git_call` refuses a `GIT_IDENTITY` command (commit, push, merge, rebase and others) run in a repo with a remote owned by an account in the prbot config, or when it cannot tell the directory or an earlier step in the same command clones, inits or changes the repo. The hook refuses GitHub MCP tools that `is_mcp_feedback_write` matches. A change to either adds a `Guard` or `Hook` test.
+- A `pr review`, `pr comment`, `issue comment` or close `-c` whose last body or comment value starts with `@codex` is not a feedback write unless `codex_triggers_as_bot` is set. `gh_read` runs the real `gh` with the caller's own login. Only `cmd_gh`, `cmd_git` and the posting step of `cmd_review` run `gh` or `git` with a bot token; `installed_repos` asks for a `metadata: read` token per installation for prbot's own API calls.
+
+**Tokens**
+- `cmd_gh` and `cmd_review` pass the installation token to `gh` only as `GH_TOKEN`, and `cmd_git` to `git` only as `PRBOT_GIT_TOKEN`, read by the credential helper in `git_env`. None of them puts it in argv, a git config file, a file on disk, a log line or an OpenClaw event.
+- All three remove `GITHUB_TOKEN` from that environment.
+- `installation_token` asks for one repository. `cmd_git` asks for a token only for push, fetch and pull, and only for `contents: write`.
+- `manifest` sets no active webhook and no events. Its permissions are `PERMISSIONS` unless the bot spec sets its own, plus `metadata: read`.
+
+**Watch and the event queue**
+- Config, watch state and rewritten event files are written with `write_json_atomic`.
+- In `cmd_watch_queue`, a PR event is deleted when its PR is done, left in the queue when it is over the run's limit, and deferred when the repository lookup or the review failed or has to wait, or when its repo is missing from an incomplete bot inventory. It is rejected only when it is malformed or not an event file, names a repo missing from a complete bot inventory, or its deferral count reaches `MAX_ATTEMPTS`.
+- Once it has the lock, `cmd_watch` holds `watch_lock` for the rest of the run: across `cmd_watch_queue` for a queue run, and across the full pass and `requeue_deferred` otherwise.
+
+**Tests**
+- Tests never post to GitHub, call the network, use Keychain, or read or write the real config, state or OpenClaw folders, except that one `OpenClaw` test imports the real OpenClaw runtime writer when it is installed. `tests/__init__.py` points `PRBOT_CONFIG_DIR`, `PRBOT_QUEUE_DIR` and `PRBOT_OPENCLAW_EVENTS` at a temp folder for the whole run; tests that need their own paths patch them and put fake `gh`, `claude` or `codex` on `PATH`.
