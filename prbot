@@ -246,33 +246,46 @@ def classify_gh(args, codex_triggers_as_bot=False):
         raise Undecided(f"gh {first} {sub} is not on the shim's safe list (it may be an alias or an extension, or "
                         "change gh's own setup); run it from your own terminal")
     rest = args[j + 1:]
-    if _opens_browser(rest):
+    if _opens_browser(rest, group, sub):
         raise Undecided(f"gh {first} {sub} --web starts the browser named in gh's config; open the page yourself")
     if (group, sub) == ("auth", "status") and _shows_token(rest):
         raise Undecided("gh auth status --show-token prints the token")
     return is_feedback_write(args, codex_triggers_as_bot)
 
 
-def _opens_browser(rest):
-    """True when the options include -w/--web before any `--`: --web, --web=..., or a short cluster of letters with
-    a w in it, with or without =value (-w, -w=true, -dw, -wwww). An attached value that is all letters and holds a
-    w (-bwow) is refused too; write it as -b wow."""
+# short options that take a value in every safe-listed subcommand that has them (from gh 2.103.3's help), so the rest
+# of a cluster after one is that option's value; any other letter is read as a flag, so an unknown letter can only
+# make _opens_browser refuse more
+GH_VALUE_SHORT = "ABDFHLORSTbghijknoq"
+
+
+def _opens_browser(rest, group, sub):
+    """True when a word sets -w/--web the way pflag reads it: --web, --web=..., -w, -w=..., or a short cluster
+    whose w comes before any letter that takes a value (-dw, -wRowner/repo, -wwww). An attached value is skipped
+    (-qnow, -b@codex review) only after a letter that takes a value here. A `--` does not end the search, since it
+    can be another option's value (`--exclude -- -w`). gh run list -w is --workflow; write that one long."""
+    value = set(GH_VALUE_SHORT)
+    if (group, sub) in WRITE_SUBCOMMANDS:
+        value |= set("b" + COMMENT_VALUE_SHORT)
+    elif (group, sub) in CLOSE_SUBCOMMANDS:
+        value |= set("c" + CLOSE_VALUE_SHORT)
     for a in rest:
-        if a == "--":
-            return False
         if a == "--web" or a.startswith("--web="):
             return True
-        m = re.fullmatch(r"-([A-Za-z]+)(=.*)?", a, re.S)
-        if m and "w" in m.group(1):
-            return True
+        if a.startswith("-") and not a.startswith("--"):
+            letters = a[1:]
+            for k, ch in enumerate(letters):
+                if ch == "w":
+                    return True
+                if ch in value or letters[k + 1:k + 2] == "=":
+                    break
     return False
 
 
 def _shows_token(rest):
-    """True when gh auth status options include -t/--show-token, alone or in a short cluster such as -at."""
+    """True when gh auth status options include -t/--show-token, alone or in a short cluster such as -at. A `--`
+    does not end the search, since it can be another option's value."""
     for a in rest:
-        if a == "--":
-            return False
         if a.startswith("--"):
             if a.partition("=")[0] == "--show-token":
                 return True
