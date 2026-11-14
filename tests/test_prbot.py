@@ -1046,8 +1046,9 @@ class OpenClaw(unittest.TestCase):
                                    "[claude-pr-gh] review findings: kennylhilljr/demo#20",
                                    "[prbot] plan ready: kennylhilljr/demo#1",
                                    "[prbot] [not a tag] x", "[prbot] [x]no space"])
-        self.assertTrue(got[5].startswith("[prbot] needs-kenny: "))   # the 100-character cut keeps the tag
-        self.assertEqual(len(got[5]), 100)
+        self.assertEqual(got[5], "[prbot] " + ("needs-kenny: " + "r" * 200)[:100])   # the cut is after the tag
+        self.assertEqual(prbot.source_tagged("[claude-pr-gh] " + "x" * 150), "[claude-pr-gh] " + "x" * 100)
+        self.assertEqual(prbot.source_tagged("short"), "[prbot] short")
 
     def test_review_findings_event_names_the_reviewer(self):
         pr = {"number": 20, "title": "T", "url": "https://github.com/o/r/pull/20", "headRefOid": "a" * 40,

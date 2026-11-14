@@ -2063,7 +2063,7 @@ def cmd_review(target, repo=None, override=None, mode="post", only=None):
     diff = gh_read(["pr", "diff", number, "-R", repo])
     cwd = os.getcwd() if repo_from_git() == repo else tempfile.gettempdir()
     for reviewer in reviewers:
-        bot_config(reviewer)  # fail before spending a model run if the bot is not registered
+        login = bot_config(reviewer).get("slug") or f"{reviewer}-pr-gh"  # fails here if the bot is not registered
         body = review_body(reviewer, reason, pr, run_review(reviewer, pr, diff, cwd))
         if mode == "dry-run":
             print(body)
@@ -2084,8 +2084,7 @@ def cmd_review(target, repo=None, override=None, mode="post", only=None):
         print(f"posted {reviewer} review: {url}")
         findings = count_findings(body)
         if findings:
-            openclaw_attention(f"[{bot_config(reviewer).get('slug') or reviewer + '-pr-gh'}] review findings: "
-                               f"{repo}#{pr['number']}",
+            openclaw_attention(f"[{login}] review findings: {repo}#{pr['number']}",
                                {"url": url, "title": pr["title"], "reviewer": f"{reviewer}-pr-gh",
                                 "p1_p2_findings": findings, "commit": pr["headRefOid"][:10]})
     return 0
@@ -2100,10 +2099,13 @@ OPENCLAW_RUN = "github"   # one pseudo-run for all GitHub activity, so OpenClaw'
 SOURCE_TAG = re.compile(r"\[[a-z0-9][a-z0-9-]{0,38}\] ")   # "[claude-pr-gh] ": the bot or tool a message comes from
 
 
-def source_tagged(reason):
-    """The reason with a leading "[bot] " tag naming who it comes from. All bots share one Slack identity, so the
-    tag is how a reader tells them apart. A caller's own tag (a bot login) is kept; anything else gets [prbot]."""
-    return reason if SOURCE_TAG.match(reason) else f"[prbot] {reason}"
+def source_tagged(reason, limit=100):
+    """The reason, cut to `limit` characters, behind a leading "[bot] " tag naming who it comes from. All bots
+    share one Slack identity, so the tag is how a reader tells them apart. A caller's own tag (a bot login) is
+    kept; anything else gets [prbot]. The cut applies to the text after the tag, so tagging removes nothing."""
+    m = SOURCE_TAG.match(reason)
+    tag, text = (m.group(0), reason[m.end():]) if m else ("[prbot] ", reason)
+    return tag + text[:limit]
 
 
 def openclaw_attention(reason, detail):
@@ -2118,7 +2120,7 @@ def openclaw_attention(reason, detail):
             sys.path.insert(0, str(OPENCLAW_RUNTIME))
         from openclaw_ecc_orchestrator.plugin.events import JsonlEventSink
         JsonlEventSink(str(OPENCLAW_EVENTS)).emit("attention.required", OPENCLAW_RUN, None,
-                                                  {"reason": reason[:100], "state": "needs-kenny", "detail": detail})
+                                                  {"reason": reason, "state": "needs-kenny", "detail": detail})
         return True
     except Exception as e:  # OpenClaw being absent or broken must not stop a review or an issue pass
         print(f"prbot: could not tell OpenClaw: {e}", file=sys.stderr)
