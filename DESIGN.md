@@ -212,7 +212,10 @@ refused. Everything else exits 4: unknown words (aliases, extensions, `gh gh`
 after `--`), unlisted subcommands (`gh pr human-review`, `gh ext human-review`,
 `gh extension exec`, `gh alias set` and `import`, `gh config set`, `gh auth
 token`, `gh browse`), `-w` or `--web` (gh starts the browser named in its
-config), `gh help` with a name that is not gh's own (gh turns
+config; a short cluster is read the way gh's flag parser reads it, ending at a
+letter that takes a value in every listed subcommand, so `-dw` and `-wRo/r` are
+refused while `-b@codex review` passes, and a `--` does not end the search
+because it can be another option's value), `gh help` with a name that is not gh's own (gh turns
 `gh help <extension>` into `<extension> --help` and runs it) and a flag before
 the command (`gh --help human-review`), since gh hands the rest of the line to
 a shell alias unparsed. Like the hook, the shim stops mistakes and is not a
