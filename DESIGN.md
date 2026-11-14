@@ -417,6 +417,16 @@ it, so the model never holds a token that can write. The workflow file lives in
 this repo and is copied into each repo by `install-backup-review.sh`, which
 Kenny runs. The worker bots can't write `.github/workflows/`.
 
+## Messages that reach Slack
+
+Every bot and tool posts to Slack under one shared identity, so the text has to
+say who it comes from. Each `attention.required` reason prbot writes starts
+with a tag: the reviewer App's slug for review findings
+(`[claude-pr-gh] review findings: owner/repo#20`), or the caller's own tag,
+such as iwb's worker bot login. `openclaw_attention` keeps a leading
+`[lowercase-name] ` tag and adds `[prbot]` to a reason without one, so no event
+goes out unnamed. The tag is a login or tool name, never a token.
+
 ## Test isolation
 
 prbot reads its config, watch state, event queue and OpenClaw event log from

@@ -1059,7 +1059,7 @@ class OpenClaw(unittest.TestCase):
                  mock.patch.object(prbot, "gh_read", lambda args: json.dumps(pr) if args[1] == "view" else "diff"), \
                  mock.patch.object(prbot, "detect_author", lambda pr: (None, "test")), \
                  mock.patch.object(prbot, "choose_reviewers", lambda *a: ([reviewer], "test")), \
-                 mock.patch.object(prbot, "bot_config", lambda b: {"slug": f"{b}-pr-gh"}), \
+                 mock.patch.object(prbot, "bot_config", lambda b: {"slug": f"{b}-review-app"}), \
                  mock.patch.object(prbot, "run_review", lambda *a: "P1 a bug"), \
                  mock.patch.object(prbot, "review_body", lambda r, why, pr, text: text), \
                  mock.patch.object(prbot, "installation_token", lambda *a: "tok"), \
@@ -1070,7 +1070,7 @@ class OpenClaw(unittest.TestCase):
                  mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
                 self.assertEqual(prbot.cmd_review("20", repo="o/r"), 0)
             self.assertEqual(len(events), 1)
-            self.assertEqual(events[0][0], f"[{reviewer}-pr-gh] review findings: o/r#20")
+            self.assertEqual(events[0][0], f"[{reviewer}-review-app] review findings: o/r#20")   # the App's own slug
             self.assertNotIn("tok", json.dumps(events))
 
     def test_missing_or_broken_runtime_never_raises(self):

@@ -2084,7 +2084,8 @@ def cmd_review(target, repo=None, override=None, mode="post", only=None):
         print(f"posted {reviewer} review: {url}")
         findings = count_findings(body)
         if findings:
-            openclaw_attention(f"[{reviewer}-pr-gh] review findings: {repo}#{pr['number']}",
+            openclaw_attention(f"[{bot_config(reviewer).get('slug') or reviewer + '-pr-gh'}] review findings: "
+                               f"{repo}#{pr['number']}",
                                {"url": url, "title": pr["title"], "reviewer": f"{reviewer}-pr-gh",
                                 "p1_p2_findings": findings, "commit": pr["headRefOid"][:10]})
     return 0
