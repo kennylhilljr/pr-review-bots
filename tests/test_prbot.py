@@ -1002,8 +1002,77 @@ class OpenClaw(unittest.TestCase):
         self.assertEqual([e["seq"] for e in lines], [1, 2])
         e = lines[0]
         self.assertEqual((e["type"], e["run_id"], e["unit_id"]), ("attention.required", "github", None))
-        self.assertEqual(e["data"]["reason"], "review findings: kennylhilljr/demo#20")
+        self.assertEqual(e["data"]["reason"], "[prbot] review findings: kennylhilljr/demo#20")
         self.assertEqual(e["data"]["detail"]["token"], "[REDACTED]")   # the runtime's redaction applies
+
+    def fake_runtime(self):
+        """A stand-in runtime whose JsonlEventSink writes the emitted events as JSON lines, like the real one."""
+        root = Path(self.tmp.name, "fake-runtime")
+        (root / "openclaw_ecc_orchestrator" / "plugin").mkdir(parents=True)
+        (root / "openclaw_ecc_orchestrator" / "__init__.py").write_text("")
+        (root / "openclaw_ecc_orchestrator" / "plugin" / "__init__.py").write_text("")
+        (root / "openclaw_ecc_orchestrator" / "plugin" / "events.py").write_text(
+            "import json\n"
+            "class JsonlEventSink:\n"
+            "    def __init__(self, path):\n"
+            "        self.path = path\n"
+            "    def emit(self, type, run, unit, data):\n"
+            "        with open(self.path, 'a') as f:\n"
+            "            f.write(json.dumps({'type': type, 'run_id': run, 'unit_id': unit, 'data': data}) + '\\n')\n")
+        cached = {m: sys.modules.pop(m) for m in list(sys.modules) if m.startswith("openclaw_ecc_orchestrator")}
+
+        def restore():
+            if str(root) in sys.path:
+                sys.path.remove(str(root))
+            for m in [m for m in sys.modules if m.startswith("openclaw_ecc_orchestrator")]:
+                sys.modules.pop(m)
+            sys.modules.update(cached)
+        self.addCleanup(restore)
+        prbot.OPENCLAW_RUNTIME = root
+
+    def reasons(self):
+        return [json.loads(l)["data"]["reason"] for l in prbot.OPENCLAW_EVENTS.read_text().splitlines()]
+
+    def test_every_reason_names_its_bot(self):
+        self.fake_runtime()
+        self.assertTrue(prbot.openclaw_attention("[codex-dev-gh] blocked: kennylhilljr/demo#3", {}))
+        self.assertTrue(prbot.openclaw_attention("[claude-pr-gh] review findings: kennylhilljr/demo#20", {}))
+        self.assertTrue(prbot.openclaw_attention("plan ready: kennylhilljr/demo#1", {}))
+        self.assertTrue(prbot.openclaw_attention("[not a tag] x", {}))
+        self.assertTrue(prbot.openclaw_attention("[x]no space", {}))
+        self.assertTrue(prbot.openclaw_attention("needs-kenny: " + "r" * 200, {}))
+        got = self.reasons()
+        self.assertEqual(got[:5], ["[codex-dev-gh] blocked: kennylhilljr/demo#3",
+                                   "[claude-pr-gh] review findings: kennylhilljr/demo#20",
+                                   "[prbot] plan ready: kennylhilljr/demo#1",
+                                   "[prbot] [not a tag] x", "[prbot] [x]no space"])
+        self.assertEqual(got[5], "[prbot] " + ("needs-kenny: " + "r" * 200)[:100])   # the cut is after the tag
+        self.assertEqual(prbot.source_tagged("[claude-pr-gh] " + "x" * 150), "[claude-pr-gh] " + "x" * 100)
+        self.assertEqual(prbot.source_tagged("short"), "[prbot] short")
+
+    def test_review_findings_event_names_the_reviewer(self):
+        pr = {"number": 20, "title": "T", "url": "https://github.com/o/r/pull/20", "headRefOid": "a" * 40,
+              "labels": [], "commits": []}
+        for reviewer in ("claude", "codex"):
+            events = []
+            done = subprocess.CompletedProcess([], 0, stdout="https://github.com/o/r/pull/20#r1\n", stderr="")
+            with mock.patch.object(prbot, "load_config", lambda: {}), \
+                 mock.patch.object(prbot, "gh_read", lambda args: json.dumps(pr) if args[1] == "view" else "diff"), \
+                 mock.patch.object(prbot, "detect_author", lambda pr: (None, "test")), \
+                 mock.patch.object(prbot, "choose_reviewers", lambda *a: ([reviewer], "test")), \
+                 mock.patch.object(prbot, "bot_config", lambda b: {"slug": f"{b}-review-app"}), \
+                 mock.patch.object(prbot, "run_review", lambda *a: "P1 a bug"), \
+                 mock.patch.object(prbot, "review_body", lambda r, why, pr, text: text), \
+                 mock.patch.object(prbot, "installation_token", lambda *a: "tok"), \
+                 mock.patch.object(prbot, "_real_gh", lambda: "gh"), \
+                 mock.patch.object(prbot, "repo_from_git", lambda: None), \
+                 mock.patch.object(prbot.subprocess, "run", lambda *a, **k: done), \
+                 mock.patch.object(prbot, "openclaw_attention", lambda r, d: events.append((r, d)) or True), \
+                 mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+                self.assertEqual(prbot.cmd_review("20", repo="o/r"), 0)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0][0], f"[{reviewer}-review-app] review findings: o/r#20")   # the App's own slug
+            self.assertNotIn("tok", json.dumps(events))
 
     def test_missing_or_broken_runtime_never_raises(self):
         prbot.OPENCLAW_RUNTIME = Path(self.tmp.name, "no-runtime")
