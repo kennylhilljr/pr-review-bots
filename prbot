@@ -2084,7 +2084,7 @@ def cmd_review(target, repo=None, override=None, mode="post", only=None):
         print(f"posted {reviewer} review: {url}")
         findings = count_findings(body)
         if findings:
-            openclaw_attention(f"review findings: {repo}#{pr['number']}",
+            openclaw_attention(f"[{reviewer}-pr-gh] review findings: {repo}#{pr['number']}",
                                {"url": url, "title": pr["title"], "reviewer": f"{reviewer}-pr-gh",
                                 "p1_p2_findings": findings, "commit": pr["headRefOid"][:10]})
     return 0
@@ -2096,11 +2096,20 @@ OPENCLAW_RUNTIME = Path(os.environ.get("PRBOT_OPENCLAW_RUNTIME",
 OPENCLAW_EVENTS = Path(os.environ.get("PRBOT_OPENCLAW_EVENTS",
                                       Path.home() / ".local/state/openclaw-ecc-orchestrator/openclaw-events.jsonl"))
 OPENCLAW_RUN = "github"   # one pseudo-run for all GitHub activity, so OpenClaw's run list gets one entry, not one per issue
+SOURCE_TAG = re.compile(r"\[[a-z0-9][a-z0-9-]{0,38}\] ")   # "[claude-pr-gh] ": the bot or tool a message comes from
+
+
+def source_tagged(reason):
+    """The reason with a leading "[bot] " tag naming who it comes from. All bots share one Slack identity, so the
+    tag is how a reader tells them apart. A caller's own tag (a bot login) is kept; anything else gets [prbot]."""
+    return reason if SOURCE_TAG.match(reason) else f"[prbot] {reason}"
 
 
 def openclaw_attention(reason, detail):
     """Append an attention.required event to OpenClaw's event log through the runtime's own writer, which locks,
-    orders, redacts and truncates. Never raises and never blocks GitHub work: returns False if it couldn't."""
+    orders, redacts and truncates. The reason starts with a source tag (source_tagged). Never raises and never
+    blocks GitHub work: returns False if it couldn't."""
+    reason = source_tagged(reason)
     try:
         if not OPENCLAW_EVENTS.parent.is_dir() or not OPENCLAW_RUNTIME.is_dir():
             return False

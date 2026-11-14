@@ -29,7 +29,7 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | `prbot watch --from-queue` (event-driven reviews) | Built and tested; the queue job and hourly backstop in `integrations/launchd/` are not installed yet. |
 | `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
 | `prbot git` (push as a bot) | Live for both bots, with Contents write. |
-| OpenClaw | Reviews with P1 or P2 findings appear in OpenClaw as `attention.required` under the `github` run, written through the orchestrator runtime's event writer. Skipped quietly if the runtime is not installed. |
+| OpenClaw | Reviews with P1 or P2 findings appear in OpenClaw as `attention.required` under the `github` run, written through the orchestrator runtime's event writer. Each reason starts with the bot it comes from, such as `[claude-pr-gh] review findings: owner/repo#20`, because all bots share one Slack identity; a reason without such a tag gets `[prbot]`. Skipped quietly if the runtime is not installed. |
 | Backup review (GitHub Actions) | Built; not installed on any repo yet. See [Backup review when the Mac is offline](#backup-review-when-the-mac-is-offline). |
 
 ## Architecture
