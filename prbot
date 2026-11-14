@@ -19,6 +19,7 @@
                                      the bots are installed on; with --from-queue, only the PRs named
                                      in the GitHub event files in DIR
   prbot classify -- <gh args>        exit 0 if the call posts PR feedback, 1 if it does not, 4 when it can't decide
+                                     or the call is off the shim's gh safe list (aliases, extensions)
 
 Standard library plus the openssl and gh binaries. No token is printed or saved.
 """
@@ -147,6 +148,154 @@ def _only_options(args, allowed_short, allowed_long, value_short, value_long):
             continue
         i += 1
     return True
+
+
+class Undecided(Exception):
+    """classify will not let this gh call run as a read; the Codex shim refuses it."""
+
+
+# The Codex shim runs the real gh only for calls on this safe list. gh expands user aliases from its config.yml and
+# runs extensions under any top-level name it does not own, and it accepts aliases nested under a command group
+# (`pr human-review`), but never under a runnable command and never shadowing a built-in name. So a call is let
+# through only when its first word after the global options is a built-in gh command below and, for a command
+# group, its subcommand is listed under it. The config is never read: every alias, the default `co` included,
+# and every extension is refused, whatever config.yml says. A gh call that is not listed is refused, not guessed.
+# Runnable top-level commands without subcommands; nothing can be nested under them. `browse` is left off: it
+# starts the browser named in gh's config.
+GH_LEAF_COMMANDS = {"api", "status", "version", "completion", "licenses"}
+# gh's help topics: they only print text
+GH_HELP_TOPICS = {"accessibility", "actions", "environment", "exit-codes", "formatting", "mintty", "reference",
+                  "telemetry"}
+# command groups (gh's own spelling, built-in aliases resolve to it) and the subcommands the shim may run; gh's
+# built-in subcommand aliases such as `pr ls` and `pr co` are listed by name. Commands that change gh's aliases,
+# extensions, config or login, print a token, or run a program other than git (alias set, extension exec, config
+# set, auth token, browse, copilot, codespace) are left off, and so is -w/--web, which starts the browser too. gh's pager and editor settings are out of reach, as
+# for the Claude Code hook: the shim stops mistakes and is not a sandbox.
+GH_SAFE_SUBCOMMANDS = {
+    "pr": {"view", "diff", "list", "ls", "checks", "status", "create", "new", "merge", "edit", "checkout", "co",
+           "ready", "close", "reopen", "comment", "review", "lock", "unlock", "update-branch", "revert"},
+    "issue": {"view", "list", "ls", "status", "create", "new", "close", "reopen", "comment", "edit", "lock",
+              "unlock", "pin", "unpin", "develop"},
+    "repo": {"view", "list", "ls", "clone", "fork", "sync", "set-default", "read-file", "read-dir", "create", "new"},
+    "run": {"view", "list", "ls", "watch", "download", "rerun", "cancel"},
+    "workflow": {"view", "list", "ls", "run", "enable", "disable"},
+    "release": {"view", "list", "ls", "download", "verify", "verify-asset"},
+    "label": {"list", "ls", "create", "edit", "clone"},
+    "search": {"code", "commits", "issues", "prs", "repos"},
+    "auth": {"status"},
+    "cache": {"list", "ls"},
+    "gist": {"view", "list", "ls"},
+    "org": {"list", "ls"},
+    "ruleset": {"view", "list", "ls", "check"},
+    "secret": {"list", "ls"},
+    "variable": {"get", "list", "ls"},
+    "alias": {"list", "ls"},
+    "extension": {"list", "ls", "search"},
+    "config": {"get", "list", "ls"},
+    "attestation": {"verify", "download", "trusted-root"},
+    "discussion": {"view", "list"},
+    "project": {"view", "list", "ls", "field-list", "item-list"},
+}
+# built-in names gh resolves to the groups above; `co` is not one of them, it is a config alias that can be redefined
+GH_GROUP_ALIASES = {"ext": "extension", "extensions": "extension", "rs": "ruleset", "at": "attestation"}
+# groups gh owns but the shim never runs; named so the refusal says what they are
+GH_UNSAFE_GROUPS = {"codespace", "cs", "copilot", "preview", "skill", "skills", "agent-task", "agent-tasks", "agent",
+                    "agents", "gpg-key", "ssh-key", "send-telemetry", "credits"}
+GH_HELP_FLAGS = ("--help", "-h")
+
+
+def classify_gh(args, codex_triggers_as_bot=False):
+    """args: the gh argv without the leading 'gh', exactly as gh receives it. True for a PR feedback write, False
+    for a call the shim may pass to the real gh, and Undecided for anything off the safe list above."""
+    i = _skip_gh_globals(args, 0)
+    if i >= len(args):
+        return False  # bare gh (or only -R) prints help
+    first, tail = args[i], args[i + 1:]
+    if first.startswith("-"):
+        # gh hands the rest of the line to a shell alias unparsed, so `--help human-review` would run the alias
+        if first in ("--version",) + GH_HELP_FLAGS and not tail:
+            return False
+        raise Undecided(f"gh option {first} before the command; put the command first")
+    if first in GH_LEAF_COMMANDS:
+        return is_feedback_write(args, codex_triggers_as_bot)
+    if first in GH_HELP_TOPICS and not tail:
+        return False
+    if first == "help":
+        # gh turns `help <extension>` into `<extension> --help`, which runs the extension, so only built-in names
+        top = GH_GROUP_ALIASES.get(tail[0], tail[0]) if tail else None
+        if (not tail or (len(tail) == 1 and (top in GH_LEAF_COMMANDS or top in GH_HELP_TOPICS
+                                             or top in GH_SAFE_SUBCOMMANDS))
+                or (len(tail) == 2 and tail[1] in GH_SAFE_SUBCOMMANDS.get(top, ()))):
+            return False
+        raise Undecided("gh help is only run for gh's own commands (gh runs an extension for gh help <extension>)")
+    group = GH_GROUP_ALIASES.get(first, first)
+    if group not in GH_SAFE_SUBCOMMANDS:
+        if first in GH_UNSAFE_GROUPS:
+            raise Undecided(f"gh {first} is not run from an agent session; run it from your own terminal")
+        raise Undecided(f"gh {first} is not a built-in gh command; aliases and extensions are not run from an "
+                        "agent session (gh would run them as you)")
+    j = _skip_gh_globals(args, i + 1)
+    if j >= len(args):
+        return False  # a bare group prints its help
+    sub = args[j]
+    if sub.startswith("-"):
+        if sub in GH_HELP_FLAGS and j + 1 == len(args):
+            return False
+        raise Undecided(f"gh {first} {sub}: put the subcommand right after {first}")
+    if sub not in GH_SAFE_SUBCOMMANDS[group]:
+        raise Undecided(f"gh {first} {sub} is not on the shim's safe list (it may be an alias or an extension, or "
+                        "change gh's own setup); run it from your own terminal")
+    rest = args[j + 1:]
+    if _opens_browser(rest, group, sub):
+        raise Undecided(f"gh {first} {sub} --web starts the browser named in gh's config; open the page yourself")
+    if (group, sub) == ("auth", "status") and _shows_token(rest):
+        raise Undecided("gh auth status --show-token prints the token")
+    return is_feedback_write(args, codex_triggers_as_bot)
+
+
+# short options that take a value in every safe-listed subcommand that has them (from gh 2.103.3's help), so the rest
+# of a cluster after one is that option's value; any other letter is read as a flag, so an unknown letter can only
+# make _opens_browser refuse more
+GH_VALUE_SHORT = "ABDFHLORSTbghijknoq"
+
+
+def _opens_browser(rest, group, sub):
+    """True when a word sets -w/--web the way pflag reads it: --web, --web=..., -w, -w=..., or a short cluster
+    whose w comes before any letter that takes a value (-dw, -wRowner/repo, -wwww). An attached value is skipped
+    (-qnow, -b@codex review) only after a letter that takes a value here. A `--` does not end the search, since it
+    can be another option's value (`--exclude -- -w`). gh run list -w is --workflow; write that one long."""
+    value = set(GH_VALUE_SHORT)
+    if (group, sub) in WRITE_SUBCOMMANDS:
+        value |= set("b" + COMMENT_VALUE_SHORT)
+    elif (group, sub) in CLOSE_SUBCOMMANDS:
+        value |= set("c" + CLOSE_VALUE_SHORT)
+    for a in rest:
+        if a == "--web" or a.startswith("--web="):
+            return True
+        if a.startswith("-") and not a.startswith("--"):
+            letters = a[1:]
+            for k, ch in enumerate(letters):
+                if ch == "w":
+                    return True
+                if ch in value or letters[k + 1:k + 2] == "=":
+                    break
+    return False
+
+
+def _shows_token(rest):
+    """True when gh auth status options include -t/--show-token, alone or in a short cluster such as -at. A `--`
+    does not end the search, since it can be another option's value."""
+    for a in rest:
+        if a.startswith("--"):
+            if a.partition("=")[0] == "--show-token":
+                return True
+        elif a.startswith("-"):
+            for ch in a[1:]:
+                if ch == "t":
+                    return True
+                if ch in "hqT":  # takes a value: the rest of the word is that value
+                    break
+    return False
 
 
 def is_codex_trigger(text):
@@ -2752,13 +2901,17 @@ def cmd_gh(bot, args, repo=None):
 
 
 def _classify(rest):
-    """Print write or read for a gh argv. Exit 0 for write, 1 for read, 4 when it can't decide."""
-    args = rest[1:] if rest[:1] == ["--"] else rest
-    args = args[1:] if args[:1] == ["gh"] else args
+    """Print write or read for a gh argv. Exit 0 for write, 1 for read, 4 when it can't decide or the call is off
+    the safe list. After `--` the argv is exactly what gh receives, so a first word `gh` is a command name (an alias
+    or an extension) and is kept; without `--` a leading `gh` is dropped."""
+    if rest[:1] == ["--"]:
+        args = rest[1:]
+    else:
+        args = rest[1:] if rest[:1] == ["gh"] else rest
     try:
         cfg = load_config()
-        write = is_feedback_write(args, cfg.get("codex_triggers_as_bot", False))
-    except ConfigError as e:
+        write = classify_gh(args, cfg.get("codex_triggers_as_bot", False))
+    except (ConfigError, Undecided) as e:
         print(f"prbot classify: {e}", file=sys.stderr)
         return 4
     except Exception as e:
