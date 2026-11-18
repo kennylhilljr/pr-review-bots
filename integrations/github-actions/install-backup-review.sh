@@ -9,7 +9,9 @@
 #   2. Run `claude setup-token` and keep the token it prints; this script asks for it once.
 #
 # For each repo it sets the CLAUDE_CODE_OAUTH_TOKEN Actions secret and opens a PR that adds
-# .github/workflows/backup-review.yml, labeled review:codex so the Codex bot reviews it.
+# .github/workflows/backup-review.yml, or updates it to this copy when the repo already has an
+# older one, labeled review:codex so the Codex bot reviews it. Rerun it after changing
+# backup-review.yml (for example a new pinned action SHA) to roll the change out.
 # The token is read without echo, passed to gh on stdin, and never written to disk.
 set -euo pipefail
 
@@ -57,6 +59,11 @@ for repo in "${repos[@]}"; do
   dir="$tmp/${repo#*/}"
   gh repo clone "$repo" "$dir" -- --depth 1 --quiet
   mkdir -p "$dir/.github/workflows"
+  if [ -e "$dir/.github/workflows/backup-review.yml" ]; then
+    verb=Update; what="Updates"
+  else
+    verb=Add; what="Adds"
+  fi
   cp "$workflow" "$dir/.github/workflows/backup-review.yml"
   git -C "$dir" switch -q -c "$branch"
   git -C "$dir" add .github/workflows/backup-review.yml
@@ -64,7 +71,7 @@ for repo in "${repos[@]}"; do
     echo "   workflow already up to date on the default branch"
     continue
   fi
-  git -C "$dir" commit -q -m "Add backup PR review with the Claude Code GitHub Action
+  git -C "$dir" commit -q -m "$verb backup PR review with the Claude Code GitHub Action
 
 Reviews open PRs that prbot has not reviewed two hours after their last
 commit, for when the Mac running prbot watch is offline. Posts as claude[bot].
@@ -72,8 +79,8 @@ Source: kennylhilljr/pr-review-bots integrations/github-actions/backup-review.ym
   git -C "$dir" push -q -u origin "$branch"
   gh label create review:codex -R "$repo" --color 0E8A16 --description "Review with Codex" --force >/dev/null
   gh pr create -R "$repo" --head "$branch" --label review:codex \
-    --title "Add backup PR review with the Claude Code GitHub Action" \
-    --body "Adds \`.github/workflows/backup-review.yml\` from [pr-review-bots](https://github.com/kennylhilljr/pr-review-bots/blob/main/integrations/github-actions/backup-review.yml).
+    --title "$verb backup PR review with the Claude Code GitHub Action" \
+    --body "$what \`.github/workflows/backup-review.yml\` from [pr-review-bots](https://github.com/kennylhilljr/pr-review-bots/blob/main/integrations/github-actions/backup-review.yml).
 
 Every 30 minutes it looks for open PRs whose newest commit has had no prbot review for 2 hours, reviews up to 3 of them read-only with the same prompt prbot uses, and posts each review as claude[bot]. It needs the Claude GitHub App on this repo and the \`CLAUDE_CODE_OAUTH_TOKEN\` secret, which is set.
 

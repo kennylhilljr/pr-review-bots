@@ -417,6 +417,14 @@ it, so the model never holds a token that can write. The workflow file lives in
 this repo and is copied into each repo by `install-backup-review.sh`, which
 Kenny runs. The worker bots can't write `.github/workflows/`.
 
+Every action in it is pinned to a full commit SHA, not a tag. The review job
+holds pull-request and issue write permissions in six repos, so a moved or
+compromised tag would reach all of them at the next run. A test rejects any
+`uses:` line that is not a 40-character SHA with a version comment. Updates are
+a PR here, then a rerun of the installer, which opens an update PR on each repo
+whose copy differs. Dependabot is not used for this: it reads workflows from
+`.github/workflows/`, and the source copy lives under `integrations/`.
+
 ## Messages that reach Slack
 
 Every bot and tool posts to Slack under one shared identity, so the text has to

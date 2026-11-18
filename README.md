@@ -30,7 +30,7 @@ Both Apps are registered and installed on all of `kennylhilljr`'s repositories, 
 | `cross-review` skill | Linked into `~/.claude/skills` and `~/.codex/skills`. |
 | `prbot git` (push as a bot) | Live for both bots, with Contents write. |
 | OpenClaw | Reviews with P1 or P2 findings appear in OpenClaw as `attention.required` under the `github` run, written through the orchestrator runtime's event writer. Each reason starts with the bot it comes from, such as `[claude-pr-gh] review findings: owner/repo#20`, because all bots share one Slack identity; a reason without such a tag gets `[prbot]`. Skipped quietly if the runtime is not installed. |
-| Backup review (GitHub Actions) | Built; not installed on any repo yet. See [Backup review when the Mac is offline](#backup-review-when-the-mac-is-offline). |
+| Backup review (GitHub Actions) | Installed on the six repos the worker bots code in. See [Backup review when the Mac is offline](#backup-review-when-the-mac-is-offline). |
 
 ## Architecture
 
@@ -202,6 +202,14 @@ To install it, run this from your own shell, not an agent's:
 2. Run `claude setup-token` and keep the token.
 3. Run `integrations/github-actions/install-backup-review.sh`. It asks for the token once, without echo, sets the `CLAUDE_CODE_OAUTH_TOKEN` secret on each repo, and opens a PR on each one that adds `.github/workflows/backup-review.yml`, labeled `review:codex`. Pass `owner/repo` arguments to pick the repos; by default it covers the six repos the worker bots code in.
 4. Merge the PRs, then run **Backup review** once from each repo's Actions tab.
+
+The workflow pins each action to a full commit SHA, with the release as a comment (`actions/checkout@<sha> # v4.4.0`), because a moved tag would change every installed copy at once. A test fails if a `uses:` line in `backup-review.yml` is not pinned this way. To move to a newer release:
+
+1. Look up the commit of the release tag: `gh api repos/actions/checkout/commits/v4.4.0 --jq .sha`. This also works for annotated tags such as `anthropics/claude-code-action`'s.
+2. Read the release notes and the diff from the pinned commit, then put the new SHA and version comment in `backup-review.yml` and open a PR here.
+3. After it merges, run `install-backup-review.sh` again. For each repo whose copy differs it opens a PR that updates `.github/workflows/backup-review.yml`; repos already up to date are skipped.
+
+The installed copies live in `kennylhilljr/openclaw-ecc-orchestrator`, `kennylhilljr/issue-worker-bots`, `kennylhilljr/pr-review-bots`, `kennylhilljr/research-mcp`, `kennylhilljr/ecc-customization` and `kennylhilljr/agent-control-plane-infra`. Each change to `backup-review.yml` needs that rollout to reach them, including this repo's own `.github/workflows/backup-review.yml`.
 
 ## Make agents use the bots
 

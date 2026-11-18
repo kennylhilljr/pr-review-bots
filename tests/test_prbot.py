@@ -2300,6 +2300,10 @@ class ReviewPrompt(unittest.TestCase):
         self.assertIn("Use the labels P1, P2 and P3 only to label findings", prompt)
 
 
+# a third-party action pinned to a full commit SHA, with the release it came from as a comment
+PINNED_ACTION = r"^[\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$"
+
+
 class BackupReviewWorkflow(unittest.TestCase):
     """The GitHub Actions backup reviewer must ask for the same review as prbot."""
 
@@ -2317,6 +2321,25 @@ class BackupReviewWorkflow(unittest.TestCase):
         # the reviewer gets read-only tools; only the posting step has a token that can write
         self.assertRegex(text, r"--allowedTools Read,Grep,Glob\n")
         self.assertIn("--disallowedTools Bash,Edit,Write", text)
+
+    def test_workflow_pins_every_action_to_a_commit(self):
+        # a moved or compromised tag would change every installed copy, so each action is a full SHA
+        import re
+        text = (ROOT / "integrations" / "github-actions" / "backup-review.yml").read_text()
+        uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(.+?)\s*$", text, re.M)
+        self.assertIn("actions/checkout@", " ".join(uses))
+        self.assertIn("anthropics/claude-code-action@", " ".join(uses))
+        for ref in uses:
+            if not ref.startswith("./"):
+                self.assertRegex(ref, PINNED_ACTION)
+
+    def test_pin_check_rejects_tags(self):
+        import re
+        pinned = re.compile(PINNED_ACTION)
+        for bad in ("actions/checkout@v4", "actions/checkout@main", "actions/checkout@11d5960a3267",
+                    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"):
+            self.assertIsNone(pinned.match(bad), bad)
+        self.assertTrue(pinned.match("actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0"))
 
 
 class Jwt(unittest.TestCase):
