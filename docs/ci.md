@@ -79,7 +79,7 @@ git clone --recurse-submodules --shallow-submodules https://github.com/kennylhil
 git submodule update --init --depth 1
 ```
 
-The `links` check runs `link-consumer --check` from the pinned submodule. It fails on a missing, dangling, extra or wrong-target link, or a real folder that shadows a shared name. Without the submodule checked out, it fails with `shared skills missing`. If `.gitmodules` has no `.agents/skills/shared` entry, the check has nothing to do and passes.
+The `links` check runs `link-consumer --check` from the pinned submodule. It fails on a missing, dangling, extra or wrong-target link, or a real folder that shadows a shared name. Without the submodule checked out, it fails with `shared skills missing`. It also fails when `.gitmodules` has no `.agents/skills/shared` entry or its URL is anything but `https://github.com/kennylhilljr/skills-catalog.git`.
 
 ## Isolation
 

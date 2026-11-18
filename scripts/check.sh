@@ -218,13 +218,18 @@ sys.exit(status)' $plists
             fi
             ;;
         links)
-            # The Claude Code links to the shared catalog skills (SUB-2). With
-            # the submodule entry in .gitmodules, link-consumer from the pinned
-            # submodule must report no missing, dangling, extra, wrong-target or
-            # shadowing link. Without the entry there is nothing to link.
-            if ! git config -f .gitmodules --get submodule..agents/skills/shared.url >/dev/null 2>&1; then
-                echo "no .agents/skills/shared submodule in .gitmodules, nothing to check"
-                return 0
+            # The Claude Code links to the shared catalog skills (SUB-2). The
+            # catalog submodule must be in .gitmodules at its one allowed URL
+            # (SUB-1) and checked out, and link-consumer from the pinned
+            # submodule must report no missing, dangling, extra, wrong-target
+            # or shadowing link.
+            url=$(git config -f .gitmodules --get submodule..agents/skills/shared.url 2>/dev/null) || {
+                echo "no .agents/skills/shared submodule in .gitmodules"
+                return 1
+            }
+            if [ "$url" != "https://github.com/kennylhilljr/skills-catalog.git" ]; then
+                echo "the .agents/skills/shared submodule URL is not https://github.com/kennylhilljr/skills-catalog.git"
+                return 1
             fi
             if [ ! -f .agents/skills/shared/tools/link-consumer ]; then
                 echo "shared skills missing: run git submodule update --init --depth 1"
