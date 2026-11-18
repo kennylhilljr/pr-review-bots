@@ -142,9 +142,39 @@ class CheckScriptTest(unittest.TestCase):
 
     def test_clean_fixture_passes_every_check(self):
         out = self.assert_passes()
-        for name in ("tests", "python", "shell", "writing", "secrets", "plists"):
+        for name in ("tests", "python", "shell", "writing", "secrets", "plists", "links"):
             self.assertIn("ok: " + name, out)
         self.assertIn("check: all passed", out)
+
+    # Links check
+
+    def write_gitmodules(self):
+        self.write(".gitmodules", textwrap.dedent("""\
+            [submodule ".agents/skills/shared"]
+            \tpath = .agents/skills/shared
+            \turl = https://github.com/kennylhilljr/skills-catalog.git
+            """))
+
+    def test_links_passes_without_a_shared_submodule_entry(self):
+        out = self.assert_passes("--check", "links")
+        self.assertIn("nothing to check", out)
+
+    def test_links_fails_when_the_submodule_is_not_checked_out(self):
+        self.write_gitmodules()
+        self.assert_fails("links", "shared skills missing")
+
+    def test_links_runs_link_consumer_check_and_fails_on_its_findings(self):
+        self.write_gitmodules()
+        tool = self.write(".agents/skills/shared/tools/link-consumer", textwrap.dedent("""\
+            import sys
+            print("link-consumer: args " + " ".join(sys.argv[1:]))
+            print("link-consumer: missing: .claude/skills/verify-change")
+            sys.exit(1)
+            """), add=False)
+        out = self.assert_fails("links", "link-consumer: args --check")
+        self.assertIn("missing: .claude/skills/verify-change", out)
+        tool.write_text("print('link-consumer: 0 links, 0 findings')\n", encoding="utf-8")
+        self.assertIn("ok: links", self.assert_passes("--check", "links"))
 
     # Writing check
 

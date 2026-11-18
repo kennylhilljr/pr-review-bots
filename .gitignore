@@ -6,4 +6,5 @@ __pycache__/
 !/.claude/hooks/
 /.claude/hooks/*
 !/.claude/hooks/check_edit.py
+!/.claude/skills/
 .DS_Store
