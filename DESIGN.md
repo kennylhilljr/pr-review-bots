@@ -462,8 +462,8 @@ loaded yet). Either way the state paths are set up before prbot loads.
 `scripts/check.sh` runs everything a PR must pass in one command: the unit
 tests, `py_compile` on the Python files, `bash -n` on the shell scripts, a
 writing check for em and en dashes, a secret check for private keys and
-literal GitHub tokens, and `plutil -lint` on the plists (a Python `plistlib`
-parse where `plutil` is missing).
+literal GitHub tokens, `plutil -lint` on the plists (a Python `plistlib`
+parse where `plutil` is missing), and a `links` check on the shared skills.
 It runs every check even after one fails, so a single run lists all problems.
 Each check can also run alone with `--check`, which is how
 `tests/test_check.py` plants one problem at a time in a throwaway Git repo.
@@ -476,6 +476,17 @@ the caller's temp folder or real config. This matters because OpenClaw can set
 The writing and secret checks scan files Git tracks, not everything on disk, so
 a local `*.pem` or draft doesn't fail the check. The secret check reports the
 file, line and kind of finding and never prints the match.
+
+Shared skills come from the skills catalog (`kennylhilljr/skills-catalog`), a
+shallow submodule at `.agents/skills/shared` pinned to a release tag's commit.
+`.claude/skills/<name>` holds one relative link per shared skill into that
+submodule, written by the catalog's `tools/link-consumer`. The `links` check
+requires the `.gitmodules` entry at its one allowed URL and the submodule
+checked out (otherwise it fails with `shared skills missing`), then runs
+`link-consumer --check` from the pinned copy, which fails on a missing,
+dangling, extra or wrong-target link or a real folder shadowing a shared name.
+A checkout needs `git clone --recurse-submodules --shallow-submodules`, or
+`git submodule update --init --depth 1` after a plain clone.
 
 GitHub should run the same script on every PR. The worker bots can't write
 `.github/workflows/`, so [`docs/ci.md`](docs/ci.md) holds the workflow for

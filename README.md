@@ -72,7 +72,13 @@ There are no third-party Python packages. The tests use the standard-library `un
 Clone the repository into `~/Documents/GitHub`, which is where the Claude Code hook below expects it, and put `prbot` on your PATH:
 
 ```bash
-git clone https://github.com/kennylhilljr/pr-review-bots.git ~/Documents/GitHub/pr-review-bots
+git clone --recurse-submodules --shallow-submodules https://github.com/kennylhilljr/pr-review-bots.git ~/Documents/GitHub/pr-review-bots
+```
+
+The shared skills catalog is a submodule at `.agents/skills/shared`, and the links in `.claude/skills/` point into it. If you cloned without `--recurse-submodules`, initialize it before running the checks, or the links dangle and `scripts/check.sh` fails with `shared skills missing`:
+
+```bash
+cd ~/Documents/GitHub/pr-review-bots && git submodule update --init --depth 1
 ```
 
 ```bash

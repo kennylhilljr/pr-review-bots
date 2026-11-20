@@ -1,13 +1,13 @@
 #!/bin/sh
 # Run every check a PR must pass. Exits non-zero and names each failed check.
 # Usage: scripts/check.sh [--check NAME]...
-# NAME is one of: tests python shell writing secrets plists. No flag runs them all.
+# NAME is one of: tests python shell writing secrets plists links. No flag runs them all.
 set -u
 
-ALL_CHECKS="tests python shell writing secrets plists"
+ALL_CHECKS="tests python shell writing secrets plists links"
 
 usage() {
-    echo "usage: scripts/check.sh [--check tests|python|shell|writing|secrets|plists]..." >&2
+    echo "usage: scripts/check.sh [--check tests|python|shell|writing|secrets|plists|links]..." >&2
 }
 
 selected=""
@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
                 exit 2
             fi
             case $2 in
-                tests|python|shell|writing|secrets|plists) selected="$selected $2" ;;
+                tests|python|shell|writing|secrets|plists|links) selected="$selected $2" ;;
                 *)
                     echo "check: unknown check: $2" >&2
                     usage
@@ -216,6 +216,26 @@ for path in sys.argv[1:]:
         status = 1
 sys.exit(status)' $plists
             fi
+            ;;
+        links)
+            # The Claude Code links to the shared catalog skills (SUB-2). The
+            # catalog submodule must be in .gitmodules at its one allowed URL
+            # (SUB-1) and checked out, and link-consumer from the pinned
+            # submodule must report no missing, dangling, extra, wrong-target
+            # or shadowing link.
+            url=$(git config -f .gitmodules --get submodule..agents/skills/shared.url 2>/dev/null) || {
+                echo "no .agents/skills/shared submodule in .gitmodules"
+                return 1
+            }
+            if [ "$url" != "https://github.com/kennylhilljr/skills-catalog.git" ]; then
+                echo "the .agents/skills/shared submodule URL is not https://github.com/kennylhilljr/skills-catalog.git"
+                return 1
+            fi
+            if [ ! -f .agents/skills/shared/tools/link-consumer ]; then
+                echo "shared skills missing: run git submodule update --init --depth 1"
+                return 1
+            fi
+            python3 .agents/skills/shared/tools/link-consumer --check
             ;;
     esac
 }
