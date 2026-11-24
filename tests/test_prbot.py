@@ -698,8 +698,11 @@ class Guard(unittest.TestCase):
                         "GIT_PAGER=cat git log", "PAGER=cat git log"):
             with self.subTest(command=command):
                 self.assertIsNone(self.guard(command))
+        self.assertIsNone(self.guard("PAGER=cat; git log"))
         for command in ("GH_PAGER='sh -c x' gh pr view 1", "GH_PAGER=less gh pr view 1", "PAGER=less git log",
-                        "GIT_PAGER='cat; touch /tmp/x' git log", "GIT_PAGER+=cat git log", "GH_PAGER=$P gh pr view 1"):
+                        "GIT_PAGER='cat; touch /tmp/x' git log", "GIT_PAGER+=cat git log", "GH_PAGER=$P gh pr view 1",
+                        "set -a; PAGER='gh pr comment 1 -b x'; git log", "PAGER=less; git log",
+                        "PAGER=$P; git log", "PAGER+=x; git log"):
             with self.subTest(command=command):
                 self.assertIsNotNone(self.guard(command))
 
@@ -2654,6 +2657,7 @@ class KeyStorage(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PRBOT_KEY_STORE": "file"}):
             prbot.store_key("claude", self.pem)
         self.assertEqual(oct(old.stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(oct(prbot.CONFIG_DIR.stat().st_mode & 0o777), oct(0o700))
         self.assertEqual(old.read_text(), self.pem)
         fresh = Path(self.tmp.name, "new", "cfg")
         prbot.CONFIG_DIR = fresh

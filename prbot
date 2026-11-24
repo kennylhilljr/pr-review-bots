@@ -1255,6 +1255,10 @@ class _Guard:
                 name = a.text.split("=", 1)[0].rstrip("+")
                 if name in GUARD_RISKY_VARS or name.startswith(("GH_", "GIT_", "LD_", "DYLD_", "BASH_")):
                     self.block(f"setting {name} is not on the safe list")
+                elif name in GUARD_PAGER_ENV and (a.dynamic or a.text.partition("=")[0].endswith("+")
+                                                  or a.text.partition("=")[2] not in GUARD_SAFE_PAGERS):
+                    # PAGER=x; git log: an exported (set -a) or already exported PAGER reaches git
+                    self.block(f"{name} runs as a command; only {name}=cat or {name}= is on the safe list")
             cmd.assigns = []
         if relevant:
             if cmd.complex:
@@ -1796,6 +1800,7 @@ def store_key(bot, pem):
                        input=f"{enc}\n{enc}\n", text=True, check=True, capture_output=True, start_new_session=True)
         return f"macOS Keychain (service {KEYCHAIN_SERVICE}, account {bot})"
     CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)  # save_config may have made it first with the default mode
     path = CONFIG_DIR / f"{bot}.pem"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
