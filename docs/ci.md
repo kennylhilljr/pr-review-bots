@@ -32,6 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -39,7 +40,7 @@ jobs:
         run: scripts/check.sh
 ```
 
-It runs on every pull request and on pushes to `main`, once on Python 3.9 (the oldest version `README.md` supports) and once on Python 3.13. The `ubuntu-latest` runner already has `gh`, `git` and `openssl`, which the tests use. The tests make no network calls, so the workflow needs no secrets and no App token. It only reads the repository, and the checkout doesn't keep a token on disk.
+It runs on every pull request and on pushes to `main`, once on Python 3.9 (the oldest version `README.md` supports) and once on Python 3.13. The `ubuntu-latest` runner already has `gh`, `git` and `openssl`, which the tests use. `submodules: true` checks out the shared skills submodule at its pinned commit, which the `links` check needs; the catalog is public, so this needs no token. The tests make no network calls, so the workflow needs no secrets and no App token. It only reads the repository, and the checkout doesn't keep a token on disk.
 
 This is separate from `.github/workflows/backup-review.yml`. That workflow posts a review on PRs prbot has left alone; this one only runs the checks and posts nothing.
 
@@ -53,6 +54,7 @@ This is separate from `.github/workflows/backup-review.yml`. That workflow posts
 | `writing` | No em dash (U+2014) or en dash (U+2013) in tracked `*.md` files or in `prbot` |
 | `secrets` | No private key block and no literal GitHub token in any tracked file |
 | `plists` | `plutil -lint` on the two plists in `integrations/launchd/`, or a Python `plistlib` parse when `plutil` is missing (as on Linux) |
+| `links` | `python3 .agents/skills/shared/tools/link-consumer --check`: every `.claude/skills/<name>` link to a shared catalog skill is present, resolves into the pinned submodule, and none is extra or shadowed |
 
 With no arguments the script runs every check, keeps going after a failure, prints `FAIL: <check>` for each one that failed, and exits 1. Run one check, or a few, with `--check`:
 
@@ -65,6 +67,19 @@ An unknown or incomplete argument exits 2.
 The `writing` and `secrets` checks read the working-tree copy of each file Git tracks (`git ls-files`), so untracked files are ignored and staged edits are checked. When the staged copy in the index differs from the working tree, or the file was deleted from the working tree, the staged copy is checked too, and its findings end with `(staged copy)`. If Git can't list the files or a tracked file can't be read, the check fails.
 
 The `secrets` check looks for a `BEGIN ... PRIVATE KEY` line (plain, RSA, EC, OPENSSH, ENCRYPTED and other labels), for `ghp_`, `gho_`, `ghu_` or `ghr_` followed by 36 or more letters, digits and underscores, for `ghs_` followed by 36 or more letters, digits and underscores (the old 40-character installation tokens, skipping the stateless shape) or by an app ID, an underscore and a three-part JWT (the long stateless `ghs_APPID_JWT` ones), and for `github_pat_` followed by 82 or more letters, digits and underscores. It prints the file, line and kind of finding, never the matched text. Tests that need a fake token build it at runtime, for example `"ghp_" + "a" * 36`, so the source holds no literal token.
+
+## Shared skills
+
+The skills catalog (`kennylhilljr/skills-catalog`) is a submodule at `.agents/skills/shared`, pinned to a release tag's commit. `.claude/skills/<name>` holds one relative link per shared skill, for example `.claude/skills/verify-change -> ../../.agents/skills/shared/skills/verify-change`. The links stay inside the repository and are written by the catalog's own `tools/link-consumer`; never edit them or anything inside the submodule by hand. A bump PR moves the gitlink and rewrites the links together.
+
+Clone with the submodule, or initialize it after a plain clone:
+
+```bash
+git clone --recurse-submodules --shallow-submodules https://github.com/kennylhilljr/pr-review-bots.git
+git submodule update --init --depth 1
+```
+
+The `links` check runs `link-consumer --check` from the pinned submodule. It fails on a missing, dangling, extra or wrong-target link, or a real folder that shadows a shared name. Without the submodule checked out, it fails with `shared skills missing`. It also fails when `.gitmodules` has no `.agents/skills/shared` entry or its URL is anything but `https://github.com/kennylhilljr/skills-catalog.git`.
 
 ## Isolation
 

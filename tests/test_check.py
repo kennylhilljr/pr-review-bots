@@ -63,6 +63,24 @@ ENV_REPORT_TEST = textwrap.dedent("""\
     """)
 
 
+GITMODULES = textwrap.dedent("""\
+    [submodule ".agents/skills/shared"]
+    \tpath = .agents/skills/shared
+    \turl = https://github.com/kennylhilljr/skills-catalog.git
+    """)
+
+# Prints its arguments, then the findings in LINK_FINDINGS, one per line.
+LINK_CONSUMER = textwrap.dedent("""\
+    import os, sys
+    print("link-consumer: args " + " ".join(sys.argv[1:]))
+    findings = [f for f in os.environ.get("LINK_FINDINGS", "").split(",") if f]
+    for finding in findings:
+        print("link-consumer: " + finding)
+    print("link-consumer: 0 links, %d findings" % len(findings))
+    sys.exit(1 if findings else 0)
+    """)
+
+
 def token(prefix, length, alphabet="aB3"):
     """A fake token made at runtime: prefix plus `length` body characters."""
     return prefix + (alphabet * length)[:length]
@@ -107,6 +125,9 @@ class CheckScriptTest(unittest.TestCase):
             self.write("integrations/launchd/com.kennylhilljr.%s.plist" % name, PLIST)
         self.write("tests/__init__.py", "")
         self.write("tests/test_fixture.py", PASSING_TEST)
+        self.write(".gitmodules", GITMODULES)
+        # Stands in for the catalog's link-consumer inside the submodule.
+        self.write(".agents/skills/shared/tools/link-consumer", LINK_CONSUMER, add=False)
         self.git("add", "scripts/check.sh")
 
     def env(self, **extra):
@@ -142,9 +163,37 @@ class CheckScriptTest(unittest.TestCase):
 
     def test_clean_fixture_passes_every_check(self):
         out = self.assert_passes()
-        for name in ("tests", "python", "shell", "writing", "secrets", "plists"):
+        for name in ("tests", "python", "shell", "writing", "secrets", "plists", "links"):
             self.assertIn("ok: " + name, out)
         self.assertIn("check: all passed", out)
+
+    # Links check
+
+    def test_links_runs_link_consumer_check(self):
+        out = self.assert_passes("--check", "links")
+        self.assertIn("link-consumer: args --check", out)
+        self.assertIn("ok: links", out)
+
+    def test_links_fails_on_link_consumer_findings(self):
+        code, out = self.run_check("--check", "links",
+                                   env=self.env(LINK_FINDINGS="missing: .claude/skills/verify-change"))
+        self.assertEqual(code, 1, out)
+        self.assertIn("link-consumer: missing: .claude/skills/verify-change", out)
+        self.assertIn("FAIL: links", out)
+
+    def test_links_fails_without_the_submodule_entry(self):
+        (self.repo / ".gitmodules").unlink()
+        self.git("rm", "-q", "--cached", ".gitmodules")
+        self.assert_fails("links", "no .agents/skills/shared submodule in .gitmodules")
+
+    def test_links_fails_on_another_submodule_url(self):
+        self.write(".gitmodules", GITMODULES.replace(
+            "https://github.com/kennylhilljr/skills-catalog.git", "git@github.com:someone/skills.git"))
+        self.assert_fails("links", "submodule URL is not")
+
+    def test_links_fails_when_the_submodule_is_not_checked_out(self):
+        shutil.rmtree(self.repo / ".agents")
+        self.assert_fails("links", "shared skills missing")
 
     # Writing check
 
