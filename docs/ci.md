@@ -6,7 +6,7 @@ The repository's checks live in `scripts/check.sh`. Run it before you open a PR:
 scripts/check.sh
 ```
 
-GitHub should run the same script on every PR. The worker bots are not allowed to write `.github/workflows/`, so they can't add the workflow. Kenny adds it by saving the block below as `.github/workflows/ci.yml` and opening a PR with it.
+GitHub runs the same script on every PR through `.github/workflows/ci.yml`, which holds the block below. The two must match; `tests/test_ci_docs.py` checks that they do. The worker bots are not allowed to write `.github/workflows/`, so a change to the workflow is a PR Kenny merges.
 
 ## The workflow
 
@@ -29,18 +29,18 @@ jobs:
       matrix:
         python-version: ['3.9', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
           submodules: true
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run scripts/check.sh
         run: scripts/check.sh
 ```
 
-It runs on every pull request and on pushes to `main`, once on Python 3.9 (the oldest version `README.md` supports) and once on Python 3.13. The `ubuntu-latest` runner already has `gh`, `git` and `openssl`, which the tests use. `submodules: true` checks out the shared skills submodule at its pinned commit, which the `links` check needs; the catalog is public, so this needs no token. The tests make no network calls, so the workflow needs no secrets and no App token. It only reads the repository, and the checkout doesn't keep a token on disk.
+It runs on every pull request and on pushes to `main`, once on Python 3.9 (the oldest version `README.md` supports) and once on Python 3.13. The `ubuntu-latest` runner already has `gh`, `git` and `openssl`, which the tests use. `submodules: true` checks out the shared skills submodule at its pinned commit, which the `links` check needs; the catalog is public, so this needs no token. The tests make no network calls, so the workflow needs no secrets and no App token. It only reads the repository, and the checkout doesn't keep a token on disk. Each action is pinned to a full commit SHA, with its release as a comment, so a moved or compromised tag can't change what runs.
 
 This is separate from `.github/workflows/backup-review.yml`. That workflow posts a review on PRs prbot has left alone; this one only runs the checks and posts nothing.
 

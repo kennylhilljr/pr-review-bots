@@ -48,11 +48,11 @@ class CiWorkflowDocTest(unittest.TestCase):
         self.assertIn("'3.9'", self.yaml)
 
     def test_checkout_and_setup_steps(self):
-        self.assert_line("      - uses: actions/checkout@v4")
+        self.assertRegex(self.yaml, r"(?m)^      - uses: actions/checkout@[0-9a-f]{40} # v4\.\d+\.\d+$")
         self.assert_line("          persist-credentials: false")
-        self.assert_line("      - uses: actions/setup-python@v5")
+        self.assertRegex(self.yaml, r"(?m)^      - uses: actions/setup-python@[0-9a-f]{40} # v5\.\d+\.\d+$")
         self.assert_line("          python-version: ${{ matrix.python-version }}")
-        self.assertLess(self.yaml.index("actions/checkout@v4"), self.yaml.index("actions/setup-python@v5"))
+        self.assertLess(self.yaml.index("actions/checkout@"), self.yaml.index("actions/setup-python@"))
 
     def test_last_step_runs_the_check_script(self):
         steps = [line for line in self.lines if line.strip()]
@@ -78,10 +78,24 @@ class CiDocLinksTest(unittest.TestCase):
             with self.subTest(file=rel):
                 self.assertIn("](docs/ci.md)", read(rel))
 
-    def test_ci_doc_says_kenny_adds_the_workflow(self):
-        text = read("docs/ci.md")
-        self.assertIn(".github/workflows/ci.yml", text)
-        self.assertIn("Kenny adds it", text)
+    def test_installed_workflow_matches_the_doc(self):
+        self.assertIn(".github/workflows/ci.yml", read("docs/ci.md"))
+        self.assertEqual(read(".github/workflows/ci.yml"), workflow_yaml())
+
+    def test_installed_workflows_pin_every_action_to_a_commit(self):
+        # a moved or compromised tag would change what runs, and backup-review holds id-token: write
+        pinned = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$")
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertIn("ci.yml", [w.name for w in workflows])
+        for wf in workflows:
+            for ref in re.findall(r"^\s*(?:-\s+)?uses:\s*(.+?)\s*$", wf.read_text(), re.M):
+                with self.subTest(workflow=wf.name, ref=ref):
+                    if not ref.startswith("./"):
+                        self.assertRegex(ref, pinned)
+
+    def test_installed_backup_review_matches_the_integration(self):
+        self.assertEqual(read(".github/workflows/backup-review.yml"),
+                         read("integrations/github-actions/backup-review.yml"))
 
     def test_check_script_exists_and_is_executable(self):
         script = ROOT / "scripts" / "check.sh"

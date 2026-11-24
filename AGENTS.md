@@ -15,7 +15,7 @@ This repository holds `prbot`, the CLI behind Kenny's two GitHub review bots (`c
 - `.claude/settings.json` and `.claude/hooks/check_edit.py`: project Claude Code hooks. They refuse writes to `*.pem`, `*.key` and `.env*` files, run the unit tests after an edit to `prbot`, `integrations/` or `tests/`, and flag em and en dashes after an edit to a `*.md` file or `skills/`. Tested in `tests/test_claude_hooks.py`.
 - `tests/test_prbot.py`: unit tests. Fixtures copy the shape of real PRs from `openclaw-ecc-orchestrator`.
 - `scripts/check.sh`: the before-PR check; `tests/test_check.py` tests it and `tests/test_ci_docs.py` tests `docs/ci.md`.
-- `docs/ci.md`: what the check script does and the CI workflow Kenny adds.
+- `docs/ci.md`: what the check script does and the CI workflow in `.github/workflows/ci.yml`.
 - `docs/assets/`: the README header.
 
 ## Tests
