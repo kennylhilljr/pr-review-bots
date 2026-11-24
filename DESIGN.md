@@ -309,11 +309,39 @@ never falls back to self-review when the other agent is unavailable (for
 example, a usage limit); that run fails and says why.
 
 The reviewing agent runs read-only: Claude with only Read, Grep and Glob and
-no MCP servers, Codex with `-s read-only`. Each gets the diff on stdin and, if
-prbot runs inside a checkout of the repo, can read files for context. The
+no MCP servers, Codex with a read-only permission profile. Each gets the diff
+on stdin and can read files in its working folder for context: the top of the
+checkout when prbot runs inside one, otherwise an empty temp folder. The
 reviewer returns text; prbot posts it as a PR review comment through that
 agent's bot, with a line saying why that agent was chosen and which commit it
 reviewed.
+
+The diff and the repo's AGENTS.md come from the PR author, so a review can be
+a prompt injection target: a planted line asking the reviewer to quote
+`~/.config/prbot/claude.pem` would otherwise end up in a public comment. Two
+layers stop it.
+
+First, neither reviewer can read outside its working folder. Claude gets no
+allow rule for its read tools, so in `dontAsk` mode it may read only the
+working folder, and `--setting-sources ""` keeps the user's and the
+checkout's `.claude/settings.json` from adding one; `Read(~/...)` deny rules
+for the folders that hold keys and logins (`PRIVATE_HOME_DIRS`) stay as a
+backstop. Codex's `-s read-only` sandbox reads the whole disk, so prbot gives
+it the `prbot_review` permission profile instead: read `:minimal` (the
+platform's system files), `:workspace_roots` and the program folders of
+the command-line tools (not Homebrew's `etc` or `var`), write nothing.
+`--ignore-user-config` and `--ignore-rules` keep the user's MCP servers,
+hooks and exec rules, which act outside the sandbox, out of the run. `-s` would override that profile, so prbot passes
+`sandbox_mode="read-only"` with `-c` as the fallback. Both run git with
+`GIT_CONFIG_GLOBAL` set to `/dev/null`, since the sandbox can't read
+`~/.gitconfig`.
+
+Second, `leaked_secret` scans every review before it is posted for private
+key blocks, GitHub tokens, paths into those folders and home folder paths. On
+a hit prbot posts nothing and the review fails without repeating what it
+found; a failed reviewer's output is withheld from the log the same way. The
+watcher retries the review like any failed one, and the PR needs a review by
+hand.
 
 Both agents get the same prompt. It works through the checks that the
 `pr-review-toolkit` Claude Code plugin splits across separate agents: the

@@ -1971,10 +1971,12 @@ def review_timeout():
 def run_reviewer_cli(reviewer, cmd, diff, cwd=None):
     """(returncode, stdout, stderr) of a reviewer CLI. It runs in its own process group, and on timeout the whole
     group is killed: claude and codex start children that keep the output pipes open, so killing only the parent
-    would leave prbot waiting and block every PR queued behind this one."""
+    would leave prbot waiting and block every PR queued behind this one. Git skips the user's and system's config:
+    the Codex sandbox can't read them, and a missing ~/.gitconfig would stop every git command it runs."""
     timeout = review_timeout()
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         cwd=cwd, start_new_session=True)
+                         cwd=cwd, env=env, start_new_session=True)
     try:
         out, err = p.communicate(diff, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1987,26 +1989,89 @@ def run_reviewer_cli(reviewer, cmd, diff, cwd=None):
     return p.returncode, out, err
 
 
+# The diff and the repo's AGENTS.md come from the PR author, so a planted instruction can ask the reviewer to quote a
+# local file. Each reviewer may read only its working folder (the checkout, or an empty temp folder), plus the system
+# folders its tools need; leaked_secret is the second layer, checked before anything is posted.
+#
+# Claude: no allow rule for Read, Grep or Glob, so dontAsk mode allows them in the working folder only. No settings
+# files are loaded (--setting-sources ""), so neither the user's nor the checkout's .claude/settings.json can add an
+# allow rule. The deny rules below hold even if that changes.
+#
+# Codex: `-s read-only` reads the whole disk, so it gets a permission profile instead: read the working folder, the
+# platform's minimal set and the command-line tool folders, write nothing. sandbox_mode stays read-only in case the
+# profile is ignored; -s would override the profile.
+# Home folders that hold keys and logins.
+PRIVATE_HOME_DIRS = (".config", ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".netrc", ".git-credentials",
+                     "Library/Keychains")
+PRIVATE_HOME_FILES = (".netrc", ".git-credentials")
+# Claude Code applies Read(path) deny rules to every file-reading tool, Grep and Glob included.
+CLAUDE_DENIED = " ".join(f"Read(~/{d}{'' if d in PRIVATE_HOME_FILES else '/**'})" for d in PRIVATE_HOME_DIRS)
+CODEX_PROFILE = "prbot_review"
+CODEX_READABLE = {":minimal": "read", ":workspace_roots": "read",
+                  # git, rg and the other command-line tools Codex reads code with. Only the program folders: the
+                  # Homebrew prefixes' etc and var folders hold user data.
+                  "/Library/Developer/CommandLineTools": "read",
+                  **{f"{prefix}/{d}": "read" for prefix in ("/opt/homebrew", "/usr/local")
+                     for d in ("bin", "Cellar", "opt", "lib", "libexec", "share")}}
+# --ignore-user-config drops the user's MCP servers, hooks and other settings, which run outside the sandbox (login
+# still comes from CODEX_HOME); --ignore-rules drops execpolicy rules that could let a command skip it.
+CODEX_SANDBOX = ["--ignore-user-config", "--ignore-rules", "-c", 'sandbox_mode="read-only"', "-c", f'default_permissions="{CODEX_PROFILE}"',
+                 "-c", f"permissions.{CODEX_PROFILE}.filesystem={{"
+                 + ",".join(f'"{k}"="{v}"' for k, v in CODEX_READABLE.items()) + "}"]
+
+# What a review may never contain. The diff and the repo's AGENTS.md come from the PR author, so a planted
+# instruction can ask the reviewer to quote a local file; prbot refuses to post a review that looks like one did.
+LEAK_PATTERNS = [
+    ("a private key block", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
+    ("a GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}")),
+    ("a GitHub token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
+    ("an API key", re.compile(r"\bsk-(?:ant-|proj-)[A-Za-z0-9_-]{20,}")),
+    ("an API key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("a path to a private home folder",
+     re.compile(r"(?:~|\$HOME|\$\{HOME\})/(?:" + "|".join(re.escape(d) for d in PRIVATE_HOME_DIRS) + r")\b")),
+    ("a home folder path", re.compile(r"/(?:Users|home)/[^/\s`'\"]+/\.")),
+]
+
+
+def leaked_secret(text):
+    """What kind of secret or private path the review text holds, or None. Never returns the match itself, so the
+    error that names it can't repeat the secret."""
+    home = str(Path.home())
+    if len(home) > 1 and home in text:
+        return "this machine's home folder path"
+    for label, pattern in LEAK_PATTERNS:
+        if pattern.search(text):
+            return label
+    return None
+
+
 def run_review(reviewer, pr, diff, cwd):
     prompt = REVIEW_PROMPT.format(url=pr["url"], title=pr["title"])
     if reviewer == "claude":
         cmd = ["claude", "-p", prompt, "--output-format", "text", "--no-session-persistence", "--strict-mcp-config",
-               "--permission-mode", "dontAsk", "--allowedTools", "Read Grep Glob",
-               "--disallowedTools", "Bash Edit Write NotebookEdit WebFetch WebSearch"]
+               "--setting-sources", "", "--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob",
+               "--disallowedTools", "Bash Edit Write NotebookEdit WebFetch WebSearch " + CLAUDE_DENIED]
         code, out, err = run_reviewer_cli(reviewer, cmd, diff, cwd)
         stdout = out
     else:
         fd, outfile = tempfile.mkstemp(prefix="prbot-codex-", suffix=".md")
         os.close(fd)
         try:
-            cmd = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "-C", cwd,
+            cmd = ["codex", "exec", *CODEX_SANDBOX, "--skip-git-repo-check", "--ephemeral", "-C", cwd,
                    "-o", outfile, prompt]
             code, stdout, err = run_reviewer_cli(reviewer, cmd, diff)
             out = Path(outfile).read_text()
         finally:
             os.unlink(outfile)
     if code != 0 or not out.strip():
-        die(f"{reviewer} review failed (exit {code}): {(err or stdout)[-500:]}")
+        detail = (err or stdout)[-500:]
+        if leaked_secret(detail):  # the watcher's log is a file on disk; keep secrets out of it
+            detail = f"[output withheld: it contains {leaked_secret(detail)}]"
+        die(f"{reviewer} review failed (exit {code}): {detail}")
+    leak = leaked_secret(out)
+    if leak:
+        die(f"{reviewer} review not posted: it contains {leak}, which may be a local file leaked through a prompt "
+            f"injection in the PR; review this PR by hand")
     return out.strip()
 
 
@@ -2061,7 +2126,23 @@ def cmd_review(target, repo=None, override=None, mode="post", only=None):
     if mode == "route":
         return 0
     diff = gh_read(["pr", "diff", number, "-R", repo])
-    cwd = os.getcwd() if repo_from_git() == repo else tempfile.gettempdir()
+    # The reviewer may read only this folder: the checkout's top level, or an empty folder when prbot runs elsewhere.
+    # Never the shared temp folder, which holds other programs' files.
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    empty = None
+    if repo_from_git() == repo and top.returncode == 0 and top.stdout.strip():
+        cwd = top.stdout.strip()
+    else:
+        empty = tempfile.TemporaryDirectory(prefix="prbot-review-")
+        cwd = empty.name
+    try:
+        return _post_reviews(reviewers, reason, pr, diff, cwd, mode, number, repo)
+    finally:
+        if empty:
+            empty.cleanup()
+
+
+def _post_reviews(reviewers, reason, pr, diff, cwd, mode, number, repo):
     for reviewer in reviewers:
         login = bot_config(reviewer).get("slug") or f"{reviewer}-pr-gh"  # fails here if the bot is not registered
         body = review_body(reviewer, reason, pr, run_review(reviewer, pr, diff, cwd))

@@ -63,7 +63,7 @@ Reads such as `gh pr view` and `gh pr diff` always use your normal `gh` login. O
 | `openssl` | Yes | Signs the App login (RS256). |
 | macOS Keychain (`security`) | Recommended | Holds the App private keys. Other systems fall back to a mode-600 file in `~/.config/prbot/`. |
 | `claude` CLI | For Claude reviews | `prbot review` runs it read-only. |
-| `codex` CLI | For Codex reviews | `prbot review` runs it with `-s read-only`. |
+| `codex` CLI | For Codex reviews | `prbot review` runs it read-only, limited to the checkout by a permission profile (tested with 0.169). |
 
 There are no third-party Python packages. The tests use the standard-library `unittest` runner.
 
@@ -307,7 +307,8 @@ Feedback writes go through `prbot gh codex`. Other `gh` calls reach the real `gh
 - App private keys live in macOS Keychain, base64-encoded under service `prbot`. Non-secret settings (App id, slug, owner) live in `~/.config/prbot/config.json`. Never commit either; `*.pem` is ignored.
 - Bot tokens last one hour, cover a single repository, and exist only in the environment of one `gh` process. prbot never prints or saves them, and it clears `GITHUB_TOKEN` before calling `gh` so a personal token cannot leak into a bot post.
 - Each App asks for the least it needs: read and write on pull requests and issues, read on contents and metadata. No webhooks.
-- Reviewing agents run read-only: Claude with only Read, Grep and Glob and no MCP servers, Codex with `-s read-only`. They return text; only prbot posts.
+- Reviewing agents run read-only and can read only the repo checkout (or an empty temp folder when prbot runs outside one): Claude with only Read, Grep and Glob, no MCP servers, no settings files and deny rules for `~/.config`, `~/.ssh` and other key folders; Codex with a permission profile that reads the working folder and the system folders its tools need, and writes nothing. They return text; only prbot posts.
+- A PR's diff and AGENTS.md come from its author, so a planted instruction could ask the reviewer to quote a local file. Besides the read limits, prbot scans every review before posting for private key blocks, GitHub tokens, paths into private home folders and home folder paths; on a hit it posts nothing and fails that review.
 - Plain comments that are `@codex` triggers (the body starts with `@codex`, alone or followed by whitespace) stay on your account by default, because the Codex Cloud connector may ignore other bots. Set `"codex_triggers_as_bot": true` in `~/.config/prbot/config.json` once you've confirmed it responds to `claude-pr-gh`.
 
 ## Troubleshooting
