@@ -2300,6 +2300,157 @@ class ReviewPrompt(unittest.TestCase):
         self.assertIn("Use the labels P1, P2 and P3 only to label findings", prompt)
 
 
+class ReviewLeak(unittest.TestCase):
+    """Issue 29: a planted instruction in the diff or AGENTS.md asks the reviewer to quote a local key file. prbot must
+    refuse to post a review holding a key, a token or a private home path, and Claude may not read those folders."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.reply = Path(self.tmp.name, "reply.txt")
+        for name in ("claude", "codex"):
+            fake = Path(self.tmp.name, name)
+            fake.write_text(f"#!/usr/bin/env python3\nimport json, sys\n"
+                            f"json.dump(sys.argv[1:], open({str(Path(self.tmp.name, name + '.args'))!r}, 'w'))\n"
+                            f"text = open({str(self.reply)!r}).read()\n"
+                            "a = sys.argv\n"
+                            "if '-o' in a: open(a[a.index('-o') + 1], 'w').write(text)\n"
+                            "else: print(text)\n")
+            fake.chmod(0o755)
+        self.saved = os.environ["PATH"]
+        os.environ["PATH"] = f"{self.tmp.name}{os.pathsep}{os.environ['PATH']}"
+        self.pr = {"url": "https://github.com/o/r/pull/2", "title": "t"}
+
+    def tearDown(self):
+        os.environ["PATH"] = self.saved
+        self.tmp.cleanup()
+
+    def review(self, reviewer, text):
+        import io
+        from contextlib import redirect_stderr
+        self.reply.write_text(text)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            try:
+                return prbot.run_review(reviewer, self.pr, "diff", self.tmp.name), err.getvalue()
+            except SystemExit:
+                return None, err.getvalue()
+
+    def test_leaked_secrets_are_not_posted(self):
+        # built from parts so scripts/check.sh's secret scan doesn't flag this file
+        key = "-" * 5 + "BEGIN RSA PRIVATE KEY" + "-" * 5 + "\nMIIEow...\n"
+        ossh = "-" * 5 + "BEGIN OPENSSH PRIVATE KEY" + "-" * 5
+        leaks = {
+            "a private key block": [key, ossh],
+            "a GitHub token": ["gh" + p + "_" + "aB3x" * 9 for p in "pousr"] + ["github_pat_" + "aB3_" * 10],
+            "an API key": ["sk-" + "ant-oat01-" + "aB3x" * 6, "sk-" + "proj-" + "aB3x" * 6, "AKIA" + "ABCD2345" * 2],
+            "a path to a private home folder": ["~/.config/prbot/claude.pem", "see ~/.ssh/id_ed25519", "$HOME/.aws",
+                                                "~/.netrc", "${HOME}/.gnupg/x"],
+            "a home folder path": ["/Users/someone/.config/gh/hosts.yml", "/home/ci/.ssh/id_rsa"],
+            "this machine's home folder path": [str(Path.home()) + "/notes.txt"],
+        }
+        for label, texts in leaks.items():
+            for text in texts:
+                for reviewer in ("claude", "codex"):
+                    with self.subTest(reviewer=reviewer, text=text):
+                        out, err = self.review(reviewer, f"P1 as asked, here it is:\n```\n{text}\n```\n")
+                        self.assertIsNone(out)
+                        self.assertIn(f"{reviewer} review not posted: it contains {label}", err)
+                        if label != "this machine's home folder path":
+                            self.assertNotIn(text.strip(), err)  # the error never repeats the secret
+
+    def test_ordinary_reviews_still_post(self):
+        for text in ("Nothing worth reporting.", "P2 `prbot:120` reads `config.json` before the lock.",
+                     "The `ghp_` prefix check misses `gho_` tokens.", "Uses `os.path.expanduser('~')` here.",
+                     "See /usr/local/bin/gh and `.config` in the repo."):
+            with self.subTest(text=text):
+                self.assertEqual(self.review("codex", text)[0], text)
+
+    def test_a_failed_review_does_not_log_the_secret(self):
+        fake = Path(self.tmp.name, "claude")
+        token = "gh" + "s_" + "aB3x" * 9
+        fake.write_text(f"#!/bin/sh\necho 'leaking {token}' >&2\nexit 1\n")
+        out, err = self.review("claude", "")
+        self.assertIsNone(out)
+        self.assertIn("claude review failed (exit 1): [output withheld: it contains a GitHub token]", err)
+        self.assertNotIn(token, err)
+
+    def test_codex_reads_only_its_working_folder(self):
+        self.review("codex", "ok")
+        args = json.loads(Path(self.tmp.name, "codex.args").read_text())
+        self.assertNotIn("-s", args)  # -s read-only reads the whole disk and overrides the permission profile
+        self.assertNotIn("--sandbox", args)
+        configs = [args[i + 1] for i, a in enumerate(args) if a == "-c"]
+        self.assertIn('sandbox_mode="read-only"', configs)
+        self.assertIn('default_permissions="prbot_review"', configs)
+        fs = next(c for c in configs if c.startswith("permissions.prbot_review.filesystem="))
+        self.assertIn('":workspace_roots"="read"', fs)
+        self.assertIn('":minimal"="read"', fs)
+        self.assertNotIn("write", fs)
+        self.assertNotIn("/Users", fs)
+        for broad in ('"/opt/homebrew"', '"/usr/local"', "/etc", "/var"):  # whole prefixes hold user data
+            self.assertNotIn(broad, fs)
+        self.assertIn('"/opt/homebrew/bin"="read"', fs)
+        # the user's config brings MCP servers and hooks that run outside the sandbox
+        self.assertIn("--ignore-user-config", args)
+        self.assertIn("--ignore-rules", args)
+        self.assertEqual(args[args.index("-C") + 1], self.tmp.name)
+
+    def test_reviewers_skip_the_users_git_config(self):
+        for name in ("claude", "codex"):
+            fake = Path(self.tmp.name, name)
+            fake.write_text("#!/bin/sh\necho \"$GIT_CONFIG_GLOBAL $GIT_CONFIG_NOSYSTEM\"\n"
+                            "for a; do [ \"$prev\" = -o ] && echo \"$GIT_CONFIG_GLOBAL $GIT_CONFIG_NOSYSTEM\" > \"$a\"; "
+                            "prev=$a; done\n")
+            with self.subTest(reviewer=name):
+                self.assertEqual(self.review(name, "")[0], f"{os.devnull} 1")
+
+    def test_reviewer_works_in_the_checkout_or_an_empty_folder(self):
+        pr = {"number": 20, "title": "T", "url": "https://github.com/o/r/pull/20", "headRefOid": "a" * 40,
+              "labels": [], "commits": []}
+        checkout = Path(self.tmp.name, "checkout")
+        (checkout / "sub").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        for in_repo, start, want in ((True, checkout / "sub", checkout), (False, checkout, None)):
+            seen = []
+            with self.subTest(in_repo=in_repo), \
+                 mock.patch.object(prbot, "load_config", lambda: {}), \
+                 mock.patch.object(prbot, "gh_read", lambda args: json.dumps(pr) if args[1] == "view" else "diff"), \
+                 mock.patch.object(prbot, "detect_author", lambda pr: (None, "test")), \
+                 mock.patch.object(prbot, "choose_reviewers", lambda *a: (["codex"], "test")), \
+                 mock.patch.object(prbot, "bot_config", lambda b: {"slug": "x"}), \
+                 mock.patch.object(prbot, "run_review",
+                                   lambda r, pr, diff, cwd: seen.append((cwd, sorted(os.listdir(cwd)))) or "ok"), \
+                 mock.patch.object(prbot, "repo_from_git", lambda: "o/r" if in_repo else None), \
+                 mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+                saved = os.getcwd()
+                os.chdir(start)
+                try:
+                    self.assertEqual(prbot.cmd_review("20", repo="o/r", mode="dry-run"), 0)
+                finally:
+                    os.chdir(saved)
+                cwd, listing = seen[0]
+                if want:
+                    self.assertTrue(os.path.samefile(cwd, want))  # the top level, not the subfolder prbot ran in
+                else:
+                    self.assertNotEqual(cwd, tempfile.gettempdir())  # never the shared temp folder
+                    self.assertEqual(listing, [])
+                    self.assertFalse(os.path.exists(cwd))  # removed after the review
+
+    def test_claude_cannot_read_private_home_folders(self):
+        self.review("claude", "ok")
+        args = json.loads(Path(self.tmp.name, "claude.args").read_text())
+        # no allow rule: dontAsk mode then allows reads in the working folder only
+        self.assertNotIn("--allowedTools", args)
+        self.assertEqual(args[args.index("--tools") + 1], "Read,Grep,Glob")
+        # no settings files, so a checkout's .claude/settings.json can't add an allow rule
+        self.assertEqual(args[args.index("--setting-sources") + 1], "")
+        denied = args[args.index("--disallowedTools") + 1].split()
+        # Claude Code applies Read(path) deny rules to Grep and Glob too
+        for rule in ("Read(~/.config/**)", "Read(~/.ssh/**)", "Read(~/.gnupg/**)", "Read(~/.aws/**)",
+                     "Read(~/.netrc)", "Read(~/Library/Keychains/**)", "Bash", "WebFetch"):
+            self.assertIn(rule, denied)
+
+
 # a third-party action pinned to a full commit SHA, with the release it came from as a comment
 PINNED_ACTION = r"^[\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$"
 
