@@ -717,7 +717,9 @@ class Guard(unittest.TestCase):
                 self.assertIsNone(self.guard(command))
         for command in ("evilscripts/check.sh && git status", "/tmp/x/scripts/check.sh && git status",
                         "cd sub && scripts/check.sh && git status", "\"$HOME/scripts/check.sh\" && git status",
-                        "sub/scripts/check.sh && git status", f"{self.theirs}/scripts/check.sh && git status"):
+                        "sub/scripts/check.sh && git status", f"{self.theirs}/scripts/check.sh && git status",
+                        "PWD=/tmp; \"$PWD/scripts/check.sh\" && git status",
+                        "PWD=/tmp \"$PWD/scripts/check.sh\" && git status"):
             with self.subTest(command=command):
                 self.assertIsNotNone(self.guard(command))
         # outside any git repository there is no repo script to match

@@ -1154,7 +1154,8 @@ GUARD_RUNNERS = {"arch", "find", "setsid", "watch", "script", "flock", "xcrun", 
                  "parallel", "chroot", "doas", "unbuffer", "expect", "osascript", "at", "batch", "launchctl", "su",
                  "runuser", "unshare", "nsenter", "sandbox-exec", "ionice", "taskset", "chrt", "prlimit",
                  "systemd-run", "open", "dtruss", "lldb", "gdb", "strace", "ltrace", "valgrind", "sem"}
-GUARD_RISKY_VARS = {"PATH", "IFS", "HOME", "XDG_CONFIG_HOME", "CDPATH"}
+# PWD and OLDPWD: the guard reads "$PWD/scripts/check.sh" as the directory it tracks
+GUARD_RISKY_VARS = {"PATH", "IFS", "HOME", "XDG_CONFIG_HOME", "CDPATH", "PWD", "OLDPWD"}
 # variables whose value bash runs or expands as code: refused in every command
 GUARD_CODE_VARS = {"PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
 # builtins that store text in a variable; text holding $( or a backtick there can run later through arithmetic
