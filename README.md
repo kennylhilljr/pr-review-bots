@@ -127,7 +127,7 @@ Without `-R`, prbot uses the `origin` remote of the current directory.
 
 ### Push as a bot
 
-Agent commits and pushes should show the bot, not you. `prbot git` sets the bot as author and committer (`claude-pr-gh[bot] <349557468+claude-pr-gh[bot]@users.noreply.github.com>`), which is what makes GitHub show the bot and its logo on the commit. For push, fetch and pull it also supplies a one-hour token with contents write, which needs the App's **Contents** permission set to read and write.
+Agent commits and pushes should show the bot, not you. `prbot git` sets the bot as author and committer (`claude-pr-gh[bot] <349557468+claude-pr-gh[bot]@users.noreply.github.com>`), which is what makes GitHub show the bot and its logo on the commit. For push, fetch and pull it also supplies a one-hour token for that one repository: contents write for push, which needs the App's **Contents** permission set to read and write, and contents read for fetch and pull. While git holds that token it runs no hooks (hook files, a `core.hooksPath` folder such as `.husky`, or config-based `hook.*` entries) and no `core.fsmonitor` command, so code in the checkout never sees the token. Run a repository's own pre-push or post-merge checks yourself before or after `prbot git`.
 
 ```bash
 prbot git claude -- commit -m "Fix the thing"
@@ -275,7 +275,7 @@ Feedback writes go through `prbot gh codex`. Other `gh` calls reach the real `gh
 | `prbot install-url <bot>` | Prints the page that installs the App. | 0, or 2 |
 | `prbot whoami <bot>` | Shows the App and where it is installed. | 0, or 2 |
 | `prbot gh <bot> [-R owner/repo] -- <gh args>` | Runs `gh` with a one-repo App token. | `gh`'s own code, or 2 |
-| `prbot git <bot> [-R owner/repo] -- <git args>` | Runs `git` (push) with a one-repo contents-write token. | `git`'s own code, or 2 |
+| `prbot git <bot> [-R owner/repo] -- <git args>` | Runs `git` as the bot; push gets a one-repo contents-write token, fetch and pull a contents-read one, and none of them run hooks. | `git`'s own code, or 2 |
 | `prbot review <pr> [-R owner/repo] [--reviewer claude\|codex\|both] [--dry-run\|--route-only]` | Routes, runs and posts a cross-review. | 0, 2 on error, 3 when the author is unclear |
 | `prbot watch [--dry-run] [--limit N] [--baseline] [--from-queue DIR]` | One pass of automatic reviews over open PRs, or over the PRs named in the event files in `DIR`. | 0, or 2 (with `--from-queue`, also when a PR failed) |
 | `prbot classify -- <gh args>` | Used by the hook and shim. Prints write or read on stdout. | 0 if the call posts PR feedback, 1 if it does not (other writes included), 4 when it can't decide (for example an unreadable config) or the call is off the shim's gh safe list (an alias, an extension, `gh alias set`, `gh extension exec`) |

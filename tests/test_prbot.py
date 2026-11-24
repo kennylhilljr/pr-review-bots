@@ -909,6 +909,92 @@ class GitPush(unittest.TestCase):
         self.assertEqual(env["PRBOT_GIT_TOKEN"], "TEST-TOKEN")
         self.assertNotIn("TEST-TOKEN", r.stdout)  # the token is never written into git config
 
+    def _cmd_git_permissions(self, args):
+        # the permissions cmd_git asks for, and the env git would get; nothing runs or reaches GitHub
+        asked, ran = [], []
+
+        class Exec(Exception):
+            pass
+
+        def fake_exec(prog, argv, env):
+            ran.append((argv, env))
+            raise Exec
+        with mock.patch.object(prbot, "installation_token",
+                               lambda bot, repo, permissions=None: asked.append(permissions) or "TEST-TOKEN"), \
+                mock.patch.object(prbot, "bot_identity", lambda bot: ("b[bot]", "1+b[bot]@users.noreply.github.com")), \
+                mock.patch.object(prbot.os, "execvpe", fake_exec):
+            with self.assertRaises(Exec):
+                prbot.cmd_git("claude", args, repo="o/r")
+        return asked, ran[0][1], ran[0][0]
+
+    def test_only_push_gets_a_contents_write_token(self):
+        # regression for issue #30: fetch and pull asked for contents write, so a read handed hooks a push token
+        for args, want in (("fetch origin", "read"), ("pull --ff-only", "read"), ("-C repo fetch", "read"),
+                           ("push origin main", "write"), ("-C repo push", "write")):
+            with self.subTest(args=args):
+                asked, env, _ = self._cmd_git_permissions(args.split())
+                self.assertEqual(asked, [{"contents": want}])
+                self.assertEqual(env["PRBOT_GIT_TOKEN"], "TEST-TOKEN")
+        asked, env, _ = self._cmd_git_permissions(["commit", "-m", "x"])
+        self.assertEqual(asked, [])
+        self.assertNotIn("PRBOT_GIT_TOKEN", env)
+
+    def test_git_with_a_token_runs_no_hooks(self):
+        # regression for issue #30: repo hooks (hook files, a husky core.hooksPath, config-based hooks) ran with
+        # PRBOT_GIT_TOKEN in their environment; a commit fires hooks the same way push and pull do
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, marker = Path(tmp, "r"), Path(tmp, "ran")
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            hook = f'#!/bin/sh\necho "$PRBOT_GIT_TOKEN" >> "{marker}"\n'
+            for folder in (repo / ".git" / "hooks", repo / ".husky"):
+                folder.mkdir(exist_ok=True)
+                for name in ("pre-commit", "post-commit"):
+                    (folder / name).write_text(hook)
+                    (folder / name).chmod(0o755)
+            git = ["git", "-C", str(repo)]
+            subprocess.run(git + ["config", "hook.leak.command", f'echo "$PRBOT_GIT_TOKEN" >> "{marker}"'], check=True)
+            subprocess.run(git + ["config", "hook.leak.event", "post-commit"], check=True)
+            identity = ("b[bot]", "1+b[bot]@users.noreply.github.com")
+            # without a token the hooks run, so the check below can see them
+            subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "a"], env=prbot.git_env(identity=identity),
+                           check=True)
+            self.assertTrue(marker.exists())
+            marker.unlink()
+            for hooks_path in (None, ".husky"):
+                with self.subTest(hooks_path=hooks_path):
+                    if hooks_path:
+                        subprocess.run(git + ["config", "core.hooksPath", hooks_path], check=True)
+                    subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "b"],
+                                   env=prbot.git_env(token="TEST-TOKEN", identity=identity), check=True)
+                    self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+
+    def test_callers_git_options_cannot_undo_the_hardening(self):
+        # review of issue #30: a caller's own -c or --config-env came after GIT_CONFIG_* and won, so
+        # `prbot git claude -- -c core.hooksPath=.husky push` ran .husky/pre-push with the token
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, marker = Path(tmp, "r"), Path(tmp, "ran")
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / ".husky").mkdir()
+            hook = repo / ".husky" / "post-commit"
+            hook.write_text(f'#!/bin/sh\necho "$PRBOT_GIT_TOKEN" >> "{marker}"\n')
+            hook.chmod(0o755)
+            evil = f'!f() {{ echo "$PRBOT_GIT_TOKEN" >> "{marker}"; }}; f'
+            caller = ["-C", str(repo), "-c", "core.hooksPath=.husky", "--config-env=hook.post-commit.enabled=ON",
+                      "-c", f"credential.helper={evil}", "-c", f"credential.https://github.com/o/r.helper={evil}"]
+            _, env, argv = self._cmd_git_permissions(caller + ["push", "origin", "main"])
+            env = dict(env, ON="true")
+            at = argv.index("push")
+            self.assertEqual(argv[at:], ["push", "origin", "main"])
+            self.assertEqual(argv[1:len(caller) + 1], caller)
+            run = lambda *a, **kw: subprocess.run(argv[:at] + list(a), env=env, capture_output=True, text=True, **kw)
+            self.assertEqual(run("config", "--get", "core.hooksPath").stdout.strip(), os.devnull)
+            self.assertEqual(run("config", "--get", "hook.post-commit.enabled").stdout.strip(), "false")
+            run("commit", "-q", "--allow-empty", "-m", "x", check=True)
+            fill = run("credential", "fill", input="protocol=https\nhost=github.com\npath=o/r\n\n", check=True)
+            self.assertIn("password=TEST-TOKEN", fill.stdout)
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+            self.assertNotIn("TEST-TOKEN", " ".join(argv))
+
     def test_git_writes_parsing(self):
         found = list(prbot.git_writes("git add . && git commit -m x && git -C repo push origin main; git status"))
         self.assertEqual(found, [(["commit", "-m", "x"], None), (["-C", "repo", "push", "origin", "main"], "repo")])
