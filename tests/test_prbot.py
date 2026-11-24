@@ -692,6 +692,39 @@ class Guard(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNone(self.guard(command))
 
+    def test_pager_variables_allow_only_cat_or_empty(self):
+        """GH_PAGER, PAGER and GIT_PAGER run as commands when a pager starts, so only cat or no pager passes."""
+        for command in ("GH_PAGER=cat gh pr view 1", "GH_PAGER= gh pr view 1", "GH_PAGER='cat' gh pr view 1",
+                        "GIT_PAGER=cat git log", "PAGER=cat git log"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command))
+        self.assertIsNone(self.guard("PAGER=cat; git log"))
+        for command in ("GH_PAGER='sh -c x' gh pr view 1", "GH_PAGER=less gh pr view 1", "PAGER=less git log",
+                        "GIT_PAGER='cat; touch /tmp/x' git log", "GIT_PAGER+=cat git log", "GH_PAGER=$P gh pr view 1",
+                        "set -a; PAGER='gh pr comment 1 -b x'; git log", "PAGER=less; git log",
+                        "PAGER=$P; git log", "PAGER+=x; git log"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command))
+
+    def test_check_script_must_be_the_repos_own(self):
+        """Only scripts/check.sh at the top of the repo the command runs in counts as a test runner."""
+        os.mkdir(os.path.join(self.mine, "sub"))
+        for command in ("scripts/check.sh && git status", "./scripts/check.sh --check tests",
+                        "\"$PWD/scripts/check.sh\" && git status", "${PWD}/scripts/check.sh && git status",
+                        "cd sub && ../scripts/check.sh && git status",
+                        f"{self.mine}/scripts/check.sh && git status"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command))
+        for command in ("evilscripts/check.sh && git status", "/tmp/x/scripts/check.sh && git status",
+                        "cd sub && scripts/check.sh && git status", "\"$HOME/scripts/check.sh\" && git status",
+                        "sub/scripts/check.sh && git status", f"{self.theirs}/scripts/check.sh && git status",
+                        "PWD=/tmp; \"$PWD/scripts/check.sh\" && git status",
+                        "PWD=/tmp \"$PWD/scripts/check.sh\" && git status"):
+            with self.subTest(command=command):
+                self.assertIsNotNone(self.guard(command))
+        # outside any git repository there is no repo script to match
+        self.assertIsNotNone(self.guard("scripts/check.sh && git status", self.tmp.name))
+
     def test_commits_and_pushes_go_through_prbot_only_in_bot_repos(self):
         for command in ("git push origin main", "git commit -m x", "git add -A && git commit -m x",
                         "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"", "git merge x", "git pull", "git rebase main",
@@ -2579,6 +2612,91 @@ class BackupReviewWorkflow(unittest.TestCase):
         self.assertTrue(pinned.match("actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0"))
 
 
+class KeyStorage(unittest.TestCase):
+    """store_key and read_key: the PEM stays out of argv, key files are 0600 in a 0700 folder, and a fallback or
+    a readable key file is reported."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = prbot.CONFIG_DIR
+        self.addCleanup(setattr, prbot, "CONFIG_DIR", saved)
+        prbot.CONFIG_DIR = Path(self.tmp.name, "cfg")
+        # built from parts so scripts/check.sh's secret scan doesn't flag this file
+        marker = "RSA PRIVATE " + "KEY-----"
+        self.pem = f"-----BEGIN {marker}\nTESTONLY\n-----END {marker}\n"
+
+    def fake_security(self, find_rc):
+        """A fake security on PATH that logs argv and stdin and fails find-generic-password with find_rc."""
+        bindir = Path(self.tmp.name, "bin")
+        bindir.mkdir()
+        log = Path(self.tmp.name, "security.log")
+        script = bindir / "security"
+        script.write_text("#!/bin/sh\n"
+                          f"printf 'argv:%s\\n' \"$*\" >> '{log}'\n"
+                          f"if [ \"$1\" = find-generic-password ]; then exit {find_rc}; fi\n"
+                          f"while IFS= read -r line; do printf 'stdin:%s\\n' \"$line\" >> '{log}'; done\n")
+        script.chmod(0o755)
+        env = {"PATH": f"{bindir}:{os.environ['PATH']}"}
+        env.pop("PRBOT_KEY_STORE", None)
+        return log, env
+
+    def test_keychain_store_keeps_the_key_out_of_argv(self):
+        log, env = self.fake_security(0)
+        with mock.patch.dict(os.environ, env), mock.patch.dict(os.environ, {"PRBOT_KEY_STORE": "keychain"}):
+            prbot.store_key("claude", self.pem)
+        enc = base64.b64encode(self.pem.encode()).decode()
+        lines = log.read_text().splitlines()
+        argv = [l for l in lines if l.startswith("argv:")]
+        self.assertEqual(argv, ["argv:add-generic-password -U -s prbot -a claude -w"])
+        self.assertEqual([l for l in lines if l.startswith("stdin:")], [f"stdin:{enc}", f"stdin:{enc}"])
+
+    def test_file_store_makes_a_private_folder_and_fixes_an_old_file_mode(self):
+        prbot.CONFIG_DIR.mkdir(mode=0o755)
+        old = prbot.CONFIG_DIR / "claude.pem"
+        old.write_text("old")
+        old.chmod(0o644)
+        with mock.patch.dict(os.environ, {"PRBOT_KEY_STORE": "file"}):
+            prbot.store_key("claude", self.pem)
+        self.assertEqual(oct(old.stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(oct(prbot.CONFIG_DIR.stat().st_mode & 0o777), oct(0o700))
+        self.assertEqual(old.read_text(), self.pem)
+        fresh = Path(self.tmp.name, "new", "cfg")
+        prbot.CONFIG_DIR = fresh
+        with mock.patch.dict(os.environ, {"PRBOT_KEY_STORE": "file"}):
+            prbot.store_key("codex", self.pem)
+        self.assertEqual(oct(fresh.stat().st_mode & 0o777), oct(0o700))
+        self.assertEqual(oct((fresh / "codex.pem").stat().st_mode & 0o777), oct(0o600))
+
+    def test_read_key_warns_on_a_readable_file(self):
+        import io
+        from contextlib import redirect_stderr
+        prbot.CONFIG_DIR.mkdir(mode=0o700)
+        path = prbot.CONFIG_DIR / "claude.pem"
+        path.write_text(self.pem)
+        for mode, warned in ((0o600, False), (0o640, True), (0o604, True)):
+            path.chmod(mode)
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"PRBOT_KEY_STORE": "file"}), redirect_stderr(err):
+                self.assertEqual(prbot.read_key("claude"), self.pem)
+            with self.subTest(mode=oct(mode)):
+                self.assertEqual("chmod 600" in err.getvalue(), warned)
+                self.assertNotIn("TESTONLY", err.getvalue())
+
+    def test_read_key_warns_when_keychain_lookup_fails_and_a_file_is_used(self):
+        import io
+        from contextlib import redirect_stderr
+        log, env = self.fake_security(44)
+        prbot.CONFIG_DIR.mkdir(mode=0o700)
+        (prbot.CONFIG_DIR / "claude.pem").write_text(self.pem)
+        (prbot.CONFIG_DIR / "claude.pem").chmod(0o600)
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.dict(os.environ, {"PRBOT_KEY_STORE": "keychain"}), \
+                redirect_stderr(err):
+            self.assertEqual(prbot.read_key("claude"), self.pem)
+        self.assertIn("no Keychain item for 'claude'", err.getvalue())
+
+
 class Jwt(unittest.TestCase):
     def test_signature_verifies_with_public_key(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2594,6 +2712,19 @@ class Jwt(unittest.TestCase):
             r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pub, "-signature", Path(d, "sig"), Path(d, "msg")],
                                capture_output=True, text=True)
             self.assertIn("Verified OK", r.stdout)
+
+    def test_signing_writes_no_key_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            key = Path(d, "k.pem")
+            subprocess.run(["openssl", "genrsa", "-out", key, "2048"], check=True, capture_output=True)
+            pem = key.read_text()
+            spy = Path(d, "tmp")
+            spy.mkdir()
+            with mock.patch.object(prbot.tempfile, "mkstemp", side_effect=AssertionError("temp file")), \
+                    mock.patch.object(prbot.tempfile, "tempdir", str(spy)):
+                token = prbot.app_jwt("Iv23liTEST", pem, now=1_800_000_000)
+            self.assertEqual(len(token.split(".")), 3)
+            self.assertEqual(list(spy.iterdir()), [])
 
     def test_worker_spec_from_another_repo(self):
         # issue worker bots keep their specs and logos in their own repo and need contents write

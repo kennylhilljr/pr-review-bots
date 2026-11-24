@@ -1154,7 +1154,8 @@ GUARD_RUNNERS = {"arch", "find", "setsid", "watch", "script", "flock", "xcrun", 
                  "parallel", "chroot", "doas", "unbuffer", "expect", "osascript", "at", "batch", "launchctl", "su",
                  "runuser", "unshare", "nsenter", "sandbox-exec", "ionice", "taskset", "chrt", "prlimit",
                  "systemd-run", "open", "dtruss", "lldb", "gdb", "strace", "ltrace", "valgrind", "sem"}
-GUARD_RISKY_VARS = {"PATH", "IFS", "HOME", "XDG_CONFIG_HOME", "CDPATH"}
+# PWD and OLDPWD: the guard reads "$PWD/scripts/check.sh" as the directory it tracks
+GUARD_RISKY_VARS = {"PATH", "IFS", "HOME", "XDG_CONFIG_HOME", "CDPATH", "PWD", "OLDPWD"}
 # variables whose value bash runs or expands as code: refused in every command
 GUARD_CODE_VARS = {"PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
 # builtins that store text in a variable; text holding $( or a backtick there can run later through arithmetic
@@ -1165,6 +1166,9 @@ GUARD_ARITH_NAMES = {"test", "[", "unset", "let", "declare", "typeset", "local",
 GUARD_STORES = {"read", "mapfile", "readarray", "printf", "declare", "typeset", "local", "export", "readonly"}
 GUARD_SAFE_ENV = {"GH_PAGER", "PAGER", "GIT_PAGER", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "LC_ALL", "LANG",
                   "TERM", "GH_NO_UPDATE_NOTIFIER", "GH_PROMPT_DISABLED", "GH_REPO"}
+# a pager value is a command line gh or git runs, so only cat or an empty value (no pager) is safe
+GUARD_PAGER_ENV = {"GH_PAGER", "PAGER", "GIT_PAGER"}
+GUARD_SAFE_PAGERS = ("", "cat")
 # programs that neither start another program nor write a file, so they may sit next to gh, git and prbot
 GUARD_SAFE_PROGRAMS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "echo", "printf", "pwd",
                        "true", "false", "test", "[", "which", "type", "stat", "cmp", "cut", "tr", "basename",
@@ -1252,6 +1256,10 @@ class _Guard:
                 name = a.text.split("=", 1)[0].rstrip("+")
                 if name in GUARD_RISKY_VARS or name.startswith(("GH_", "GIT_", "LD_", "DYLD_", "BASH_")):
                     self.block(f"setting {name} is not on the safe list")
+                elif name in GUARD_PAGER_ENV and (a.dynamic or a.text.partition("=")[0].endswith("+")
+                                                  or a.text.partition("=")[2] not in GUARD_SAFE_PAGERS):
+                    # PAGER=x; git log: an exported (set -a) or already exported PAGER reaches git
+                    self.block(f"{name} runs as a command; only {name}=cat or {name}= is on the safe list")
             cmd.assigns = []
         if relevant:
             if cmd.complex:
@@ -1260,6 +1268,9 @@ class _Guard:
                 name = a.text.split("=", 1)[0].rstrip("+")
                 if name not in GUARD_SAFE_ENV or a.dynamic:
                     self.block(f"setting {name} before a command is not on the safe list")
+                elif name in GUARD_PAGER_ENV and (a.text.partition("=")[0].endswith("+")
+                                                  or a.text.partition("=")[2] not in GUARD_SAFE_PAGERS):
+                    self.block(f"{name} runs as a command; only {name}=cat or {name}= is on the safe list")
             for op, target in cmd.redirects:
                 if not self.safe_redirect(op, target):
                     self.block("output redirection to a file is not on the safe list (2>&1 and /dev/null are)")
@@ -1348,7 +1359,7 @@ class _Guard:
                 self.block("set with positional arguments is not on the safe list")
         elif name == "command":
             pass  # command -v / -V: a lookup, nothing runs
-        elif self.test_runner(prog.text, name, args):
+        elif self.test_runner(prog, name, args):
             pass
         else:
             self.block(f"`{name}` is not on the safe list")
@@ -1465,10 +1476,11 @@ class _Guard:
             # bash cd is logical: link/.. goes back to where it started, so fold .. before any lookup
             self.dir = os.path.normpath(os.path.join(self.dir or "/", os.path.expanduser(positional[0].text)))
 
-    @staticmethod
-    def test_runner(path, name, args):
+    def test_runner(self, prog, name, args):
         texts = [a.text for a in args]
-        if path.endswith("scripts/check.sh") or name in ("pytest",):
+        if name == "check.sh":
+            return self.repo_check_script(prog)
+        if name in ("pytest",):
             return True
         if name in ("npm", "pnpm", "yarn") and texts[:1] == ["test"]:
             return True
@@ -1480,6 +1492,25 @@ class _Guard:
                 i += 1
             return texts[i:i + 1] == ["-m"] and i + 1 < len(texts) and texts[i + 1] in GUARD_TEST_MODULES
         return False
+
+    def repo_check_script(self, prog):
+        """True when prog resolves to scripts/check.sh at the top of the git repository the command runs in, so
+        evilscripts/check.sh or an agent-written /tmp/x/scripts/check.sh does not count. "$PWD/..." is the one
+        run-time part allowed, read as the directory the guard is tracking."""
+        if self.dir is None:
+            return False
+        text = prog.text
+        if prog.dynamic:
+            m = re.fullmatch(r'"?\$(?:PWD|\{PWD\})(/[^"$`\\]*)"?', prog.raw)
+            if not m:
+                return False
+            text = self.dir + m.group(1)
+        path = os.path.join(self.dir, os.path.expanduser(text))
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, cwd=self.dir) \
+            if os.path.isdir(self.dir) else None
+        if top is None or top.returncode != 0 or not top.stdout.strip():
+            return False
+        return os.path.realpath(path) == os.path.realpath(os.path.join(top.stdout.strip(), "scripts", "check.sh"))
 
     def literal_args(self, args, what, allow_messages=False):
         """Argument texts, or None (and a block) when one is only known at run time. A double-quoted value of a
@@ -1764,25 +1795,41 @@ def _keychain():
 def store_key(bot, pem):
     if _keychain():
         enc = base64.b64encode(pem.encode()).decode()  # base64 so the multi-line PEM round-trips through -w
-        subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", bot, "-w", enc],
-                       check=True, capture_output=True)
+        # -w last makes security prompt for the value, so the key never sits in argv where ps can see it. A new
+        # session has no controlling terminal, so security reads the answer and its retype from stdin.
+        subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", bot, "-w"],
+                       input=f"{enc}\n{enc}\n", text=True, check=True, capture_output=True, start_new_session=True)
         return f"macOS Keychain (service {KEYCHAIN_SERVICE}, account {bot})"
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)  # save_config may have made it first with the default mode
     path = CONFIG_DIR / f"{bot}.pem"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)  # the open mode applies only when the file is new
         f.write(pem)
     return str(path)
 
 
+def warn_key_mode(path):
+    """Warn on stderr when a key file can be read by the group or by everyone."""
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        print(f"prbot: warning: {path} has mode {mode:o}; other users may read the key. Run: chmod 600 {path}",
+              file=sys.stderr)
+
+
 def read_key(bot):
+    path = CONFIG_DIR / f"{bot}.pem"
     if _keychain():
         r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", bot, "-w"],
                            capture_output=True, text=True)
         if r.returncode == 0:
             return base64.b64decode(r.stdout.strip()).decode()
-    path = CONFIG_DIR / f"{bot}.pem"
+        if path.exists():
+            print(f"prbot: warning: no Keychain item for '{bot}' (service {KEYCHAIN_SERVICE}); using {path}",
+                  file=sys.stderr)
     if path.exists():
+        warn_key_mode(path)
         return path.read_text()
     die(f"no private key for '{bot}'. Run: prbot import-key {bot} <file.pem>")
 
@@ -1823,14 +1870,19 @@ def app_jwt(issuer, pem, now=None):
     header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
     payload = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(issuer)}, separators=(",", ":")).encode())
     signing_input = f"{header}.{payload}".encode()
-    fd, keyfile = tempfile.mkstemp(prefix="prbot-", suffix=".pem")  # mkstemp creates it 0600
+    # openssl reads the key from a pipe, so the PEM never touches disk. A key fits in the 16 KiB pipe buffer, so
+    # it is written and closed before openssl starts; a bigger one would block the write, so it is refused.
+    data = pem.encode()
+    if len(data) > 16384:
+        die("the private key is larger than 16 KiB; GitHub App keys are about 1.7 KiB")
+    r, w = os.pipe()
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(pem)
-        sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", keyfile], input=signing_input,
-                             capture_output=True, check=True).stdout
+        with os.fdopen(w, "wb") as f:
+            f.write(data)
+        sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{r}"], input=signing_input,
+                             capture_output=True, check=True, pass_fds=(r,)).stdout
     finally:
-        os.unlink(keyfile)
+        os.close(r)
     return f"{header}.{payload}.{b64url(sig)}"
 
 

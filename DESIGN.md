@@ -188,11 +188,14 @@ through what it can read and knows is safe:
      `mkdir`, `set` options, `cd` and other programs that neither start a
      program nor write a file the guard has to protect, and the test runners `python3 -m unittest`, `pytest`,
      `scripts/check.sh`, `npm test`, and `make test` or `make check` with no
-     other arguments.
+     other arguments. `scripts/check.sh` counts only when it resolves to the
+     one at the top of the git repository the command runs in, so
+     `evilscripts/check.sh` or a `/tmp/x/scripts/check.sh` does not.
 
    On top of that, such a command may not hold `if`/`for`/`while` blocks,
    subshells or `{ }` groups, wrappers (`env`, `sudo`, `nohup`, `xargs`,
-   `time`), `VAR=value` prefixes other than pager and locale settings, or output
+   `time`), `VAR=value` prefixes other than pager and locale settings (a pager
+   variable may only be `cat` or empty, since gh and git run its value), or output
    redirection to a file (`2>&1`, `>&2` and `/dev/null` are fine). A
    double-quoted `$(...)` is allowed only as the value of a message option
    (`git commit -m "$(cat <<'EOF' ...)"`, `gh pr create --body "$(...)"`); a
@@ -562,6 +565,15 @@ On hosts without the `security` command the key falls back to
 `~/.config/prbot/<bot>.pem` with mode 600. To rotate a key, generate a new one
 in the App settings, run `prbot import-key <bot> new.pem`, then delete the old
 key on GitHub.
+
+The key never sits in argv or on disk outside its store. `store_key` runs
+`security add-generic-password ... -w` with `-w` last, so `security` prompts
+for the value, and starts it in a new session with no terminal, so it reads
+the value from stdin. `app_jwt` hands the PEM to `openssl dgst -sign` through
+a pipe (`/dev/fd/N`) instead of a temp file. The file fallback creates
+`~/.config/prbot/` with mode 700 and sets an existing key file back to 600.
+`read_key` warns on stderr when it falls back from Keychain to a file, and
+when the key file can be read by the group or by everyone.
 
 ## Logos
 
