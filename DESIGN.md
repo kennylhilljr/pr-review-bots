@@ -67,6 +67,19 @@ GitHub shows the comment as claude-pr-gh[bot]
 The token lives only in the environment of the one `gh` process. It is never
 written to disk or printed.
 
+`prbot git` follows the same steps for push, fetch and pull, with the least
+contents permission the command needs: write for push, read for fetch and pull.
+Git gets the token as `PRBOT_GIT_TOKEN`, read by a credential helper set only
+for github.com. Because a checkout can bring its own hooks (a `.husky` folder
+named by `core.hooksPath`, or a config-based `hook.*` entry), git runs with
+`core.hooksPath` pointed at an empty path, every `hook.<event>.enabled` set to
+false and `core.fsmonitor` off, so no repo code runs while it holds the token.
+prbot passes these settings, and the credential helper reset, as the last `-c`
+options before the git subcommand, so a caller's own `-c core.hooksPath=...`
+or extra credential helper can't undo them.
+The cost is that a repo's pre-push or post-merge checks do not run under
+`prbot git`; run them yourself.
+
 ## Enforcement
 
 Instructions in `CLAUDE.md` or `AGENTS.md` are easy for an agent to skip, so

@@ -67,7 +67,7 @@ Review bots check every PR against these rules, as well as Conventions and Safet
 **Tokens**
 - `cmd_gh` and `cmd_review` pass the installation token to `gh` only as `GH_TOKEN`, and `cmd_git` to `git` only as `PRBOT_GIT_TOKEN`, read by the credential helper in `git_env`. None of them puts it in argv, a git config file, a file on disk, a log line or an OpenClaw event.
 - All three remove `GITHUB_TOKEN` from that environment.
-- `installation_token` asks for one repository. `cmd_git` asks for a token only for push, fetch and pull, and only for `contents: write`.
+- `installation_token` asks for one repository. `cmd_git` asks for a token only for push, fetch and pull (`REMOTE_PERMISSIONS`): `contents: write` for push and `contents: read` for fetch and pull. With a token, `git_token_config` resets the credential helpers to prbot's and turns off hook files (`core.hooksPath`), config-based hooks (`hook.<event>.enabled` for every name in `GIT_HOOK_EVENTS`) and `core.fsmonitor`. `git_env` sets these through `GIT_CONFIG_*`, and `cmd_git` repeats them as the last `-c` options before the subcommand so a caller's own `-c` or `--config-env` can't undo them; a change to either adds a `GitPush` test.
 - `manifest` sets no active webhook and no events. Its permissions are `PERMISSIONS` unless the bot spec sets its own, plus `metadata: read`.
 
 **Watch and the event queue**
