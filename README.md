@@ -197,7 +197,7 @@ Log: `~/Library/Logs/prbot-watch.log`. State: `~/.config/prbot/watch-state.json`
 `prbot watch` only runs while the Mac is awake. [`integrations/github-actions/backup-review.yml`](integrations/github-actions/backup-review.yml) is a GitHub Actions workflow that fills the gap:
 
 - Every 30 minutes it looks for open, non-draft PRs whose newest commit is at least 2 hours old and has no review, either from prbot ("Reviewed commit") or from an earlier backup run ("Backup review of commit").
-- It reviews up to 3 of them, one at a time, with the Claude Code GitHub Action. It uses the same prompt prbot uses, with only Read, Grep and Glob.
+- It reviews up to 3 of them, one at a time, with the Claude Code GitHub Action. It uses the same prompt prbot uses, with only Read, Grep and Glob, and it may read only the PR's checkout and the diff. The posting step refuses to post a review that contains a private key, a GitHub token, an API key or a path into a home folder, and fails the job instead.
 - It posts each review as `claude[bot]` through the Claude GitHub App, not as `claude-pr-gh[bot]`. That keeps the App's private key in the Keychain, off GitHub.
 
 This is a fallback: Claude also reviews PRs Claude wrote here, which prbot never does.

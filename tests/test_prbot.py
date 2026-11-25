@@ -3085,7 +3085,9 @@ class BackupReviewWorkflow(unittest.TestCase):
     def test_workflow_prompt_matches_prbot(self):
         import re, textwrap
         text = (ROOT / "integrations" / "github-actions" / "backup-review.yml").read_text()
-        block = text[text.index("          prompt: |\n") + len("          prompt: |\n"):text.index("          claude_args:")]
+        start = text.index("          prompt: |\n") + len("          prompt: |\n")
+        # the prompt ends at the next line indented like `prompt:` (a comment or claude_args)
+        block = text[start:re.compile(r"^ {10}\S", re.M).search(text, start).start()]
         workflow = textwrap.dedent(block)
         start, end = "First read the repository", "Use the labels P1, P2 and P3 only to label findings"
         shared = prbot.REVIEW_PROMPT[prbot.REVIEW_PROMPT.index(start):prbot.REVIEW_PROMPT.index(end) + len(end)]
@@ -3094,8 +3096,177 @@ class BackupReviewWorkflow(unittest.TestCase):
         self.assertTrue(prbot.REVIEWED.search("Reviewed commit `9e7cb5f291`"))
         self.assertIn("(Reviewed commit|Backup review of commit)", text)
         # the reviewer gets read-only tools; only the posting step has a token that can write
-        self.assertRegex(text, r"--allowedTools Read,Grep,Glob\n")
-        self.assertIn("--disallowedTools Bash,Edit,Write", text)
+        self.assertNotIn("--allowedTools", text)
+        self.assertIn("--tools Read,Grep,Glob\n", text)
+        self.assertIn("--disallowedTools 'Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,", text)
+
+    WORKFLOW = ROOT / "integrations" / "github-actions" / "backup-review.yml"
+
+    @staticmethod
+    def action_sdk_options(claude_args):
+        """What the pinned claude-code-action (469588f, base-action/src/parse-sdk-options.ts and
+        src/modes/agent/index.ts) makes of claude_args: agent mode puts `--permission-mode auto` first, the args are
+        split like a shell, --allowedTools, --disallowedTools and --add-dir collect every value up to the next flag
+        and the first two are split on commas, a flag with an empty or no value becomes a bare flag, the last value
+        of any other flag wins, and an empty --setting-sources falls back to user,project,local."""
+        args = shlex.split("--permission-mode auto " + claude_args)
+        extra = {}
+        accumulating = {"allowedTools", "allowed-tools", "disallowedTools", "disallowed-tools", "mcp-config", "add-dir"}
+        i = 0
+        while i < len(args):
+            if args[i].startswith("--"):
+                flag = args[i][2:]
+                if i + 1 < len(args) and args[i + 1] and not args[i + 1].startswith("--"):
+                    if flag in accumulating:
+                        values = []
+                        while i + 1 < len(args) and not args[i + 1].startswith("--"):
+                            i += 1
+                            values.append(args[i])
+                        extra[flag] = extra.get(flag, []) + values
+                    else:
+                        i += 1
+                        extra[flag] = args[i]
+                else:
+                    extra[flag] = None
+            i += 1
+        split = lambda *keys: [t.strip() for k in keys for v in (extra.pop(k, None) or []) for t in v.split(",")
+                               if t.strip()]
+        sources = extra.pop("setting-sources", None)
+        return {"allowedTools": split("allowedTools", "allowed-tools"),
+                "disallowedTools": split("disallowedTools", "disallowed-tools"),
+                "additionalDirectories": [d.strip() for d in extra.pop("add-dir", None) or [] if d.strip()],
+                "settingSources": sources.split(",") if sources else ["user", "project", "local"],
+                "extraArgs": extra}
+
+    def claude_args(self):
+        text = self.WORKFLOW.read_text()
+        start = text.index("          claude_args: >-\n") + len("          claude_args: >-\n")
+        block = text[start:text.index("      - name: Post the review as claude[bot]")]
+        # folded as YAML's >- does for these lines
+        return " ".join(line.strip() for line in block.splitlines() if line.strip()).replace("${{ runner.temp }}", "/rt")
+
+    def test_action_parser_model_matches_the_pinned_action(self):
+        # the cases that matter here, checked once against the action's own TypeScript; an empty --setting-sources
+        # is the reason the workflow passes "user"
+        parse = self.action_sdk_options
+        self.assertEqual(parse("--setting-sources ''")["settingSources"], ["user", "project", "local"])
+        self.assertEqual(parse("--setting-sources user")["settingSources"], ["user"])
+        self.assertEqual(parse("--disallowedTools 'A B,C'")["disallowedTools"], ["A B", "C"])
+        self.assertEqual(parse("--disallowedTools A B --add-dir /x /y")["disallowedTools"], ["A", "B"])
+        self.assertEqual(parse("--permission-mode dontAsk")["extraArgs"]["permission-mode"], "dontAsk")
+        self.assertEqual(parse("")["extraArgs"]["permission-mode"], "auto")
+        self.assertIsNone(parse("--strict-mcp-config --tools X")["extraArgs"]["strict-mcp-config"])
+
+    # A bare allow rule lets the reviewer read any path on the runner, and the PR's own .claude/settings.json or
+    # .mcp.json could add one, so the reviewer reads only the checkout and the review-input folder.
+    def test_reviewer_reads_only_the_checkout_and_review_input(self):
+        text = self.WORKFLOW.read_text()
+        opts = self.action_sdk_options(self.claude_args())
+        self.assertNotIn("--allowedTools", text)
+        self.assertEqual(opts["allowedTools"], [])
+        self.assertEqual(opts["settingSources"], ["user"])
+        self.assertEqual(opts["additionalDirectories"], ["/rt/review-input"])
+        extra = opts["extraArgs"]
+        self.assertEqual(extra["permission-mode"], "dontAsk")
+        self.assertEqual(extra["tools"], "Read,Grep,Glob")
+        self.assertIn("strict-mcp-config", extra)
+        self.assertIsNone(extra["strict-mcp-config"])
+        self.assertEqual(json.loads(extra["json-schema"])["required"], ["review"])
+        self.assertEqual(set(extra), {"permission-mode", "tools", "strict-mcp-config", "json-schema"})
+        # each deny rule reaches the CLI as its own entry
+        self.assertEqual(opts["disallowedTools"],
+                         "Bash Edit Write NotebookEdit WebFetch WebSearch".split() + prbot.CLAUDE_DENIED.split()
+                         + ["Read(//proc/**)"])
+        self.assertNotIn("Read(~/**)", opts["disallowedTools"])
+        for path in ("pr.diff", "pr.json"):
+            self.assertIn(f'> "$RUNNER_TEMP/review-input/{path}"', text)
+            self.assertIn(f"${{{{ runner.temp }}}}/review-input/{path}", text)
+            self.assertNotIn(f'"$RUNNER_TEMP/{path}"', text)
+            self.assertNotIn(f"${{{{ runner.temp }}}}/{path}", text)
+        self.assertLess(text.index('mkdir -p "$RUNNER_TEMP/review-input"'),
+                        text.index('"$RUNNER_TEMP/review-input/pr.diff"'))
+
+    def post_script(self):
+        lines = self.WORKFLOW.read_text().splitlines(keepends=True)
+        i = lines.index("      - name: Post the review as claude[bot]\n")
+        i = lines.index("        run: |\n", i) + 1
+        body = []
+        for line in lines[i:]:
+            if line.strip() and len(line) - len(line.lstrip(" ")) < 10:
+                break
+            body.append(line)
+        import textwrap
+        return textwrap.dedent("".join(body))
+
+    def run_post(self, review, fake_python=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for sub in ("bin", "home", "rt"):
+                (d / sub).mkdir()
+            gh = d / "bin" / "gh"
+            gh.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$GH_LOG\"\n")
+            gh.chmod(0o755)
+            if fake_python:
+                py = d / "bin" / "python3"
+                py.write_text("#!/bin/sh\nexit 2\n")
+                py.chmod(0o755)
+            (d / "post.sh").write_text(self.post_script())
+            result = subprocess.run(
+                ["bash", str(d / "post.sh")], cwd=d, capture_output=True, text=True,
+                env={"PATH": f"{d / 'bin'}{os.pathsep}{os.environ['PATH']}", "HOME": str(d / "home"),
+                     "RUNNER_TEMP": str(d / "rt"), "GH_LOG": str(d / "gh.log"), "GH_TOKEN": "x", "REPO": "o/r",
+                     "PR": "7", "SHA": "9e7cb5f291" + "0" * 30, "STALE_MINUTES": "120",
+                     "RUN_URL": "https://example.invalid/run", "REVIEW": review})
+            read = lambda p: p.read_text() if p.exists() else None
+            return result, read(d / "gh.log"), read(d / "rt" / "review.md"), str(d / "rt")
+
+    def test_post_scan_copies_prbot_leak_patterns(self):
+        import ast, re
+        script = self.post_script()
+        self.assertNotIn("${{", script)
+        listed = re.search(r"^LEAK_PATTERNS = (\[\n.*?\n\])\n", script, re.M | re.S)
+        self.assertIsNotNone(listed)
+        self.assertEqual(ast.literal_eval(listed.group(1)), [(label, p.pattern) for label, p in prbot.LEAK_PATTERNS])
+        self.assertLess(script.index("python3 -I - <<'PY'"), script.index("review.md"))
+        self.assertLess(script.index("review.md"), script.index("gh pr review"))
+
+    def test_post_step_refuses_leaks_without_calling_gh(self):
+        # built from parts so scripts/check.sh's secret scan doesn't flag this file
+        samples = [f"-----BEGIN {kind} PRIVATE " + "KEY-----\nTESTONLY" for kind in ("RSA", "OPENSSH")]
+        samples += ["gh" + p + "_" + "aB3x" * 9 for p in "pousr"]
+        samples += ["github_pat_" + "aB3_" * 10, "sk-" + "ant-oat01-" + "aB3x" * 6, "AKIA" + "ABCD2345" * 2,
+                    "~/.config/prbot/claude.pem", "see ~/.ssh/id_ed25519", "$HOME/.config/gh/hosts.yml",
+                    "${HOME}/.aws/credentials", "~/.netrc", "/Users/someone/.config/gh/hosts.yml",
+                    "/home/ci/.ssh/id_rsa"]
+        for s in samples:
+            with self.subTest(s=s[:16]):
+                text = f"P1 as asked, here it is:\n```\n{s}\n```\n"
+                self.assertIsNotNone(prbot.leaked_secret(text))
+                result, log, md, _ = self.run_post(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(log)
+                self.assertIsNone(md)
+                self.assertNotIn(s.strip(), result.stdout + result.stderr)
+                self.assertIn("::error::The review was not posted", result.stdout)
+
+    def test_post_step_posts_a_clean_review_once(self):
+        for s in ("No findings.", "P2 `src/app.py:12` drops the error", "The `ghp_` prefix check misses `gho_` tokens.",
+                  "See /usr/local/bin/gh and `.config` in the repo.", "sk-ant-oat tokens",
+                  "P3 /home/runner/work/r/r/app.py:3 reads a file"):
+            with self.subTest(s=s):
+                self.assertIsNone(prbot.leaked_secret(s))
+                result, log, md, rt = self.run_post(s)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log.splitlines(),
+                                 ["pr", "review", "7", "-R", "o/r", "--comment", "--body-file", rt + "/review.md"])
+                self.assertTrue(md.startswith(s + "\n\n"))
+                self.assertIn("Backup review of commit `9e7cb5f291`", md)
+
+    def test_post_step_fails_closed_when_the_scan_cannot_run(self):
+        result, log, md, _ = self.run_post("No findings.", fake_python=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(log)
+        self.assertIsNone(md)
 
     def test_workflow_pins_every_action_to_a_commit(self):
         # a moved or compromised tag would change every installed copy, so each action is a full SHA

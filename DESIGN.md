@@ -513,6 +513,21 @@ it, so the model never holds a token that can write. The workflow file lives in
 this repo and is copied into each repo by `install-backup-review.sh`, which
 Kenny runs. The worker bots can't write `.github/workflows/`.
 
+The reviewer has no allow rule for its read tools and runs in `dontAsk` mode,
+so it may read the checkout and the `review-input` folder that holds the diff,
+and nothing else. The PR controls the checkout, so the workflow passes
+`--setting-sources user` and `--strict-mcp-config`: the PR's own
+`.claude/settings.json` can't add an allow rule and its `.mcp.json` can't add a
+server. It passes `user` rather than an empty value because the action replaces
+an empty `--setting-sources` with its default, which loads the project settings
+too. Deny rules for `/proc` and the home folders prbot denies stay as a
+backstop. It doesn't deny all of `~`, because the runner's checkout and temp
+folder sit under `/home/runner`. A test runs the `claude_args` through a copy
+of the pinned action's parser and checks what reaches Claude Code. Before
+posting, the post step checks the review against a copy of prbot's
+`LEAK_PATTERNS` and fails the job without posting on a match, or when the check
+can't run. A test keeps the copy equal to prbot's list.
+
 Every action in it is pinned to a full commit SHA, not a tag. The review job
 holds pull-request and issue write permissions in six repos, so a moved or
 compromised tag would reach all of them at the next run. A test rejects any
