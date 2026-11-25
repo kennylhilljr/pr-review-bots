@@ -889,6 +889,36 @@ class Guard(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNone(self.guard(command, self.theirs))
 
+    def test_cd_option_terminator_keeps_directory_unknown(self):
+        """issue #41: cd -- -repo was tracked as ~, so a write in a bot-owned ./-repo passed the owner check."""
+        start = tempfile.mkdtemp(dir=self.tmp.name)
+        dash = os.path.join(start, "-repo")
+        subprocess.run(["git", "init", "-q", dash], check=True)
+        subprocess.run(["git", "-C", dash, "remote", "add", "origin", "https://github.com/kennylhilljr/demo.git"],
+                       check=True)
+        root = tempfile.mkdtemp(dir=self.tmp.name)
+        os.mkdir(os.path.join(root, "-repo"))
+        os.environ["HOME"] = self.theirs  # the old code tracked ~ here, which would allow the write
+        writes = ["cd -- -repo && git push", "cd -- -repo && git commit -m x", "cd -- '-repo' && git push",
+                  'cd -- "-repo" && git commit -m x', "cd -L -- -repo && git push", "cd -- -repo; git push",
+                  "cd -- sub && git push", f"cd -- {self.theirs} && git push", "cd -- && git push",
+                  "pushd -- -repo && git push"]
+        for cdpath in (None, "", root):
+            if cdpath is None:
+                os.environ.pop("CDPATH", None)
+            else:
+                os.environ["CDPATH"] = cdpath
+            for command in writes:
+                with self.subTest(command=command, cdpath=cdpath):
+                    reasons = self.guard(command, start)
+                    self.assertIsNotNone(reasons)
+                    self.assertIn("cannot tell which repository", " ".join(reasons["reasons"]))
+            with self.subTest("reads stay allowed", cdpath=cdpath):
+                self.assertIsNone(self.guard("cd -- -repo && git status", start))
+        os.environ.pop("CDPATH", None)
+        self.assertIsNone(self.guard(f"cd {self.theirs} && git commit -m x", self.mine))
+        self.assertIsNotNone(self.guard(f"cd {self.mine} && git commit -m x", self.theirs))
+
     def test_common_agent_commands_stay_allowed(self):
         for command in ("SHA=$(git rev-parse HEAD); echo $SHA", "git log | sort | uniq -c", "mkdir -p x && git add x",
                         "set -euo pipefail; git status", "gh pr checkout 1", "\"$PWD/scripts/check.sh\" && git status",
@@ -4171,6 +4201,15 @@ class GuardDocs(unittest.TestCase):
         text = (ROOT / name).read_text()
         a = text.index(start)
         return self.norm(text[a:text.index(end, a + len(start))])
+
+    def test_cd_option_terminator_is_documented(self):
+        """issue #41: both docs say cd -- leaves the directory unknown."""
+        readme = self.between("README.md", "The hook denies", "\n\n")
+        enforcement = self.between("DESIGN.md", "## Enforcement", "\n## ")
+        for name, text in (("README hook paragraph", readme), ("DESIGN Enforcement", enforcement)):
+            with self.subTest(section=name):
+                self.assertIn("cd -- -repo", text)
+                self.assertRegex(text, r"cd -- -repo\)? (also )?leaves the directory unknown")
 
     def test_feedback_scope(self):
         readme = self.between("README.md", "The hook denies", "\n\n")
