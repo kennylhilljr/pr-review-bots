@@ -2994,31 +2994,117 @@ GIT_HOOK_EVENTS = ("applypatch-msg", "pre-applypatch", "post-applypatch", "pre-c
 
 
 def git_token_config():
-    """(key, value) settings for git holding a bot token. They hold no secret: the helper reads PRBOT_GIT_TOKEN."""
+    """(key, value) settings for git holding a bot token. They hold no secret: the helper reads PRBOT_GIT_TOKEN.
+    Every setting names a command git could run from config, and makes it run nothing or a no-op, so no
+    command but prbot's credential helper sees the token (issues #30 and #35)."""
     helper = '!f() { echo username=x-access-token; echo "password=$PRBOT_GIT_TOKEN"; }; f'
     pairs = [("credential.helper", ""), ("credential.https://github.com.helper", ""),
              ("credential.https://github.com.helper", helper),
              # hooksPath stops hook files; hook.<event>.enabled stops config-based hooks (git 2.54+)
-             ("core.hooksPath", os.devnull), ("core.fsmonitor", "false")]
+             ("core.hooksPath", os.devnull), ("core.fsmonitor", "false"),
+             # transport: https only, so no ext::, ssh, file or remote-helper command runs. GIT_ALLOW_PROTOCOL
+             # in git_env enforces this over any protocol.<name>.allow; the standard GitHub ssh forms become https
+             ("protocol.allow", "never"), ("protocol.https.allow", "always"), ("core.sshCommand", "false"),
+             ("url.https://github.com/.insteadOf", "git@github.com:"),
+             ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
+             # other programs git can run from config: pager, editors, askpass, signing, alternate refs
+             ("core.pager", "cat"), ("core.editor", "false"), ("sequence.editor", "false"), ("core.askPass", "false"),
+             ("gpg.program", "false"), ("gpg.openpgp.program", "false"), ("gpg.x509.program", "false"),
+             ("gpg.ssh.program", "false"), ("gpg.ssh.defaultKeyCommand", "false"),
+             ("core.alternateRefsCommand", "true"),
+             # no git process in a submodule, and no background maintenance, holding the token
+             ("submodule.recurse", "false"), ("fetch.recurseSubmodules", "false"), ("push.recurseSubmodules", "no"),
+             ("maintenance.auto", "false"), ("gc.auto", "0")]
     return pairs + [(f"hook.{event}.enabled", "false") for event in GIT_HOOK_EVENTS]
 
 
-def git_env(token=None, identity=None):
+# environment variables that name a command git would run, or where git finds its own helpers such as
+# git-remote-https; a token run drops them (git_env sets safe ones)
+GIT_COMMAND_ENV = ("GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "SSH_ASKPASS", "GIT_EXTERNAL_DIFF",
+                   "GIT_EXEC_PATH")
+
+
+def git_token_path():
+    """PATH for a token run: git's own folder and the system ones. A program config can only name (a
+    git-merge-<strategy> from pull.twohead or -s, a false or cat shadowed in the caller's PATH) is then
+    found only among the system's and git's own."""
+    git = shutil.which("git")
+    dirs = ([os.path.dirname(os.path.realpath(git))] if git else []) + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    return os.pathsep.join(dict.fromkeys(dirs))
+
+
+def git_env(token=None, identity=None, extra=()):
     """Environment for git as the bot. identity sets author and committer. token, when given, is the only
     credential git uses for github.com; the helper reads it from the environment, so it never reaches disk.
-    With a token, git also runs no hooks and no fsmonitor command, so code in the checkout (a husky hooks
-    folder, a config-based hook) never runs with the token in its environment."""
+    With a token, git also runs no hooks, no fsmonitor, pager, editor, askpass, signing or alternate-refs
+    command, talks only https, and stays out of submodules (git_token_config, plus extra (key, value)
+    pairs such as pull_config_overrides), so code in the checkout never runs with the token."""
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     env.pop("GITHUB_TOKEN", None)
+    env.pop("PRBOT_GIT_TOKEN", None)
     if identity:
         env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = identity[0]
         env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = identity[1]
     if token:
-        pairs = git_token_config()
+        for var in GIT_COMMAND_ENV:
+            env.pop(var, None)
+        for var in [v for v in env if v.startswith("GIT_TRACE")]:
+            env.pop(var)  # trace2 can print chosen variables, PRBOT_GIT_TOKEN too (GIT_TRACE2_ENV_VARS)
+        env["PATH"] = git_token_path()
+        # GIT_ALLOW_PROTOCOL overrides every protocol.* setting, so no config can allow ext:: or ssh again.
+        # GIT_MERGE_AUTOEDIT=no lets a pull's merge commit take git's message instead of the (failing) editor.
+        env.update(GIT_ALLOW_PROTOCOL="https", GIT_PAGER="cat", PAGER="cat", GIT_EDITOR="false",
+                   GIT_SEQUENCE_EDITOR="false", GIT_ASKPASS="false", GIT_MERGE_AUTOEDIT="no", GIT_TRACE_REDACT="1",
+                   # these beat the trace2.* targets in a global config
+                   GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
+        pairs = git_token_config() + list(extra)
         env.update(PRBOT_GIT_TOKEN=token, GIT_CONFIG_COUNT=str(len(pairs)))
         for i, (k, v) in enumerate(pairs):
             env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, v
     return env
+
+
+def pull_config_overrides(git_options):
+    """(key, value) settings that stop every clean, smudge or process filter and custom merge driver in git's
+    config from running during a pull: filter commands empty and required, merge drivers failing. A checkout
+    that needs such a filter (Git LFS) then fails, and a file that needs such a driver is left as a conflict,
+    rather than running it with the token. git_options are the caller's own (-C, -c,
+    --config-env, --git-dir), so this reads the same config the pull will; dies if it can't (issue #35)."""
+    r = subprocess.run(["git"] + git_options + ["--no-pager", "config", "--null", "--list"], env=git_env(),
+                       capture_output=True)
+    if r.returncode != 0:
+        die("cannot read git's config, so cannot tell which filters or merge drivers a pull would run; "
+            "nothing was run")
+    filters, drivers = set(), set()
+    for entry in r.stdout.split(b"\0"):
+        key = os.fsdecode(entry.partition(b"\n")[0])
+        section, _, rest = key.partition(".")
+        name, _, var = rest.rpartition(".")
+        if section == "filter" and var in ("clean", "smudge", "process"):
+            filters.add(name)
+        elif section == "merge" and var == "driver":
+            drivers.add(name)
+    for name in filters | drivers:
+        if not name or "=" in name or "\n" in name:
+            die("a filter or merge driver name in git's config can't be overridden with -c; nothing was run")
+    pairs = [(f"filter.{n}.{var}", value) for n in sorted(filters)
+             for var, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "true"))]
+    # a failing driver leaves the file as a conflict, so the pull stops instead of merging it some other way
+    return pairs + [(f"merge.{n}.driver", "false") for n in sorted(drivers)]
+
+
+def refuse_recursive(sub, args):
+    """Die on an option that sends a token-holding git into submodules (--recurse-submodules or any
+    abbreviation or variant of it, other than turning it off): their config and hooks were not checked."""
+    full = "--recurse-submodules"
+    for a in args:
+        if a == "--":
+            break
+        name, _, value = a.partition("=")
+        recursive = len(name) >= len("--rec") and (full.startswith(name) or name.startswith(full))
+        if recursive and value.lower() not in ("no", "false", "off", "0"):
+            die(f"{sub} {a}: prbot git does not recurse into submodules while git holds a token; "
+                "run it in each submodule instead")
 
 
 # the contents permission each remote subcommand's token gets: only push writes
@@ -3045,19 +3131,31 @@ def cmd_git(bot, args, repo=None):
     at, sub = git_subcommand(args)
     if sub not in REMOTE_SUBCOMMANDS:
         os.execvpe("git", ["git"] + args, git_env(identity=bot_identity(bot)))
+    refuse_recursive(sub, args[at + 1:])
+    # --config-env copies a variable into git's config, where git can send it (http.userAgent, extraHeader)
+    config_env = [b for a, b in zip([""] + args[:at], args[:at]) if a == "--config-env"]
+    config_env += [a.partition("=")[2] for a in args[:at] if a.startswith("--config-env=")]
+    if any(c.rpartition("=")[2] == "PRBOT_GIT_TOKEN" for c in config_env):
+        die("--config-env: PRBOT_GIT_TOKEN is the token itself; it can't be copied into git's config")
+    if any(a.startswith("--exec-path=") for a in args[:at]):
+        die("--exec-path=: prbot git does not let git find its helpers in another folder while it holds a token")
+    # before the token: a pull's filters and merge drivers come from config, read with the caller's options
+    extra = pull_config_overrides(args[:at]) if sub == "pull" else []
     if not repo:
         remote = next((a for a in args[at + 1:] if not a.startswith("-")), "origin")
         # args[:at] keeps git's own options such as -C <dir>, so the lookup runs where the push would
-        r = subprocess.run(["git"] + args[:at] + ["remote", "get-url", remote], capture_output=True, text=True)
+        r = subprocess.run(["git"] + args[:at] + ["remote", "get-url", remote], capture_output=True, text=True,
+                           env=git_env())
         m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(\.git)?\s*$", r.stdout) if r.returncode == 0 else None
         repo = f"{m.group(1)}/{m.group(2)}" if m else None
     if not repo:
         die("cannot tell which GitHub repository this pushes to; pass -R owner/repo")
     token = installation_token(bot, repo, permissions={"contents": REMOTE_PERMISSIONS[sub]})
-    env = git_env(token, bot_identity(bot))
+    env = git_env(token, bot_identity(bot), extra)
     # the same settings again as the last -c options: a later -c or --config-env wins over GIT_CONFIG_*, so a
-    # caller's own -c core.hooksPath=.husky or extra credential helper can't undo them
-    hardening = [w for k, v in git_token_config() for w in ("-c", f"{k}={v}")]
+    # caller's own -c core.hooksPath=.husky or extra credential helper can't undo them. --no-pager beats any
+    # pager.<cmd> or core.pager setting.
+    hardening = ["--no-pager"] + [w for k, v in git_token_config() + extra for w in ("-c", f"{k}={v}")]
     os.execvpe("git", ["git"] + args[:at] + hardening + args[at:], env)
 
 

@@ -1,5 +1,5 @@
 """Tests for prbot, the Claude Code guard hook and the Codex gh shim. Run: python3 -B -m unittest discover -s tests -t . -v"""
-import base64, importlib.util, json, os, shlex, shutil, subprocess, sys, tempfile, time, unittest
+import base64, importlib.util, io, json, os, shlex, shutil, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -930,7 +930,25 @@ class Guard(unittest.TestCase):
                     prbot.shell_commands(bad)
 
 
-class GitPush(unittest.TestCase):
+class IsolatedGit:
+    """Git sees an empty global config and no system config, so the developer's ~/.gitconfig (a global
+    filter.lfs from `git lfs install`, a credential helper) can't change what these tests see."""
+    def setUp(self):
+        self._git_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._git_tmp.cleanup)
+        self.global_config = Path(self._git_tmp.name, "gitconfig")
+        self.global_config.write_text("")
+        env = {k: v for k, v in os.environ.items()
+               if not (k.startswith("GIT_CONFIG") or k in (
+                   "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "SSH_ASKPASS", "GIT_EXTERNAL_DIFF", "PRBOT_GIT_TOKEN", "GIT_ALLOW_PROTOCOL", "GIT_PAGER", "PAGER", "GIT_EDITOR", "EDITOR", "VISUAL",
+                   "GIT_SEQUENCE_EDITOR", "GIT_ASKPASS", "GIT_DIR", "GIT_WORK_TREE"))}
+        env.update(GIT_CONFIG_GLOBAL=str(self.global_config), GIT_CONFIG_NOSYSTEM="1")
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class GitPush(IsolatedGit, unittest.TestCase):
     def test_git_env_uses_only_the_bot_token(self):
         # git sees exactly one github.com helper: ours, which reads the token from the environment
         env = prbot.git_env(token="TEST-TOKEN")
@@ -962,10 +980,12 @@ class GitPush(unittest.TestCase):
 
     def test_only_push_gets_a_contents_write_token(self):
         # regression for issue #30: fetch and pull asked for contents write, so a read handed hooks a push token
-        for args, want in (("fetch origin", "read"), ("pull --ff-only", "read"), ("-C repo fetch", "read"),
-                           ("push origin main", "write"), ("-C repo push", "write")):
+        repo = Path(self._git_tmp.name, "repo")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        for args, want in (("fetch origin", "read"), ("pull --ff-only", "read"), ("-C REPO fetch", "read"),
+                           ("-C REPO pull", "read"), ("push origin main", "write"), ("-C REPO push", "write")):
             with self.subTest(args=args):
-                asked, env, _ = self._cmd_git_permissions(args.split())
+                asked, env, _ = self._cmd_git_permissions([str(repo) if a == "REPO" else a for a in args.split()])
                 self.assertEqual(asked, [{"contents": want}])
                 self.assertEqual(env["PRBOT_GIT_TOKEN"], "TEST-TOKEN")
         asked, env, _ = self._cmd_git_permissions(["commit", "-m", "x"])
@@ -1098,6 +1118,491 @@ class GitPush(unittest.TestCase):
             self.assertTrue(out.startswith(f"claude-pr-gh[bot] <{email}>"), out)
         self.assertEqual(prbot.agent_of(email=email), "claude")
         self.assertEqual(prbot.agent_of(email="349558466+codex-pr-gh[bot]@users.noreply.github.com"), "codex")
+
+
+class GitTokenIsolation(IsolatedGit, unittest.TestCase):
+    """Issue #35: config can make git run a command (an ext:: transport, core.sshCommand, a filter, a merge
+    driver, a pager, an editor, askpass, a signing program) that inherits PRBOT_GIT_TOKEN. Each test runs the
+    command once the way main did, to prove the fixture really reaches the token, then with the argv and
+    environment cmd_git builds, and checks the command never ran."""
+
+    TOKEN = "TEST-TOKEN"
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(self._git_tmp.name)
+        self.marker = self.tmp / "leaked"
+        self.repo = self.tmp / "r"
+        self.git(["init", "-q", "-b", "main", str(self.repo)], cwd=self.tmp)
+        self.git(["config", "user.name", "t"])
+        self.git(["config", "user.email", "t@example.invalid"])
+        self.git(["remote", "add", "origin", "https://github.com/o/r.git"])
+        self.evil = self.script("evil", "exit 1")
+
+    def script(self, name, tail):
+        # a program that writes the token it can see to the marker file, then runs tail
+        path = self.tmp / name
+        path.write_text(f'#!/bin/sh\nprintf "%s\\n" "$PRBOT_GIT_TOKEN" >> "{self.marker}"\n{tail}\n')
+        path.chmod(0o755)
+        return path
+
+    def git(self, args, cwd=None, env=None, check=True, **kw):
+        return subprocess.run(["git"] + args, cwd=cwd or self.repo, env=env, capture_output=True, text=True,
+                              check=check, **kw)
+
+    def commit(self, name, text, message):
+        (self.repo / name).write_text(text)
+        self.git(["add", "--", name])
+        self.git(["commit", "-q", "-m", message])
+
+    def built(self, args, repo="o/r", extra_env=None):
+        """(argv, env) that cmd_git would exec for args, and the permissions it asked for."""
+        asked, ran = [], []
+
+        class Exec(Exception):
+            pass
+
+        def fake_exec(prog, argv, env):
+            ran.append((argv, env))
+            raise Exec
+        with mock.patch.dict(os.environ, extra_env or {}), \
+                mock.patch.object(prbot, "installation_token",
+                                  lambda bot, r, permissions=None: asked.append((r, permissions)) or self.TOKEN), \
+                mock.patch.object(prbot, "bot_identity", lambda bot: ("b[bot]", "1+b[bot]@users.noreply.github.com")), \
+                mock.patch.object(prbot.os, "execvpe", fake_exec):
+            with self.assertRaises(Exec):
+                prbot.cmd_git("claude", ["-C", str(self.repo)] + args, repo=repo)
+        argv, env = ran[0]
+        self.assertNotIn(self.TOKEN, " ".join(argv))
+        return argv, env, asked
+
+    def refused(self, args, repo="o/r"):
+        asked = []
+        with mock.patch.object(prbot, "installation_token", lambda *a, **kw: asked.append(a) or self.TOKEN), \
+                mock.patch.object(prbot, "bot_identity", lambda bot: ("b[bot]", "1+b[bot]@users.noreply.github.com")), \
+                mock.patch.object(prbot.os, "execvpe", lambda *a: self.fail("git ran")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit):
+                prbot.cmd_git("claude", args, repo=repo)
+        self.assertEqual(asked, [])  # refused before any token was asked for
+        return err.getvalue()
+
+    def unprotected(self):
+        # the environment main gave git: the token, and nothing else changed
+        return dict(os.environ, PRBOT_GIT_TOKEN=self.TOKEN)
+
+    def run_with(self, argv, env, sub_args, **kw):
+        # run other git words with the options cmd_git put before the subcommand
+        at = next(i for i, w in enumerate(argv) if w in prbot.REMOTE_SUBCOMMANDS and argv[i - 1] != "-c")
+        return subprocess.run(argv[:at] + sub_args, cwd=self.repo, env=env, capture_output=True, text=True, **kw)
+
+    def assert_reached(self, result):
+        self.assertTrue(self.marker.exists(), f"fixture never ran: {result.stderr}")
+        self.assertEqual(set(self.marker.read_text().split()), {self.TOKEN})  # it saw the token
+        self.marker.unlink()
+
+    def assert_not_reached(self, result=None):
+        self.assertFalse(self.marker.exists(), self.marker.read_text() if self.marker.exists() else "")
+
+    def ext_url(self):
+        return f"ext::{self.evil} "  # the rest of the URL becomes its argument
+
+    # transport
+
+    def test_insteadof_ext_cannot_read_token(self):
+        self.git(["config", "protocol.ext.allow", "always"])
+        self.git(["config", f"url.{self.ext_url()}.insteadOf", "https://github.com/"])
+        self.assert_reached(self.git(["fetch", "origin"], env=self.unprotected(), check=False))
+        argv, env, _ = self.built(["fetch", "origin"])
+        r = subprocess.run(argv, env=env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not allowed", r.stderr)
+        self.assert_not_reached()
+
+    def test_callers_insteadof_ext_cannot_read_token(self):
+        caller = ["-c", "protocol.allow=always", "-c", "protocol.ext.allow=always",
+                  "-c", f"url.{self.ext_url()}.insteadOf=https://github.com/"]
+        self.assert_reached(self.git(caller + ["fetch", "origin"], env=self.unprotected(), check=False))
+        for sub in (["fetch", "origin"], ["pull", "origin", "main"]):
+            with self.subTest(sub=sub[0]):
+                argv, env, _ = self.built(caller + sub)
+                subprocess.run(argv, env=env, capture_output=True)
+                self.assert_not_reached()
+
+    def test_pushinsteadof_ext_cannot_read_token(self):
+        self.commit("a.txt", "a\n", "a")
+        self.git(["config", "protocol.ext.allow", "always"])
+        self.git(["config", f"url.{self.ext_url()}.pushInsteadOf", "https://github.com/"])
+        self.assert_reached(self.git(["push", "origin", "main"], env=self.unprotected(), check=False))
+        argv, env, _ = self.built(["push", "origin", "main"])
+        r = subprocess.run(argv, env=env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assert_not_reached()
+
+    def test_inherited_allow_protocol_is_overridden(self):
+        self.git(["config", f"url.{self.ext_url()}.insteadOf", "https://github.com/"])
+        extra = {"GIT_ALLOW_PROTOCOL": "ext:https"}
+        self.assert_reached(self.git(["fetch", "origin"], env=dict(self.unprotected(), **extra), check=False))
+        argv, env, _ = self.built(["fetch", "origin"], extra_env=extra)
+        self.assertEqual(env["GIT_ALLOW_PROTOCOL"], "https")
+        subprocess.run(argv, env=env, capture_output=True)
+        self.assert_not_reached()
+
+    def test_core_sshcommand_cannot_read_token(self):
+        self.git(["remote", "set-url", "origin", "ssh://git@example.invalid/o/r.git"])
+        self.git(["config", "core.sshCommand", str(self.evil)])
+        self.assert_reached(self.git(["fetch", "origin"], env=self.unprotected(), check=False))
+        for caller in ([], ["-c", f"core.sshCommand={self.evil}", "-c", "protocol.ssh.allow=always"]):
+            with self.subTest(caller=caller):
+                argv, env, _ = self.built(caller + ["fetch", "origin"])
+                r = subprocess.run(argv, env=env, capture_output=True, text=True)
+                self.assertNotEqual(r.returncode, 0)
+                self.assert_not_reached()
+
+    def test_git_ssh_command_env_cannot_read_token(self):
+        self.git(["remote", "set-url", "origin", "ssh://git@example.invalid/o/r.git"])
+        for var in ("GIT_SSH_COMMAND", "GIT_SSH"):
+            with self.subTest(var=var):
+                extra = {var: str(self.evil)}
+                self.assert_reached(self.git(["fetch", "origin"], env=dict(self.unprotected(), **extra), check=False))
+                argv, env, _ = self.built(["fetch", "origin"], extra_env=extra)
+                self.assertNotIn(var, env)
+                subprocess.run(argv, env=env, capture_output=True)
+                self.assert_not_reached()
+
+    def test_github_ssh_remotes_use_https(self):
+        # the standard GitHub ssh forms still push and fetch, over https with the token; stored config is unchanged
+        for url in ("git@github.com:o/r.git", "ssh://git@github.com/o/r.git", "https://github.com/o/r.git"):
+            with self.subTest(url=url):
+                self.git(["remote", "set-url", "origin", url])
+                self.git(["remote", "set-url", "--push", "origin", url])
+                for sub in ("fetch", "push"):
+                    argv, env, asked = self.built([sub, "origin"], repo=None)
+                    self.assertEqual(asked[0][0], "o/r")
+                    got = self.run_with(argv, env, ["ls-remote", "--get-url", "origin"], check=True).stdout.strip()
+                    self.assertEqual(got, "https://github.com/o/r.git")
+                    push = self.run_with(argv, env, ["remote", "get-url", "--push", "origin"], check=True)
+                    self.assertEqual(push.stdout.strip(), "https://github.com/o/r.git")
+                    fill = self.run_with(argv, env, ["credential", "fill"], check=True,
+                                         input="protocol=https\nhost=github.com\npath=o/r.git\n\n")
+                    self.assertIn(f"password={self.TOKEN}", fill.stdout)
+                self.assertEqual(self.git(["config", "--get", "remote.origin.url"]).stdout.strip(), url)
+
+    # pull: filters and merge drivers
+
+    def filtered_repo(self, attribute="filter=f"):
+        (self.repo / ".gitattributes").write_text(f"*.x {attribute}\n")
+        self.commit("a.x", "one\n", "a")
+
+    def checkout_runs_filters(self, argv, env):
+        # what a pull's checkout does to a filtered file: smudge it out of the index, clean it back in
+        (self.repo / "a.x").unlink()
+        r = self.run_with(argv, env, ["checkout", "--", "a.x"])
+        (self.repo / "a.x").write_text("two\n")
+        r2 = self.run_with(argv, env, ["add", "a.x"])
+        return r, r2
+
+    def test_pull_filters_cannot_read_token(self):
+        self.filtered_repo()
+        for var in ("smudge", "clean", "process"):
+            with self.subTest(var=var):
+                self.git(["config", f"filter.f.{var}", str(self.evil)])
+                self.checkout_runs_filters([*["git"], "pull"], self.unprotected())
+                self.assert_reached(subprocess.CompletedProcess([], 0, "", ""))
+                argv, env, _ = self.built(["pull", "origin", "main"])
+                r, r2 = self.checkout_runs_filters(argv, env)
+                self.assert_not_reached()
+                self.assertNotEqual(r.returncode if var != "clean" else r2.returncode, 0)  # fails, not skipped
+                self.git(["config", "--unset", f"filter.f.{var}"])
+                self.git(["checkout", "--", "."], check=False)
+
+    def test_pull_filters_from_every_config_source(self):
+        self.filtered_repo("filter=a.b")
+        included = self.tmp / "included"
+        included.write_text(f'[filter "a.b"]\n\tsmudge = {self.evil}\n')
+        sources = {
+            "repo": (lambda: self.git(["config", "filter.a.b.smudge", str(self.evil)]), []),
+            "include": (lambda: self.git(["config", "include.path", str(included)]), []),
+            "global": (lambda: self.global_config.write_text(f'[filter "a.b"]\n\tsmudge = {self.evil}\n'), []),
+            "-c": (lambda: None, ["-c", f"filter.a.b.smudge={self.evil}"]),
+            "--config-env=": (lambda: None, ["--config-env=filter.a.b.smudge=EVIL"]),
+            "--config-env": (lambda: None, ["--config-env", "filter.a.b.smudge=EVIL"]),
+        }
+        for source, (setup, caller) in sources.items():
+            with self.subTest(source=source):
+                setup()
+                argv, env, _ = self.built(caller + ["pull"], extra_env={"EVIL": str(self.evil)})
+                env = dict(env, EVIL=str(self.evil))
+                (self.repo / "a.x").unlink()
+                self.run_with(argv, env, ["checkout", "--", "a.x"])
+                self.assert_not_reached()
+                # the same options without prbot's do run the filter, so the source was really read
+                plain = [w for w in argv[argv.index("-C"):argv.index("--no-pager")]]
+                subprocess.run(["git"] + plain + ["checkout", "--", "a.x"], env=dict(self.unprotected(), EVIL=str(self.evil)),
+                               capture_output=True)
+                self.assert_reached(subprocess.CompletedProcess([], 0, "", ""))
+                self.git(["config", "--unset-all", "filter.a.b.smudge"], check=False)
+                self.git(["config", "--unset-all", "include.path"], check=False)
+                self.global_config.write_text("")
+
+    def test_global_lfs_filter_keeps_push_fetch_and_pull_working(self):
+        # `git lfs install` writes filter.lfs.* into ~/.gitconfig; push, fetch and pull still get their tokens,
+        # and a pull in a repo that uses no LFS path still checks out normally
+        self.global_config.write_text('[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n'
+                                      '\tprocess = git-lfs filter-process\n\trequired = true\n')
+        self.commit("a.txt", "a\n", "a")
+        for sub, want in (("push", "write"), ("fetch", "read"), ("pull", "read")):
+            with self.subTest(sub=sub):
+                argv, env, asked = self.built([sub, "origin", "main"])
+                self.assertEqual(asked, [("o/r", {"contents": want})])
+                self.assertEqual(env["PRBOT_GIT_TOKEN"], self.TOKEN)
+        (self.repo / "a.txt").unlink()
+        self.run_with(argv, env, ["checkout", "--", "a.txt"], check=True)
+        self.assertEqual((self.repo / "a.txt").read_text(), "a\n")
+
+    def test_pull_merge_driver_cannot_read_token(self):
+        self.filtered_repo("merge=m")
+        self.git(["config", "merge.m.driver", str(self.evil)])
+        self.git(["checkout", "-q", "-b", "side"])
+        self.commit("a.x", "one\nside\n", "side")
+        self.git(["checkout", "-q", "main"])
+        self.commit("b.txt", "b\n", "b")
+        self.commit("a.x", "main\none\n", "main change")
+        self.git(["branch", "base"])
+        self.assert_reached(self.git(["merge", "-q", "--no-edit", "side"], env=self.unprotected(), check=False))
+        self.git(["merge", "--abort"], check=False)
+        self.git(["reset", "-q", "--hard", "base"])
+        argv, env, _ = self.built(["pull", "origin", "main"])
+        r = self.run_with(argv, env, ["merge", "side"])
+        self.assertNotEqual(r.returncode, 0)  # the pull stops with a conflict; no other merge is put in its place
+        self.assertIn("a.x", self.git(["diff", "--name-only", "--diff-filter=U"]).stdout)
+        self.assertEqual((self.repo / "a.x").read_text(), "main\none\n")
+        self.assert_not_reached()
+
+    def test_override_names_with_dots_and_spaces(self):
+        self.git(["config", "filter.a.b c.smudge", str(self.evil)])
+        self.git(["config", "merge.d.e f.driver", str(self.evil)])
+        argv, env, _ = self.built(["pull"])
+        self.assertEqual(self.run_with(argv, env, ["config", "--get", "filter.a.b c.smudge"]).stdout, "\n")
+        self.assertEqual(self.run_with(argv, env, ["config", "--get", "filter.a.b c.required"]).stdout, "true\n")
+        self.assertEqual(self.run_with(argv, env, ["config", "--get", "merge.d.e f.driver"]).stdout, "false\n")
+
+    def test_pull_config_inspection_fails_closed(self):
+        err = self.refused(["-C", str(self.tmp / "missing"), "pull"])
+        self.assertIn("cannot read git's config", err)
+        (self.repo / ".git" / "config").write_text("[broken\n")
+        self.refused(["-C", str(self.repo), "pull"])
+        self.refused(["-C", str(self.repo), "--config-env=filter.f.smudge=UNSET_VAR_FOR_TEST", "pull"])
+
+    def test_inspection_never_sees_the_token(self):
+        self.git(["config", "filter.f.smudge", "secret-command-value"])
+        seen = []
+        real = subprocess.run
+        with mock.patch.object(prbot.subprocess, "run",
+                               lambda argv, **kw: seen.append(kw.get("env")) or real(argv, **kw)):
+            argv, env, _ = self.built(["pull"], extra_env={"PRBOT_GIT_TOKEN": "INHERITED"})
+        self.assertTrue(seen)
+        self.assertTrue(all("PRBOT_GIT_TOKEN" not in e for e in seen))
+        self.assertNotIn("secret-command-value", " ".join(argv))
+
+    # other programs git runs from config or the environment
+
+    def test_signing_programs_cannot_read_token(self):
+        cases = [{"gpg.program": str(self.evil)},
+                 {"gpg.format": "openpgp", "gpg.openpgp.program": str(self.evil)},
+                 {"gpg.format": "x509", "gpg.x509.program": str(self.evil)},
+                 {"gpg.format": "ssh", "gpg.ssh.program": str(self.evil), "user.signingKey": "key::ssh-ed25519 AAAA"},
+                 {"gpg.format": "ssh", "gpg.ssh.defaultKeyCommand": str(self.evil)}]
+        for case in cases:
+            with self.subTest(case=case):
+                caller = [w for k, v in dict(case, **{"commit.gpgSign": "true"}).items() for w in ("-c", f"{k}={v}")]
+                self.assert_reached(self.git(caller + ["commit", "--allow-empty", "-m", "x"], env=self.unprotected(),
+                                             check=False))
+                argv, env, _ = self.built(caller + ["pull"])
+                r = self.run_with(argv, env, ["commit", "--allow-empty", "-m", "x"])
+                self.assertNotEqual(r.returncode, 0)  # signing fails; it is never silently skipped
+                self.assert_not_reached()
+
+    def test_editors_cannot_read_token(self):
+        self.commit("a.txt", "a\n", "a")
+        self.commit("b.txt", "b\n", "b")
+        cases = [(["-c", f"core.editor={self.evil}"], {}, ["commit", "--amend"]),
+                 ([], {"GIT_EDITOR": str(self.evil)}, ["commit", "--amend"]),
+                 ([], {"EDITOR": str(self.evil)}, ["commit", "--amend"]),
+                 (["-c", f"sequence.editor={self.evil}"], {}, ["rebase", "-i", "HEAD~1"]),
+                 ([], {"GIT_SEQUENCE_EDITOR": str(self.evil)}, ["rebase", "-i", "HEAD~1"])]
+        for caller, extra, words in cases:
+            with self.subTest(caller=caller, extra=extra, words=words):
+                self.assert_reached(self.git(caller + words, env=dict(self.unprotected(), **extra), check=False))
+                self.git(["rebase", "--abort"], check=False)
+                argv, env, _ = self.built(caller + ["pull"], extra_env=extra)
+                self.run_with(argv, env, words)
+                self.git(["rebase", "--abort"], check=False)
+                self.assert_not_reached()
+
+    def test_ordinary_merge_needs_no_editor(self):
+        self.commit("a.txt", "a\n", "a")
+        self.git(["checkout", "-q", "-b", "side"])
+        self.commit("b.txt", "b\n", "b")
+        self.git(["checkout", "-q", "main"])
+        self.commit("c.txt", "c\n", "c")
+        argv, env, _ = self.built(["pull"])
+        r = self.run_with(argv, env, ["merge", "side"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.git(["log", "-1", "--format=%an %s"]).stdout.strip(), "b[bot] Merge branch 'side'")
+
+    def test_pagers_cannot_read_token(self):
+        import pty
+        self.commit("a.txt", "a\n", "a")
+        pager = self.script("pager", "cat >/dev/null")
+        cases = [(["-c", f"pager.fetch={pager}", "-c", f"pager.log={pager}"], {}),
+                 (["-c", f"core.pager={pager}"], {}), ([], {"GIT_PAGER": str(pager)}), ([], {"PAGER": str(pager)})]
+
+        def on_tty(argv, env):
+            main, child = pty.openpty()
+            try:
+                subprocess.run(argv, cwd=self.repo, env=env, stdin=child, stdout=child, stderr=child, timeout=20)
+            finally:
+                os.close(child)
+                os.close(main)
+        for caller, extra in cases:
+            with self.subTest(caller=caller, extra=extra):
+                on_tty(["git"] + caller + ["log"], dict(self.unprotected(), **extra))
+                self.assert_reached(subprocess.CompletedProcess([], 0, "", ""))
+                argv, env, _ = self.built(caller + ["fetch", "origin"], extra_env=extra)
+                self.assertIn("--no-pager", argv)
+                at = argv.index("fetch")
+                on_tty(argv[:at] + ["log"], env)
+                self.assert_not_reached()
+
+    def test_askpass_cannot_read_token(self):
+        # a host no helper answers makes git prompt, and git prompts through askpass even with no terminal
+        fill = "protocol=https\nhost=example.invalid\n\n"
+        cases = [(["-c", f"core.askPass={self.evil}"], {}), ([], {"GIT_ASKPASS": str(self.evil)}),
+                 ([], {"SSH_ASKPASS": str(self.evil)})]
+        for caller, extra in cases:
+            with self.subTest(caller=caller, extra=extra):
+                self.assert_reached(self.git(caller + ["credential", "fill"], input=fill, check=False,
+                                             env=dict(self.unprotected(), GIT_TERMINAL_PROMPT="0", **extra)))
+                argv, env, _ = self.built(caller + ["push", "origin"], extra_env=extra)
+                r = self.run_with(argv, env, ["credential", "fill"], input=fill)
+                self.assertNotEqual(r.returncode, 0)
+                self.assert_not_reached()
+
+    def test_hardening_settings_win_over_the_caller(self):
+        caller = ["-c", "core.alternateRefsCommand=evil", "-c", "submodule.recurse=true",
+                  "-c", "fetch.recurseSubmodules=yes", "-c", "push.recurseSubmodules=on-demand",
+                  "-c", "maintenance.auto=true", "-c", "gc.auto=1"]
+        argv, env, _ = self.built(caller + ["fetch", "origin"])
+        want = {"core.alternateRefsCommand": "true", "submodule.recurse": "false", "fetch.recurseSubmodules": "false",
+                "push.recurseSubmodules": "no", "maintenance.auto": "false", "gc.auto": "0",
+                "core.sshCommand": "false", "protocol.allow": "never", "protocol.https.allow": "always"}
+        for key, value in want.items():
+            with self.subTest(key=key):
+                self.assertEqual(self.run_with(argv, env, ["config", "--get", key]).stdout.strip(), value)
+        listed = self.run_with(argv, env, ["config", "--list"], check=True).stdout
+        self.assertNotIn(self.TOKEN, listed)  # the token is never in git's config
+        self.assertEqual(env["GIT_TRACE_REDACT"], "1")
+
+    def test_submodule_recursion_is_refused(self):
+        for args in (["fetch", "--recurse-submodules"], ["fetch", "--recurse-submodules=yes"],
+                     ["fetch", "--recurse-sub=on-demand"], ["fetch", "--recurse-submodules-default=yes"],
+                     ["pull", "--recurse-submodules"], ["pull", "--rec"], ["push", "--recurse-submodules=on-demand"],
+                     ["push", "--recurse-submodules=check"], ["push", "origin", "main", "--recurse-submodules"]):
+            with self.subTest(args=args):
+                self.assertIn("submodules", self.refused(["-C", str(self.repo)] + args))
+        for args in (["fetch", "--no-recurse-submodules"], ["pull", "--recurse-submodules=no"],
+                     ["push", "--receive-pack=git-receive-pack"], ["fetch", "--refetch"],
+                     ["push", "--recurse-submodules=no"], ["push", "origin", "--", "--recurse-submodules"]):
+            with self.subTest(args=args):
+                self.built(args)
+
+    def test_submodule_config_cannot_read_token(self):
+        # a populated submodule whose own config holds a credential helper, a hook and an ext:: rewrite; git
+        # commands prbot's settings reach in the submodule still run none of them
+        sub_src = self.tmp / "sub"
+        self.git(["init", "-q", "-b", "main", str(sub_src)], cwd=self.tmp)
+        self.git(["-C", str(sub_src), "commit", "-q", "--allow-empty", "-m", "s"], cwd=self.tmp)
+        self.git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_src), "sub"])
+        self.git(["commit", "-q", "-m", "add sub"])
+        sub = self.repo / "sub"
+        self.git(["-C", str(sub), "config", "credential.helper", f"!{self.evil}"])
+        hooks = Path(self.git(["-C", str(sub), "rev-parse", "--git-path", "hooks"]).stdout.strip())
+        if not hooks.is_absolute():
+            hooks = sub / hooks
+        hooks.mkdir(parents=True, exist_ok=True)
+        hook = self.script("post-commit", "exit 0")
+        shutil.copy(hook, hooks / "post-commit")
+        argv, env, _ = self.built(["pull"])
+        self.assertEqual(self.run_with(argv, env, ["config", "--get", "submodule.recurse"]).stdout.strip(), "false")
+        r = self.run_with(argv, env, ["-C", "sub", "credential", "fill"],
+                          input="protocol=https\nhost=github.com\npath=o/s\n\n")
+        self.assertIn(f"password={self.TOKEN}", r.stdout)
+        self.run_with(argv, env, ["-C", "sub", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        self.assert_not_reached()
+        # without prbot's settings the submodule's helper and hook do run
+        self.git(["-C", "sub", "commit", "-q", "--allow-empty", "-m", "y"], env=self.unprotected())
+        self.assertTrue(self.marker.exists())
+
+    def test_external_merge_strategy_cannot_read_token(self):
+        # pull -s <name>, pull.twohead or a branch's mergeOptions name a git-merge-<name> program found on PATH
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        shutil.copy(self.evil, bin_dir / "git-merge-evil")
+        (bin_dir / "false").symlink_to(self.evil)  # a caller's PATH can't shadow the inert programs either
+        extra = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        self.commit("a.txt", "a\n", "a")
+        self.git(["checkout", "-q", "-b", "side"])
+        self.commit("b.txt", "b\n", "b")
+        self.git(["checkout", "-q", "main"])
+        self.commit("c.txt", "c\n", "c")
+        # pull.twohead only hands its name to the merge pull runs, as -s does, so `merge -s evil` stands for it
+        for caller, words in (([], ["merge", "-s", "evil", "side"]),
+                              (["-c", "branch.main.mergeOptions=-s evil"], ["merge", "side"]),
+                              (["-c", "commit.gpgSign=true", "-c", "gpg.program=false"],
+                               ["commit", "--allow-empty", "-m", "x"])):
+            with self.subTest(caller=caller, words=words):
+                self.assert_reached(self.git(caller + words, env=dict(self.unprotected(), **extra), check=False))
+                self.git(["merge", "--abort"], check=False)
+                argv, env, _ = self.built(caller + ["pull"], extra_env=extra)
+                self.assertNotIn(str(bin_dir), env["PATH"].split(os.pathsep))
+                r = self.run_with(argv, env, words)
+                self.assertNotEqual(r.returncode, 0)
+                self.git(["merge", "--abort"], check=False)
+                self.assert_not_reached()
+
+    def test_config_env_cannot_copy_the_token(self):
+        # --config-env=http.userAgent=PRBOT_GIT_TOKEN would put the token in config and send it as the User-Agent
+        for sub in ("fetch", "push", "pull"):
+            for caller in (["--config-env=http.userAgent=PRBOT_GIT_TOKEN"],
+                           ["--config-env", "http.extraHeader=PRBOT_GIT_TOKEN"]):
+                with self.subTest(sub=sub, caller=caller):
+                    self.assertIn("PRBOT_GIT_TOKEN", self.refused(["-C", str(self.repo)] + caller + [sub]))
+        self.built(["--config-env=http.userAgent=OTHER", "fetch"], extra_env={"OTHER": "x"})
+
+    def test_trace_cannot_print_the_token(self):
+        extra = {"GIT_TRACE2_EVENT": str(self.marker), "GIT_TRACE2_ENV_VARS": "PRBOT_GIT_TOKEN",
+                 "GIT_TRACE_REDACT": "0", "GIT_TRACE_CURL": "1"}
+        self.git(["status"], env=dict(self.unprotected(), **extra))
+        self.assertIn(self.TOKEN, self.marker.read_text())
+        self.marker.unlink()
+        self.global_config.write_text(f"[trace2]\n\teventTarget = {self.marker}\n\tenvVars = PRBOT_GIT_TOKEN\n")
+        argv, env, _ = self.built(["fetch", "origin"], extra_env=extra)
+        self.assertEqual(env["GIT_TRACE_REDACT"], "1")
+        self.assertNotIn("GIT_TRACE_CURL", env)
+        self.run_with(argv, env, ["status"])
+        self.assertFalse(self.marker.exists() and self.TOKEN in self.marker.read_text())
+
+    def test_exec_path_is_refused_and_dropped(self):
+        self.assertIn("--exec-path", self.refused(["-C", str(self.repo), f"--exec-path={self.tmp}", "fetch"]))
+        argv, env, _ = self.built(["fetch", "origin"], extra_env={"GIT_EXEC_PATH": str(self.tmp)})
+        self.assertNotIn("GIT_EXEC_PATH", env)
+
+    def test_commands_without_a_token_drop_an_inherited_one(self):
+        env = prbot.git_env(identity=("b[bot]", "1+b[bot]@users.noreply.github.com"))
+        with mock.patch.dict(os.environ, {"PRBOT_GIT_TOKEN": "INHERITED"}):
+            env = prbot.git_env(identity=("b[bot]", "1+b[bot]@users.noreply.github.com"))
+        self.assertNotIn("PRBOT_GIT_TOKEN", env)
 
 
 class OpenClaw(unittest.TestCase):
