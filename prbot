@@ -3018,8 +3018,19 @@ def git_token_config():
     return pairs + [(f"hook.{event}.enabled", "false") for event in GIT_HOOK_EVENTS]
 
 
-# environment variables that name a command git would run; a token run drops them (git_env sets safe ones)
-GIT_COMMAND_ENV = ("GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "SSH_ASKPASS", "GIT_EXTERNAL_DIFF")
+# environment variables that name a command git would run, or where git finds its own helpers such as
+# git-remote-https; a token run drops them (git_env sets safe ones)
+GIT_COMMAND_ENV = ("GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "SSH_ASKPASS", "GIT_EXTERNAL_DIFF",
+                   "GIT_EXEC_PATH")
+
+
+def git_token_path():
+    """PATH for a token run: git's own folder and the system ones. A program config can only name (a
+    git-merge-<strategy> from pull.twohead or -s, a false or cat shadowed in the caller's PATH) is then
+    found only among the system's and git's own."""
+    git = shutil.which("git")
+    dirs = ([os.path.dirname(os.path.realpath(git))] if git else []) + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    return os.pathsep.join(dict.fromkeys(dirs))
 
 
 def git_env(token=None, identity=None, extra=()):
@@ -3037,10 +3048,15 @@ def git_env(token=None, identity=None, extra=()):
     if token:
         for var in GIT_COMMAND_ENV:
             env.pop(var, None)
+        for var in [v for v in env if v.startswith("GIT_TRACE")]:
+            env.pop(var)  # trace2 can print chosen variables, PRBOT_GIT_TOKEN too (GIT_TRACE2_ENV_VARS)
+        env["PATH"] = git_token_path()
         # GIT_ALLOW_PROTOCOL overrides every protocol.* setting, so no config can allow ext:: or ssh again.
         # GIT_MERGE_AUTOEDIT=no lets a pull's merge commit take git's message instead of the (failing) editor.
         env.update(GIT_ALLOW_PROTOCOL="https", GIT_PAGER="cat", PAGER="cat", GIT_EDITOR="false",
-                   GIT_SEQUENCE_EDITOR="false", GIT_ASKPASS="false", GIT_MERGE_AUTOEDIT="no", GIT_TRACE_REDACT="1")
+                   GIT_SEQUENCE_EDITOR="false", GIT_ASKPASS="false", GIT_MERGE_AUTOEDIT="no", GIT_TRACE_REDACT="1",
+                   # these beat the trace2.* targets in a global config
+                   GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
         pairs = git_token_config() + list(extra)
         env.update(PRBOT_GIT_TOKEN=token, GIT_CONFIG_COUNT=str(len(pairs)))
         for i, (k, v) in enumerate(pairs):
@@ -3050,9 +3066,9 @@ def git_env(token=None, identity=None, extra=()):
 
 def pull_config_overrides(git_options):
     """(key, value) settings that stop every clean, smudge or process filter and custom merge driver in git's
-    config from running during a pull: filter commands empty and required, merge drivers replaced by git's
-    own text merge. A checkout that needs such a filter (Git LFS) then fails rather than running it with
-    the token. git_options are the caller's own (-C, -c,
+    config from running during a pull: filter commands empty and required, merge drivers failing. A checkout
+    that needs such a filter (Git LFS) then fails, and a file that needs such a driver is left as a conflict,
+    rather than running it with the token. git_options are the caller's own (-C, -c,
     --config-env, --git-dir), so this reads the same config the pull will; dies if it can't (issue #35)."""
     r = subprocess.run(["git"] + git_options + ["--no-pager", "config", "--null", "--list"], env=git_env(),
                        capture_output=True)
@@ -3073,18 +3089,20 @@ def pull_config_overrides(git_options):
             die("a filter or merge driver name in git's config can't be overridden with -c; nothing was run")
     pairs = [(f"filter.{n}.{var}", value) for n in sorted(filters)
              for var, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "true"))]
-    # an empty driver makes git fail, not fall back, so each driver becomes git's own text merge
-    merge = "git --no-pager merge-file --marker-size=%L %A %O %B"
-    return pairs + [(f"merge.{n}.driver", merge) for n in sorted(drivers)]
+    # a failing driver leaves the file as a conflict, so the pull stops instead of merging it some other way
+    return pairs + [(f"merge.{n}.driver", "false") for n in sorted(drivers)]
 
 
 def refuse_recursive(sub, args):
     """Die on an option that sends a token-holding git into submodules (--recurse-submodules or any
     abbreviation or variant of it, other than turning it off): their config and hooks were not checked."""
+    full = "--recurse-submodules"
     for a in args:
         if a == "--":
             break
-        if a.startswith("--rec") and a.partition("=")[2].lower() not in ("no", "false", "off", "0"):
+        name, _, value = a.partition("=")
+        recursive = len(name) >= len("--rec") and (full.startswith(name) or name.startswith(full))
+        if recursive and value.lower() not in ("no", "false", "off", "0"):
             die(f"{sub} {a}: prbot git does not recurse into submodules while git holds a token; "
                 "run it in each submodule instead")
 
@@ -3114,6 +3132,13 @@ def cmd_git(bot, args, repo=None):
     if sub not in REMOTE_SUBCOMMANDS:
         os.execvpe("git", ["git"] + args, git_env(identity=bot_identity(bot)))
     refuse_recursive(sub, args[at + 1:])
+    # --config-env copies a variable into git's config, where git can send it (http.userAgent, extraHeader)
+    config_env = [b for a, b in zip([""] + args[:at], args[:at]) if a == "--config-env"]
+    config_env += [a.partition("=")[2] for a in args[:at] if a.startswith("--config-env=")]
+    if any(c.rpartition("=")[2] == "PRBOT_GIT_TOKEN" for c in config_env):
+        die("--config-env: PRBOT_GIT_TOKEN is the token itself; it can't be copied into git's config")
+    if any(a.startswith("--exec-path=") for a in args[:at]):
+        die("--exec-path=: prbot git does not let git find its helpers in another folder while it holds a token")
     # before the token: a pull's filters and merge drivers come from config, read with the caller's options
     extra = pull_config_overrides(args[:at]) if sub == "pull" else []
     if not repo:

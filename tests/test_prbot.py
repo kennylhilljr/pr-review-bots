@@ -1374,8 +1374,9 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
         self.git(["reset", "-q", "--hard", "base"])
         argv, env, _ = self.built(["pull", "origin", "main"])
         r = self.run_with(argv, env, ["merge", "side"])
-        self.assertEqual(r.returncode, 0, r.stderr)  # git's own text merge (merge-file), with git's own message
-        self.assertEqual((self.repo / "a.x").read_text(), "main\none\nside\n")
+        self.assertNotEqual(r.returncode, 0)  # the pull stops with a conflict; no other merge is put in its place
+        self.assertIn("a.x", self.git(["diff", "--name-only", "--diff-filter=U"]).stdout)
+        self.assertEqual((self.repo / "a.x").read_text(), "main\none\n")
         self.assert_not_reached()
 
     def test_override_names_with_dots_and_spaces(self):
@@ -1384,8 +1385,7 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
         argv, env, _ = self.built(["pull"])
         self.assertEqual(self.run_with(argv, env, ["config", "--get", "filter.a.b c.smudge"]).stdout, "\n")
         self.assertEqual(self.run_with(argv, env, ["config", "--get", "filter.a.b c.required"]).stdout, "true\n")
-        self.assertTrue(self.run_with(argv, env, ["config", "--get", "merge.d.e f.driver"]).stdout.startswith(
-            "git --no-pager merge-file"))
+        self.assertEqual(self.run_with(argv, env, ["config", "--get", "merge.d.e f.driver"]).stdout, "false\n")
 
     def test_pull_config_inspection_fails_closed(self):
         err = self.refused(["-C", str(self.tmp / "missing"), "pull"])
@@ -1512,6 +1512,7 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
             with self.subTest(args=args):
                 self.assertIn("submodules", self.refused(["-C", str(self.repo)] + args))
         for args in (["fetch", "--no-recurse-submodules"], ["pull", "--recurse-submodules=no"],
+                     ["push", "--receive-pack=git-receive-pack"], ["fetch", "--refetch"],
                      ["push", "--recurse-submodules=no"], ["push", "origin", "--", "--recurse-submodules"]):
             with self.subTest(args=args):
                 self.built(args)
@@ -1542,6 +1543,60 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
         # without prbot's settings the submodule's helper and hook do run
         self.git(["-C", "sub", "commit", "-q", "--allow-empty", "-m", "y"], env=self.unprotected())
         self.assertTrue(self.marker.exists())
+
+    def test_external_merge_strategy_cannot_read_token(self):
+        # pull -s <name>, pull.twohead or a branch's mergeOptions name a git-merge-<name> program found on PATH
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        shutil.copy(self.evil, bin_dir / "git-merge-evil")
+        (bin_dir / "false").symlink_to(self.evil)  # a caller's PATH can't shadow the inert programs either
+        extra = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        self.commit("a.txt", "a\n", "a")
+        self.git(["checkout", "-q", "-b", "side"])
+        self.commit("b.txt", "b\n", "b")
+        self.git(["checkout", "-q", "main"])
+        self.commit("c.txt", "c\n", "c")
+        # pull.twohead only hands its name to the merge pull runs, as -s does, so `merge -s evil` stands for it
+        for caller, words in (([], ["merge", "-s", "evil", "side"]),
+                              (["-c", "branch.main.mergeOptions=-s evil"], ["merge", "side"]),
+                              (["-c", "commit.gpgSign=true", "-c", "gpg.program=false"],
+                               ["commit", "--allow-empty", "-m", "x"])):
+            with self.subTest(caller=caller, words=words):
+                self.assert_reached(self.git(caller + words, env=dict(self.unprotected(), **extra), check=False))
+                self.git(["merge", "--abort"], check=False)
+                argv, env, _ = self.built(caller + ["pull"], extra_env=extra)
+                self.assertNotIn(str(bin_dir), env["PATH"].split(os.pathsep))
+                r = self.run_with(argv, env, words)
+                self.assertNotEqual(r.returncode, 0)
+                self.git(["merge", "--abort"], check=False)
+                self.assert_not_reached()
+
+    def test_config_env_cannot_copy_the_token(self):
+        # --config-env=http.userAgent=PRBOT_GIT_TOKEN would put the token in config and send it as the User-Agent
+        for sub in ("fetch", "push", "pull"):
+            for caller in (["--config-env=http.userAgent=PRBOT_GIT_TOKEN"],
+                           ["--config-env", "http.extraHeader=PRBOT_GIT_TOKEN"]):
+                with self.subTest(sub=sub, caller=caller):
+                    self.assertIn("PRBOT_GIT_TOKEN", self.refused(["-C", str(self.repo)] + caller + [sub]))
+        self.built(["--config-env=http.userAgent=OTHER", "fetch"], extra_env={"OTHER": "x"})
+
+    def test_trace_cannot_print_the_token(self):
+        extra = {"GIT_TRACE2_EVENT": str(self.marker), "GIT_TRACE2_ENV_VARS": "PRBOT_GIT_TOKEN",
+                 "GIT_TRACE_REDACT": "0", "GIT_TRACE_CURL": "1"}
+        self.git(["status"], env=dict(self.unprotected(), **extra))
+        self.assertIn(self.TOKEN, self.marker.read_text())
+        self.marker.unlink()
+        self.global_config.write_text(f"[trace2]\n\teventTarget = {self.marker}\n\tenvVars = PRBOT_GIT_TOKEN\n")
+        argv, env, _ = self.built(["fetch", "origin"], extra_env=extra)
+        self.assertEqual(env["GIT_TRACE_REDACT"], "1")
+        self.assertNotIn("GIT_TRACE_CURL", env)
+        self.run_with(argv, env, ["status"])
+        self.assertFalse(self.marker.exists() and self.TOKEN in self.marker.read_text())
+
+    def test_exec_path_is_refused_and_dropped(self):
+        self.assertIn("--exec-path", self.refused(["-C", str(self.repo), f"--exec-path={self.tmp}", "fetch"]))
+        argv, env, _ = self.built(["fetch", "origin"], extra_env={"GIT_EXEC_PATH": str(self.tmp)})
+        self.assertNotIn("GIT_EXEC_PATH", env)
 
     def test_commands_without_a_token_drop_an_inherited_one(self):
         env = prbot.git_env(identity=("b[bot]", "1+b[bot]@users.noreply.github.com"))

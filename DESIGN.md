@@ -96,6 +96,18 @@ starts inherits the token (issue #35). So a token run also:
   `gpg.ssh.defaultKeyCommand`) set to `false`, and `core.alternateRefsCommand`
   set to `true`. `GIT_MERGE_AUTOEDIT=no` lets a pull's merge commit take git's
   message. Signing and editing then fail instead of running.
+- runs with `PATH` set to the folder of git's own binary plus `/usr/bin`,
+  `/bin`, `/usr/sbin` and `/sbin`, drops `GIT_EXEC_PATH` and refuses
+  `--exec-path=`. Config can name a program without giving its path (an
+  external merge strategy `git-merge-<name>` from `-s`, `pull.twohead` or
+  `branch.<name>.mergeOptions`, and the `false` and `cat` above), so it must
+  only be found where git and the system keep theirs, and git's helpers such
+  as `git-remote-https` only in git's own exec path.
+- drops every `GIT_TRACE*` variable and sets `GIT_TRACE2`, `GIT_TRACE2_EVENT`
+  and `GIT_TRACE2_PERF` to `0` (they beat a global `trace2.*` target), since
+  trace2 can print any variable it is told to, and refuses a caller's
+  `--config-env` that names `PRBOT_GIT_TOKEN`, which would copy the token into
+  config where git sends it (`http.userAgent`, `http.extraHeader`).
 - turns off `submodule.recurse`, `fetch.recurseSubmodules`,
   `push.recurseSubmodules`, `maintenance.auto` and `gc.auto`, and refuses any
   `--recurse-submodules` form that turns recursion on, before asking for a
@@ -103,9 +115,10 @@ starts inherits the token (issue #35). So a token run also:
 - for pull only, reads git's config first, with the caller's `-C`, `-c` and
   `--config-env` options and without the token, and dies if it can't. Every
   filter it names gets empty `clean`, `smudge` and `process` commands and
-  `required=true`, and every `merge.<name>.driver` becomes
-  `git --no-pager merge-file`. A checkout that needs a filter, such as Git LFS,
-  then fails instead of running it with the token, while a global
+  `required=true`, and every `merge.<name>.driver` becomes `false`. A checkout
+  that needs a filter, such as Git LFS, then fails, and a file that needs a
+  driver is left as a conflict, instead of running either with the token or
+  merging some other way, while a global
   `filter.lfs` that no file uses changes nothing. For filters, custom merge
   drivers, editors or signing, run `prbot git <bot> -- fetch`, then a
   token-free `prbot git <bot> -- merge` or `rebase`.
