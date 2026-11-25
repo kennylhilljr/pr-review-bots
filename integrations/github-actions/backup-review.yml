@@ -103,8 +103,10 @@ jobs:
             echo "SKIP=1" >> "$GITHUB_ENV"
             exit 0
           fi
-          gh pr diff "$PR" -R "$REPO" > "$RUNNER_TEMP/pr.diff"
-          gh pr view "$PR" -R "$REPO" --json url,title > "$RUNNER_TEMP/pr.json"
+          # The reviewer may read the checkout and this folder only (--add-dir below), not the rest of RUNNER_TEMP.
+          mkdir -p "$RUNNER_TEMP/review-input"
+          gh pr diff "$PR" -R "$REPO" > "$RUNNER_TEMP/review-input/pr.diff"
+          gh pr view "$PR" -R "$REPO" --json url,title > "$RUNNER_TEMP/review-input/pr.json"
 
       - id: claude
         if: env.SKIP != '1'
@@ -112,8 +114,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
-            You are reviewing GitHub pull request #${{ matrix.pr.number }} in ${{ github.repository }}. Its URL and title are in ${{ runner.temp }}/pr.json.
-            The full diff is in ${{ runner.temp }}/pr.diff. The current directory is a checkout of the PR's head commit; read files there for context if useful.
+            You are reviewing GitHub pull request #${{ matrix.pr.number }} in ${{ github.repository }}. Its URL and title are in ${{ runner.temp }}/review-input/pr.json.
+            The full diff is in ${{ runner.temp }}/review-input/pr.diff. The current directory is a checkout of the PR's head commit; read files there for context if useful.
 
             First read the repository's agent instructions if there are any (AGENTS.md, CLAUDE.md and the files they point to). Breaking a rule written there is a defect.
 
@@ -132,9 +134,18 @@ jobs:
             If you find nothing worth reporting, say so in one sentence.
 
             Put the review text, in GitHub Markdown and ready to post, in the "review" field of your structured output. Do not post anything yourself or change any file.
+          # No allow rule: in dontAsk mode Claude may read only the checkout and the --add-dir folder. The action
+          # turns an empty --setting-sources into its default of user,project,local, so it gets "user": that drops
+          # the PR's own .claude/settings*.json, and --strict-mcp-config drops its .mcp.json. The action splits
+          # --disallowedTools on commas; the deny rules are prbot's plus /proc (two slashes means an absolute path).
+          # Read(~/**) is not denied because the checkout and RUNNER_TEMP sit under /home/runner.
           claude_args: >-
-            --allowedTools Read,Grep,Glob
-            --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch
+            --setting-sources user
+            --strict-mcp-config
+            --permission-mode dontAsk
+            --tools Read,Grep,Glob
+            --add-dir ${{ runner.temp }}/review-input
+            --disallowedTools 'Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Read(~/.config/**),Read(~/.ssh/**),Read(~/.gnupg/**),Read(~/.aws/**),Read(~/.kube/**),Read(~/.docker/**),Read(~/.netrc),Read(~/.git-credentials),Read(~/Library/Keychains/**),Read(//proc/**)'
             --json-schema '{"type":"object","properties":{"review":{"type":"string","minLength":1}},"required":["review"]}'
 
       - name: Post the review as claude[bot]
@@ -148,6 +159,26 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # A planted instruction in the PR can ask the reviewer to quote a secret, so refuse to post a review that
+          # matches prbot's LEAK_PATTERNS (copied; a test keeps them equal). A plain command, so set -e stops the
+          # step if python3 fails or is missing. -I: the step runs in the PR's checkout, so no module loads from it.
+          python3 -I - <<'PY'
+          import os, re, sys
+          LEAK_PATTERNS = [
+              ("a private key block", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"),
+              ("a GitHub token", r"\bgh[pousr]_[A-Za-z0-9_]{30,}"),
+              ("a GitHub token", r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+              ("an API key", r"\bsk-(?:ant-|proj-)[A-Za-z0-9_-]{20,}"),
+              ("an API key", r"\bAKIA[0-9A-Z]{16}\b"),
+              ("a path to a private home folder", r"(?:~|\$HOME|\$\{HOME\})/(?:\.config|\.ssh|\.gnupg|\.aws|\.kube|\.docker|\.netrc|\.git\-credentials|Library/Keychains)\b"),
+              ("a home folder path", r"/(?:Users|home)/[^/\s`'\"]+/\."),
+          ]
+          review = os.environ["REVIEW"]
+          for label, pattern in LEAK_PATTERNS:
+              if re.search(pattern, review):
+                  print(f"::error::The review was not posted because it contains {label}. The PR may hold an instruction asking the reviewer to quote a secret.")
+                  sys.exit(1)
+          PY
           # shellcheck disable=SC2016  # the backticks are Markdown
           {
             printf '%s\n\n' "$REVIEW"
