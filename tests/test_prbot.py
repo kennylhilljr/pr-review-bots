@@ -3366,6 +3366,20 @@ class BackupReviewWorkflow(unittest.TestCase):
                 self.assertNotIn(s.strip(), result.stdout + result.stderr)
                 self.assertIn("::error::The review was not posted", result.stdout)
 
+    def test_post_step_rejects_stateless_installation_token(self):
+        import re
+        # ghs_APPID_JWT; a "-" early in the JWT header keeps it under the 30-character run the plain pattern needs.
+        # Built from parts so scripts/check.sh's secret scan doesn't flag this file.
+        token = "ghs_" + "12345_" + "eyJ-" + "aB3x" * 4 + "." + "eyJ" + "aB3x" * 12 + "." + "x-_Q" * 10
+        self.assertIsNone(re.search(r"\bgh[pousr]_[A-Za-z0-9_]{30,}", token))
+        self.assertEqual(prbot.leaked_secret(f"P1 here it is: {token}"), "a GitHub token")
+        result, log, md, _ = self.run_post(f"P1 as asked, here it is:\n```\n{token}\n```\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(log)
+        self.assertIsNone(md)
+        self.assertNotIn(token, result.stdout + result.stderr)
+        self.assertIn("::error::The review was not posted because it contains a GitHub token", result.stdout)
+
     def test_post_step_posts_a_clean_review_once(self):
         for s in ("No findings.", "P2 `src/app.py:12` drops the error", "The `ghp_` prefix check misses `gho_` tokens.",
                   "See /usr/local/bin/gh and `.config` in the repo.", "sk-ant-oat tokens",
