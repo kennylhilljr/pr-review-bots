@@ -261,7 +261,9 @@ through what it can read and knows is safe:
    `cd` or `pushd` target through it, so a target that is not absolute and is
    not `.`, `..` or a path starting with `./` or `../` leaves the directory
    unknown, and a later `git commit`, `git push` or `scripts/check.sh` in the
-   same command is refused.
+   same command is refused. A `cd` or `pushd` with a `--` argument
+   (`cd -- -repo`) leaves the directory unknown the same way, rather than
+   being read as `cd` with no directory, which would track `~`.
 4. Every command, whether or not it names gh, is checked for a request to
    GitHub's API that skips gh (`github_api` in `prbot`), once its text names
    `api.github.com`, `uploads.github.com`, an `api.<tenant>.ghe.com` host,

@@ -1550,6 +1550,9 @@ class _Guard:
         if self.physical or any(a.text.startswith("-") and a.text != "-" and "P" in a.text for a in args):
             self.dir = None  # cd -P or set -P: .. is folded after symlinks, which the guard does not follow
             return
+        if any(a.text == "--" for a in args):
+            self.dir = None  # cd -- -dir: bash ends options at --, so the guard stops tracking rather than guess
+            return
         positional = [a for a in args if a.text == "-" or not a.text.startswith("-")]
         if name == "popd" or (name == "pushd" and (not positional or len(positional) != len(args))) or (
                 positional and (positional[0].dynamic or positional[0].text == "-")):
