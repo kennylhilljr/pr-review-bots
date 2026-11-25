@@ -38,7 +38,7 @@ class CiWorkflowDocTest(unittest.TestCase):
         self.assertNotRegex(self.yaml, r":\s*write\b")
 
     def test_runs_on_ubuntu_with_python_matrix(self):
-        self.assert_line("    runs-on: ubuntu-latest")
+        self.assert_line("    runs-on: ubuntu-24.04")
         self.assert_line("        python-version: ['3.9', '3.13']")
 
     def test_minimum_python_matches_readme(self):

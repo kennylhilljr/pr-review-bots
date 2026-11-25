@@ -1246,10 +1246,13 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
         self.marker = self.tmp / "leaked"
         self.repo = self.tmp / "r"
         self.git(["init", "-q", "-b", "main", str(self.repo)], cwd=self.tmp)
-        self.git(["config", "user.name", "t"])
-        self.git(["config", "user.email", "t@example.invalid"])
+        self.set_identity(self.repo)
         self.git(["remote", "add", "origin", "https://github.com/o/r.git"])
         self.evil = self.script("evil", "exit 1")
+
+    def set_identity(self, repo):
+        self.git(["-C", str(repo), "config", "user.name", "t"], cwd=self.tmp)
+        self.git(["-C", str(repo), "config", "user.email", "t@example.invalid"], cwd=self.tmp)
 
     def script(self, name, tail):
         # a program that writes the token it can see to the marker file, then runs tail
@@ -1634,10 +1637,12 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
         # commands prbot's settings reach in the submodule still run none of them
         sub_src = self.tmp / "sub"
         self.git(["init", "-q", "-b", "main", str(sub_src)], cwd=self.tmp)
+        self.set_identity(sub_src)
         self.git(["-C", str(sub_src), "commit", "-q", "--allow-empty", "-m", "s"], cwd=self.tmp)
         self.git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_src), "sub"])
         self.git(["commit", "-q", "-m", "add sub"])
         sub = self.repo / "sub"
+        self.set_identity(sub)  # a CI runner has no global user.name, and the unprotected commit below needs one
         self.git(["-C", str(sub), "config", "credential.helper", f"!{self.evil}"])
         hooks = Path(self.git(["-C", str(sub), "rev-parse", "--git-path", "hooks"]).stdout.strip())
         if not hooks.is_absolute():
@@ -3366,7 +3371,10 @@ class BackupReviewWorkflow(unittest.TestCase):
                   "See /usr/local/bin/gh and `.config` in the repo.", "sk-ant-oat tokens",
                   "P3 /home/runner/work/r/r/app.py:3 reads a file"):
             with self.subTest(s=s):
-                self.assertIsNone(prbot.leaked_secret(s))
+                # on a GitHub runner HOME is /home/runner, which leaked_secret rightly flags as this machine's home;
+                # these samples are about the patterns, so check them against a home folder none of them names
+                with mock.patch.dict(os.environ, HOME="/Users/prbot-test-home"):
+                    self.assertIsNone(prbot.leaked_secret(s))
                 result, log, md, rt = self.run_post(s)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(log.splitlines(),

@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +40,7 @@ jobs:
         run: scripts/check.sh
 ```
 
-It runs on every pull request and on pushes to `main`, once on Python 3.9 (the oldest version `README.md` supports) and once on Python 3.13. The `ubuntu-latest` runner already has `gh`, `git` and `openssl`, which the tests use. `submodules: true` checks out the shared skills submodule at its pinned commit, which the `links` check needs; the catalog is public, so this needs no token. The tests make no network calls, so the workflow needs no secrets and no App token. It only reads the repository, and the checkout doesn't keep a token on disk. Each action is pinned to a full commit SHA, with its release as a comment, so a moved or compromised tag can't change what runs.
+It runs on every pull request and on pushes to `main`, once on Python 3.9 (the oldest version `README.md` supports) and once on Python 3.13. The runner is pinned to `ubuntu-24.04` because `actions/setup-python` has no Python 3.9 build for Ubuntu 26.04, which `ubuntu-latest` now points to; raising the minimum past 3.9 would let it move back. The runner already has `gh`, `git` and `openssl`, which the tests use, but no Git `user.name` or `user.email`, so a test that commits sets them in its own repositories. `submodules: true` checks out the shared skills submodule at its pinned commit, which the `links` check needs; the catalog is public, so this needs no token. The tests make no network calls, so the workflow needs no secrets and no App token. It only reads the repository, and the checkout doesn't keep a token on disk. Each action is pinned to a full commit SHA, with its release as a comment, so a moved or compromised tag can't change what runs.
 
 This is separate from `.github/workflows/backup-review.yml`. That workflow posts a review on PRs prbot has left alone; this one only runs the checks and posts nothing.
 
