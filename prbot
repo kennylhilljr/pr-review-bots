@@ -1557,8 +1557,14 @@ class _Guard:
         elif not positional:
             self.dir = os.path.expanduser("~")
         elif self.dir is not None or os.path.isabs(os.path.expanduser(positional[0].text)):
+            target = os.path.expanduser(positional[0].text)
+            if os.environ.get("CDPATH") and not os.path.isabs(target) and target not in (".", "..") and not (
+                    target.startswith("./") or target.startswith("../")):
+                # bash looks a bare relative target up in CDPATH first, so the directory it reaches is unknown
+                self.dir = None
+                return
             # bash cd is logical: link/.. goes back to where it started, so fold .. before any lookup
-            self.dir = os.path.normpath(os.path.join(self.dir or "/", os.path.expanduser(positional[0].text)))
+            self.dir = os.path.normpath(os.path.join(self.dir or "/", target))
 
     def test_runner(self, prog, name, args):
         texts = [a.text for a in args]
@@ -1867,9 +1873,17 @@ def guard_bash(command, cwd, owners, codex_triggers_as_bot=False):
 
     Keys: feedback (gh argv lists that post PR feedback), git (git argv lists that commit or push in a bot
     repo), gh (other gh argv lists not on the safe list), api (requests to GitHub's API made without gh, such as
-    a curl POST or python code naming api.github.com) and reasons (why anything else was refused)."""
+    a curl POST or python code naming api.github.com) and reasons (why anything else was refused).
+
+    It also reads os.environ, the environment the agent's shell inherits: CDPATH and the pager variables there are
+    checked."""
     g = _Guard(cwd, set(owners), codex_triggers_as_bot)
     g.run(command)
+    if _mentions_guarded(command):
+        for name in sorted(GUARD_PAGER_ENV):
+            if name in os.environ and os.environ[name] not in GUARD_SAFE_PAGERS:
+                g.block(f"{name} is set in the environment to anything other than cat or empty, and gh and git run "
+                        f"it as a command; start Claude Code with {name}=cat, {name} empty or {name} unset")
     if g.feedback or g.git or g.gh_other or g.reasons or g.api:
         shown = lambda lists: [[a.replace(DYN, "<run-time value>") for a in args] for args in lists]
         return {"feedback": shown(g.feedback), "git": shown(g.git), "gh": shown(g.gh_other), "api": g.api,

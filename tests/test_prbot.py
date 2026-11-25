@@ -658,6 +658,11 @@ class Guard(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.mine = self.repo("kennylhilljr")
         self.theirs = self.repo("someone-else")
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for k in ("CDPATH", "GH_PAGER", "PAGER", "GIT_PAGER"):
+            os.environ.pop(k, None)
 
     def repo(self, owner):
         d = tempfile.mkdtemp(dir=self.tmp.name)
@@ -3508,6 +3513,8 @@ class Hook(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.env = dict(os.environ, PRBOT_CONFIG_DIR=self.tmp.name)
+        for k in ("CDPATH", "GH_PAGER", "PAGER", "GIT_PAGER"):
+            self.env.pop(k, None)
 
     def tearDown(self):
         self.tmp.cleanup()
