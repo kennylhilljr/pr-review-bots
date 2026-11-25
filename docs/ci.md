@@ -87,4 +87,4 @@ Each run makes a private folder under `/tmp`, whatever `TMPDIR` the caller has, 
 
 ## Python 3.9
 
-No Python 3.9 interpreter was available when this was written, so the suite has not run on 3.9 yet. The code parses with the 3.9 grammar, and `tests/test_check.py` passes on Python 3.10 and 3.13. The 3.9 job in the workflow above is the first real 3.9 run. If it fails, either fix the code or raise the minimum in `README.md` (badge and Requirements), in the matrix above and in `tests/test_ci_docs.py` together.
+The 3.9 job runs the whole suite on Python 3.9, the oldest version `README.md` supports. To raise the minimum, change `README.md` (badge and Requirements), the matrix above and `tests/test_ci_docs.py` together; once 3.9 is gone the runner can move back to `ubuntu-latest`.
