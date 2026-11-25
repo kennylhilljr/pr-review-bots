@@ -1125,9 +1125,14 @@ def shell_commands(command):
     return _Lexer(command).parse()
 
 
+def _unquoted(text):
+    """The text with quotes, backslashes and line continuations removed."""
+    return re.sub(r"[\\'\"]", "", text.replace("\\\n", ""))
+
+
 def _mentions_guarded(command):
     """True when the text names gh, git or prbot once quotes, backslashes and line continuations are removed."""
-    return GUARD_MENTION.search(re.sub(r"[\\'\"]", "", command.replace("\\\n", ""))) is not None
+    return GUARD_MENTION.search(_unquoted(command)) is not None
 
 
 # wrappers that run the program named after their own options; value: options that take an operand
@@ -1154,6 +1159,22 @@ GUARD_RUNNERS = {"arch", "find", "setsid", "watch", "script", "flock", "xcrun", 
                  "parallel", "chroot", "doas", "unbuffer", "expect", "osascript", "at", "batch", "launchctl", "su",
                  "runuser", "unshare", "nsenter", "sandbox-exec", "ionice", "taskset", "chrt", "prlimit",
                  "systemd-run", "open", "dtruss", "lldb", "gdb", "strace", "ltrace", "valgrind", "sem"}
+# GitHub's REST, GraphQL and upload APIs: github.com, GHE.com tenants and GitHub Enterprise Server (/api/v3 on
+# any host, /api/graphql and /api/uploads on a host named github)
+GITHUB_API = re.compile(r"(?:^|(?<=[\s=(,\[{<>|;&])|(?<=//))(api|uploads)\.(github|[A-Za-z0-9-]+\.ghe)\.com"
+                        r"(?![A-Za-z0-9-]|\.[A-Za-z0-9]|@)"
+                        r"|[A-Za-z0-9.-](:[0-9]+)?/api/v3(?![A-Za-z0-9])"
+                        r"|(?<![A-Za-z0-9-])github[A-Za-z0-9.-]*(:[0-9]+)?/api/(graphql|uploads)(?![A-Za-z0-9])", re.I)
+# programs that send an HTTP request named on their command line
+GUARD_HTTP_CLIENTS = {"curl", "wget", "wget2", "http", "https", "xh", "xhs", "httpie", "aria2c", "lwp-request",
+                      "POST", "PUT"}
+GUARD_HTTPIE = {"http", "https", "xh", "xhs", "httpie"}
+# text that sends something rather than reading: a non-GET method name, or a curl, wget or code data option
+GUARD_HTTP_WRITE = re.compile(
+    r"(?<![A-Za-z0-9_])(post|put|patch|delete)(?![A-Za-z0-9_])"
+    r"|(?:^|\s)(-[A-Za-z]*[dFT]|--data[A-Za-z-]*|--form[A-Za-z-]*|--json|--upload-file|--post-data|--post-file"
+    r"|--body-data|--body-file|--method|-X|--request|-K|--config)(?=[\s=]|$)"
+    r"|(?:^|\s)-X\S|(?<![A-Za-z0-9_])(data|body|json|method)\s*[:=]", re.I)
 # PWD and OLDPWD: the guard reads "$PWD/scripts/check.sh" as the directory it tracks
 GUARD_RISKY_VARS = {"PATH", "IFS", "HOME", "XDG_CONFIG_HOME", "CDPATH", "PWD", "OLDPWD"}
 # variables whose value bash runs or expands as code: refused in every command
@@ -1206,20 +1227,27 @@ REMOTE_URL = re.compile(r"github\.com(?::[0-9]+)?[:/]+([^/\s:]+)/", re.I)
 class _Guard:
     def __init__(self, cwd, owners, codex_triggers_as_bot):
         self.dir, self.owners, self.codex = cwd, {o.lower() for o in owners}, codex_triggers_as_bot
-        self.feedback, self.gh_other, self.git, self.reasons = [], [], [], []
+        self.feedback, self.gh_other, self.git, self.reasons, self.api = [], [], [], [], []
         self.repo_changed = False  # an earlier git clone/init/worktree/remote may have made a bot repo
         self.cd_seen = False
         self.physical = False  # set -P or set -o physical: later cds resolve symlinks first
+        self.api_named = None  # the whole command names GitHub's API (set by the outermost run)
+        self.api_sends = False  # ... and holds text that sends something
 
     def block(self, reason):
         if reason not in self.reasons:
             self.reasons.append(reason)
 
     def run(self, command, depth=0, relevant=False):
+        if self.api_named is None:  # a URL in a variable or an earlier step counts for every step after it
+            text = _unquoted(command)
+            self.api_named = GITHUB_API.search(text) is not None
+            self.api_sends = self.api_named and GUARD_HTTP_WRITE.search(text) is not None
         try:
             cmds = shell_commands(command)
         except Unparseable as e:
-            if _mentions_guarded(command) or GUARD_SUSPICIOUS.search(command):
+            if (_mentions_guarded(command) or GUARD_SUSPICIOUS.search(command)
+                    or GITHUB_API.search(_unquoted(command))):
                 self.block(f"the guard cannot read this command ({e})")
             return
         relevant = relevant or _mentions_guarded(command)  # sh -c text inside a strict command stays strict
@@ -1285,6 +1313,7 @@ class _Guard:
                 self.block("xargs running a program named on stdin")
             return
         prog, args = words[prog_at], words[prog_at + 1:]
+        self.github_api(prog, args, cmd, wrappers)
         head, _, tail = prog.text.rpartition("/")
         if prog.glob or (prog.dynamic and (DYN in tail or not head)):
             self.block("the program name is only known at run time")
@@ -1363,6 +1392,61 @@ class _Guard:
             pass
         else:
             self.block(f"`{name}` is not on the safe list")
+
+    def api_write(self, reason):
+        if reason not in self.api:
+            self.api.append(reason)
+
+    def github_api(self, prog, args, cmd, wrappers=(), depth=0):
+        """Refuse a request to GitHub's API that does not go through gh: an HTTP client that sends data or a
+        non-GET method, an interpreter run in a command that names the API, and a file written in a command whose
+        text names the API and sends something (a script to run next). Reads with curl stay allowed."""
+        if not self.api_named:
+            return
+        name = prog.text.rpartition("/")[2]
+        lname = name.lower()
+        writes_file = lname in ("tee", "dd", "cp", "install") or any(
+            op in (">", ">>", "&>", "&>>", ">|", "<>") and t.text != "/dev/null" for op, t in cmd.redirects)
+        # find -exec curl ..., ssh host curl ...: the client named inside another program's arguments
+        inner = next((j for j, a in enumerate(args) if not a.dynamic and (
+            a.text.rpartition("/")[2] in GUARD_HTTP_CLIENTS or a.text.rpartition("/")[2].lower() in GUARD_HTTP_CLIENTS
+            or re.fullmatch(GUARD_INTERPRETERS, a.text.rpartition("/")[2], re.I))), None)
+        if inner is not None and lname not in GUARD_HTTP_CLIENTS and name not in GUARD_HTTP_CLIENTS and not (
+                re.fullmatch(GUARD_INTERPRETERS, lname, re.I)) and lname not in GUARD_SAFE_PROGRAMS:
+            prog, args = args[inner], args[inner + 1:]
+            name = prog.text.rpartition("/")[2]
+            lname = name.lower()
+        # xargs reads the pipe itself; the program it starts gets no input
+        stdin = (cmd.piped and "xargs" not in wrappers) or any(
+            op in ("<", "<<", "<<-", "<<<", "<>") for op, _ in cmd.redirects)
+        if lname in GUARD_HTTP_CLIENTS or name in GUARD_HTTP_CLIENTS:
+            # the URL is in this command, or elsewhere in it: "$URL" set earlier, printf URL | xargs curl
+            if _http_sends(name, args, stdin, appended="xargs" in wrappers):
+                self.api_write(f"{name} sending a request to GitHub's API as the user")
+        elif re.fullmatch(GUARD_INTERPRETERS, lname, re.I) and not (
+                [a.text for a in args[:1]] == ["-m"] and len(args) > 1 and args[1].text in GUARD_TEST_MODULES):
+            self.api_write(f"{name} code in a command that names GitHub's API would call it as the user")
+        elif lname in GUARD_SHELLS:  # sh -c text is checked again as its own command
+            if self.api_sends and not any(a.text.startswith("-") and "c" in a.text for a in args):
+                self.api_write(f"{name} script in a command that sends to GitHub's API")
+        elif lname in GUARD_RUNNERS:  # ssh host 'curl -d ...', find -exec sh -c '...': read the quoted command
+            for a in args:
+                if a.dynamic or not re.search(r"\s", a.text):
+                    continue
+                try:
+                    inner_cmds = shell_commands(a.text) if depth < GUARD_MAX_DEPTH else None
+                except Unparseable:
+                    inner_cmds = None
+                if inner_cmds is None:
+                    if GITHUB_API.search(_unquoted(a.text)):
+                        self.api_write(f"{name} running a command the guard cannot read that names GitHub's API")
+                    continue
+                for c in inner_cmds:
+                    at, wr, _ = self.unwrap(c.words) if c.words else (None, [], None)
+                    if at is not None:
+                        self.github_api(c.words[at], c.words[at + 1:], c, wr, depth + 1)
+        elif writes_file and self.api_sends:
+            self.api_write("writing a script that calls GitHub's API")
 
     @staticmethod
     def stores_code(w):
@@ -1686,16 +1770,110 @@ def gh_api_is_get(rest):
     return endpoint is not None
 
 
+# curl short options that take a value: a cluster ends at the first of them
+CURL_SHORT_VALUES = set("HoouAebcEmrwxyYzCDUQPt")
+# per client, long options naming one of these send a body or read a config or rc command that may: curl
+# --data, --data-urlencode, --expand-data, --json, --form, --upload-file, --config; wget --post-data,
+# --body-file, --execute, --config (and their prefixes); httpie --raw. Other clients: any of them.
+HTTP_SEND_WORDS = {"curl": ("data", "json", "form", "upload", "config"),
+                   "wget": ("post", "body", "execute", "config"), "httpie": ("raw",)}
+HTTP_SEND_ANY = ("data", "json", "form", "upload", "post", "body", "config", "execute", "raw")
+# wget accepts any unambiguous prefix of a long option
+WGET_LONG_SENDS = ("post-data", "post-file", "body-data", "body-file", "execute", "config")
+HTTP_METHODS_READ = ("GET", "HEAD")
+# httpie and xh options whose operand is the next word, so it is not read as the method
+HTTPIE_VALUE_OPTIONS = {"auth", "auth-type", "bearer", "verify", "session", "session-read-only", "cert", "cert-key",
+                        "cert-key-pass", "ssl", "ciphers", "proxy", "timeout", "max-redirects", "pretty", "style",
+                        "print", "history-print", "output", "format-options", "response-charset", "response-mime",
+                        "default-scheme", "max-headers", "boundary", "http-version",
+                        "resolve", "interface", "local-port"}
+HTTPIE_SHORT_VALUES = {"-a", "-A", "-s", "-p", "-P", "-o"}
+
+
+def _http_sends(name, args, stdin=False, appended=False):
+    """True when an HTTP client call may send a body or use a method other than GET or HEAD. stdin: the call
+    reads a redirection or a pipe, which httpie and xh send as the body. appended: xargs adds words after args,
+    so the URL may be one of them."""
+    texts = [a.text for a in args]
+    lname = name.lower()
+    if name.upper() in ("POST", "PUT") or (lname in GUARD_HTTPIE and stdin and not any(
+            t in ("--ignore-stdin", "-I") for t in texts)):
+        return True
+    def url_last(k):
+        # curl "$URL" -s: the one quoted run-time word, with no literal URL in the call, is the URL, not an
+        # option or a method; the words around it are still read
+        return (not appended and not args[k].split and sum(x.dynamic for x in args) == 1
+                and not any("://" in x or GITHUB_API.search(x) for x in texts))
+
+    i = 0
+    while i < len(args):
+        a, t = args[i], texts[i]
+        nxt = texts[i + 1] if i + 1 < len(texts) else ""
+        if a.dynamic and (t.startswith("-") or (t.startswith(DYN) and not url_last(i))):
+            return True  # an option only known at run time could be -d or -X POST
+        if t.startswith("--"):
+            opt, eq, value = t.partition("=")
+            key = opt[2:].lower()
+            family = "wget" if lname.startswith("wget") else "httpie" if lname in GUARD_HTTPIE else lname
+            if key.startswith("no-") or key in ("form-escape",):
+                pass  # wget --no-config, curl --form-escape: they send nothing
+            elif (family == "curl" and key.removeprefix("expand-").startswith(HTTP_SEND_WORDS["curl"])) or (
+                    family != "curl" and any(word in key for word in HTTP_SEND_WORDS.get(family, HTTP_SEND_ANY))) or (
+                    family == "wget" and len(key) >= 2 and any(o.startswith(key) for o in WGET_LONG_SENDS)):
+                return True
+            if "method" in key or key in ("request", "custom-request") or (
+                    family == "wget" and len(key) >= 2 and "method".startswith(key)):
+                if (value if eq else nxt).upper() not in HTTP_METHODS_READ:
+                    return True
+                i += 1 if eq else 2
+                continue
+            if family == "httpie" and not eq and key in HTTPIE_VALUE_OPTIONS:
+                i += 2  # --auth-type basic, --verify yes: the operand is not the method
+                continue
+        elif t.startswith("-") and len(t) > 1 and lname == "curl":
+            for k, ch in enumerate(t[1:], 1):
+                if ch in "dFTK":
+                    return True
+                if ch == "X" or ch in CURL_SHORT_VALUES:
+                    value = t[k + 1:] or nxt
+                    if ch == "X" and value.upper() not in HTTP_METHODS_READ:
+                        return True
+                    if not t[k + 1:]:
+                        i += 1  # the value is the next word
+                    break
+        elif t.startswith("-") and len(t) > 1:
+            if lname in GUARD_HTTPIE and t in HTTPIE_SHORT_VALUES:
+                i += 2
+                continue
+            if lname.startswith("wget") and "e" in t[1:]:
+                return True  # -e runs a wgetrc command such as post_data=x
+            if lname == "lwp-request" and t[:2] in ("-m", "-c") and (
+                    t[2:] or nxt).upper() not in HTTP_METHODS_READ:
+                return True
+        elif lname in GUARD_HTTPIE:
+            # [METHOD] URL [items], in any letter case and after options that take a value (--auth u:p DELETE):
+            # any bare word other than GET or HEAD may be the method
+            if re.fullmatch(r"[A-Za-z]+", t) and t.upper() not in HTTP_METHODS_READ:
+                return True
+            # httpie and xh send a body, and switch to POST, for any data item: key=value, key:=json, key@file
+            if re.match(r"[^:=@/]*(:=|=|@)", t) and not re.match(r"[^:=@/]*==", t):
+                return True
+        i += 1
+    return False
+
+
 def guard_bash(command, cwd, owners, codex_triggers_as_bot=False):
     """What the Claude Code hook should refuse in a Bash command, as a dict, or None to let it run.
 
     Keys: feedback (gh argv lists that post PR feedback), git (git argv lists that commit or push in a bot
-    repo), gh (other gh argv lists not on the safe list) and reasons (why anything else was refused)."""
+    repo), gh (other gh argv lists not on the safe list), api (requests to GitHub's API made without gh, such as
+    a curl POST or python code naming api.github.com) and reasons (why anything else was refused)."""
     g = _Guard(cwd, set(owners), codex_triggers_as_bot)
     g.run(command)
-    if g.feedback or g.git or g.gh_other or g.reasons:
+    if g.feedback or g.git or g.gh_other or g.reasons or g.api:
         shown = lambda lists: [[a.replace(DYN, "<run-time value>") for a in args] for args in lists]
-        return {"feedback": shown(g.feedback), "git": shown(g.git), "gh": shown(g.gh_other), "reasons": g.reasons}
+        return {"feedback": shown(g.feedback), "git": shown(g.git), "gh": shown(g.gh_other), "api": g.api,
+                "reasons": g.reasons}
     return None
 
 # ---------- config and key storage ----------

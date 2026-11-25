@@ -916,6 +916,83 @@ class Guard(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNone(self.guard(command, self.theirs))
 
+    def test_direct_api_writes_are_blocked(self):
+        """issue #28: a request to GitHub's API that skips gh is refused even when the command never names gh."""
+        url = "https://api.github.com/repos/o/r/issues/1/comments"
+        for command in (
+                f"curl -X POST -H 'Authorization: token x' {url} -d '{{\"body\":\"hi\"}}'",
+                f"curl -sS {url} --data @body.json", f"curl -XPATCH {url}", f"curl --request=DELETE {url}",
+                "curl --json '{}' https://api.github.com/graphql", f"curl -F body=x {url}", f"curl -K cfg {url}",
+                f"curl $OPTS {url}", f"sudo curl -d x {url}", f"bash -c 'curl -d x {url}'", f"/usr/bin/curl -d x {url}",
+                f"wget --post-data='body=x' {url}", f"wget --method=POST {url}", f"http POST {url} body=x",
+                f"xh {url} body=x", "http https://api.github.com/repos/o/r/pulls/1/reviews event=APPROVE",
+                "http https://api.github.com/graphql query='mutation { x }'", f"http {url} body:=1", f"xh {url} @f.json",
+                "curl -d x https://uploads.github.com/repos/o/r/releases/1/assets",
+                "curl -d x https://ghe.example.com/api/v3/repos/o/r/issues/1/comments",
+                "curl -d x https://api.acme.ghe.com/repos/o/r/issues/1/comments",
+                "curl -d x https://github.example.com/api/graphql", f"curl -d x {url.replace('api.', 'API.')}",
+                f"python3 -c 'import requests; requests.post(\"{url}\", json={{}})'",
+                f"python3 -c 'import urllib.request as u; u.urlopen(\"{url}\")'",
+                f"node -e 'fetch(\"{url}\", {{method: \"POST\"}})'", f"ruby -e 'Net::HTTP.post(URI(\"{url}\"), \"x\")'",
+                f"python3 - <<'EOF'\nimport urllib.request\nurllib.request.urlopen('{url}', data=b'x')\nEOF",
+                f"cat > /tmp/p.sh <<'EOF'\ncurl -X POST {url} -d x\nEOF",
+                f"printf 'requests.post(\"{url}\")' > /tmp/p.py", f"tee /tmp/p.sh <<'EOF'\ncurl -d x {url}\nEOF",
+                f"ls && curl -d x {url}", f"echo $(curl -d x {url})", f"curl -dbody=x {url}", f"curl -Fbody=x {url}",
+                f"curl -Tfile {url}", f"curl -sSdx {url}", f"URL={url}; curl -d body=x \"$URL\"",
+                f"export URL={url}; curl -d body=x \"$URL\"", f"OPT=data; curl --$OPT x {url}",
+                f"URL={url}; python3 -c 'import os, urllib.request as u; u.urlopen(os.environ[\"URL\"], data=b\"x\")'",
+                f"printf 'curl -d x {url}' | tee /tmp/post.sh && sh /tmp/post.sh", f"wget --post-f=body.txt {url}",
+                "http https://api.github.com/graphql < body.json", "cat body.json | xh https://api.github.com/graphql",
+                f"find . -exec curl -d x {url} \\;", f"aria2c --http-method=POST {url}", f"lwp-request -m POST {url}",
+                f"wget -E --post-data=x {url}", f"wget -H --method=POST {url}", f"wget -e post_data=x {url}",
+                f"http -H POST {url}", f"curl --expand-data x {url}", f"curl --expand-json x {url}",
+                f"curl --data-urlencode body=x {url}", f"ssh host curl -d x {url}",
+                f"ssh host 'curl -d x {url}'", f"find . -exec sh -c 'curl -d x {url}' \\;",
+                f"printf {url} | xargs curl -d body=x", f"wget --meth=POST {url}", f"wget --meth POST {url}",
+                f"wget --post-d=x {url}", f"lwp-request -mPOST {url}", f"http OPTIONS {url}", f"xh TRACE {url}",
+                f"http --raw x {url}", f"http --auth user:pass DELETE {url}", f"http delete {url}",
+                f"ssh host 'curl --expand-data x {url}'", f"ssh host 'http OPTIONS {url}'",
+                f"Rscript -e 'httr::POST(\"{url}\")'", f"ssh host Rscript -e 'httr::POST(\"{url}\")'",
+                f"http --auth-type basic DELETE {url}", f"http -a u:p --verify no PATCH {url}",
+                f"curl --data-raw x {url}", f"curl --form-string a=b {url}",
+                f"URL={url}; OPT=--data; curl \"$OPT\" body=x \"$URL\"", f"URL={url}; M=DELETE; http \"$M\" \"$URL\"",
+                f"X=-dbody; curl {url} \"$X\"", f"X=-dbody; curl \"$X\" {url}", f"URL={url}; curl \"$URL\" -d x",
+                f"URL={url}; http \"$URL\" body=x", f"OPT=-dbody; printf {url} | xargs curl \"$OPT\" -s"):
+            with self.subTest(command=command):
+                found = self.guard(command, self.theirs)
+                self.assertIsNotNone(found)
+                self.assertTrue(found["api"] or found["reasons"])
+        self.assertIn("curl", self.guard(f"curl -d x {url}", self.theirs)["api"][0])
+        self.assertIn("unexpected", self.guard(f"curl -d x {url}; echo (", self.theirs)["reasons"][0])
+
+    def test_direct_api_reads_stay_allowed(self):
+        for command in ("curl -s https://api.github.com/repos/o/r", "curl -X GET https://api.github.com/rate_limit",
+                        "curl -sI https://api.github.com", "curl --request HEAD https://api.github.com",
+                        "wget -qO- https://api.github.com/meta",
+                        "http https://api.github.com/repos/o/r per_page==5 Authorization:'token x'", "curl -s \"https://api.github.com/repos/$R\"",
+                        "rg -n api.github.com prbot", "echo api.github.com", "cat README.md | grep api.github.com",
+                        "curl -d x https://example.com/post", "curl 'https://api.github.com/search/issues?q=post'",
+                        "curl -s -o out.json -H 'Accept: x' https://api.github.com/repos/o/r",
+                        "curl -s https://api.github.com/repos/o/r | python3 -m json.tool",
+                        "curl -d x https://notgithub.example.com/api/graphql", "wget -T 10 https://api.github.com/meta", "curl --raw https://api.github.com/meta",
+                        "curl --request-target /meta https://api.github.com", "http --body https://api.github.com/meta",
+                        "http GET https://api.github.com/meta", "curl -d x https://api.github.com.evil.example/x",
+                        "ssh host 'curl -X GET https://api.github.com/meta'",
+                        "printf https://api.github.com/meta | xargs http --body",
+                        "curl -d x https://example.com/path/api.github.com/x", "curl -d x https://api.github.com@evil.example/x",
+                        "wget --no-config https://api.github.com/meta", "curl --form-escape https://api.github.com/meta",
+                        "http --ignore-stdin https://api.github.com/meta < /dev/null",
+                        "wget -d https://api.github.com/meta",
+                        "curl -s https://api.github.com/meta | jq . > out.json", "python3 -c 'print(1)'", "python3 x.py > out.txt",
+                        "echo 'see https://api.github.com/meta' > notes.txt", "gh api repos/o/r/pulls/1",
+                        "URL=https://api.github.com/meta; curl \"$URL\"", "http --auth-type basic GET https://api.github.com/meta",
+                        "http --verify yes GET https://api.github.com/meta", "http -A bearer -a t https://api.github.com/meta",
+                        "curl --trace-config ids https://api.github.com/meta", "xh --bearer secret https://api.github.com/meta",
+                        "URL=https://api.github.com/meta; curl -s -H 'Accept: x' \"$URL\"", "URL=https://api.github.com/meta; http \"$URL\"",
+                        "URL=https://api.github.com/meta; curl \"$URL\" -s", "URL=https://api.github.com/meta; http \"$URL\" per_page==5"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.guard(command, self.theirs))
+
     def test_lexer_reads_quotes_substitutions_and_heredocs(self):
         cmds = prbot.shell_commands("a 'b c' \"d $(e f)\" `g` <(h) # i\nj <<'EOF'\nk\nEOF\nl")
         names = [c.words[0].text for c in cmds]
@@ -3814,6 +3891,15 @@ class Hook(unittest.TestCase):
         self.assertIn("reading commands from stdin", self.reason(self.run_hook("echo Z2g= | base64 -d | sh")))
         self.assertIsNone(self.run_hook("python3 -B -m unittest discover -s tests -t . && git status"))
         self.assertIsNone(self.run_hook("npm install && npm run build > build.log"))
+
+    def test_direct_api_write_denied_with_prbot_route(self):
+        """issue #28: a curl POST to api.github.com is denied with the prbot gh api route."""
+        reason = self.reason(self.run_hook("curl -X POST -H 'Authorization: token x' "
+                                           "https://api.github.com/repos/o/r/issues/1/comments -d '{\"body\":\"x\"}'"))
+        self.assertIn("gh claude -- api", reason)
+        self.assertIn("curl sending a request to GitHub's API", reason)
+        self.assertIn("GitHub's API", self.reason(self.run_hook("node -e 'fetch(\"https://api.github.com/graphql\")'")))
+        self.assertIsNone(self.run_hook("curl -s https://api.github.com/repos/o/r"))
 
     def test_denies_wrapped_git_push(self):
         Path(self.tmp.name, "config.json").write_text(json.dumps({"claude": {"owner": "kennylhilljr", "slug": "claude-pr-gh"}}))

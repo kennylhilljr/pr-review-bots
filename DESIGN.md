@@ -254,16 +254,39 @@ through what it can read and knows is safe:
    gh read or a gh or git argument known only at run time is refused. A plain
    assignment such as `SHA=$(git rev-parse HEAD)` is fine, except to `PATH`,
    `IFS`, `HOME` and `GH_`, `GIT_`, `LD_`, `DYLD_` or `BASH_` names.
-4. Commands that never name gh, git or prbot and pass step 2 are not checked
-   further: `npm install`, `python3 x.py > out` and `for f in *.py` loops run as
-   before.
+4. Every command, whether or not it names gh, is checked for a request to
+   GitHub's API that skips gh (`github_api` in `prbot`), once its text names
+   `api.github.com`, `uploads.github.com`, an `api.<tenant>.ghe.com` host,
+   `/api/v3` on any host, or `/api/graphql` on a host named github, anywhere
+   in the command (so `URL=...; curl -d x "$URL"` counts). A `curl`, `wget`,
+   `http` or `xh` call is refused when it may send something, read word by
+   word (`_http_sends`): a method other than GET or HEAD, `-d`, `-F`, `-T`
+   or `-K` alone or in a cluster (`-dbody=x`, `-sSd`), `--data`, `--form`,
+   `--json`, `--upload-file`, `--post-data`, an HTTPie
+   request item (`event=APPROVE`, `body:=1`, `@file`), or an option only
+   known at run time (`--$OPT`). A plain curl GET passes, whatever its query
+   string. `python3`, `node` and the other interpreters are refused in such a
+   command, since the method can't be read from code (`python3 -m json.tool`
+   passes). A file written with a redirection or `tee`, a script run with a
+   shell, or a runner such as `ssh` or `find -exec`, in a command whose text
+   names the API and sends something is refused too. A client named inside
+   another program's arguments (`ssh host curl ...`) is read as that client.
+   Options are read per client: curl short clusters, wget long-option
+   prefixes (`--meth=POST`, `--post-d`), `lwp-request -m`, and any bare HTTPie
+   word other than GET or HEAD, in any letter case and after options
+   (`OPTIONS`, `--auth u:p delete`), as a method. A runner's quoted command
+   (`ssh host 'curl ...'`) is read the same way. The denial gives the `prbot gh claude -- api ...` route.
+5. Commands that never name gh, git or prbot and pass steps 2 and 4 are not
+   checked further: `npm install`, `python3 x.py > out` and `for f in *.py`
+   loops run as before.
 
 The denial lists each reason and gives the `prbot gh claude -- ...` or
 `prbot git claude -- ...` command for any gh or git call in the command. The
 safe list closes the shell-level gaps; the hook stops mistakes and is not a sandbox. A
 program that builds the gh command itself (a script file, `python3 -c` with
-string pieces, an executable copied under another name) is out of reach, as
-before. `prbot classify` and the Codex shim keep the feedback classifier above,
+string pieces, an executable copied under another name), or a script file
+written in an earlier command, or a URL exported in one, that calls GitHub's
+API or builds its URL from pieces, is out of reach, as before. `prbot classify` and the Codex shim keep the feedback classifier above,
 because they see argv, not shell text, behind a gh safe list of their own
 (`classify_gh`). Real gh expands aliases from its config.yml and runs
 extensions under any name it does not own, so `gh alias set human-review 'pr
