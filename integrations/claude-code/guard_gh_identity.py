@@ -91,14 +91,24 @@ def decide(payload):
             fixes = "\n".join(f"  {shlex.quote(str(PRBOT))} git {BOT} -- {shlex.join(a)}" for a in found["git"])
             return deny("Commits and pushes in Kenny's repos must come from the Claude bot (claude-pr-gh[bot]), "
                         f"not his account. Run them through prbot, which sets the bot identity and token:\n{fixes}")
+        if found.get("api") and not (found["gh"] or found["reasons"]):
+            return deny(api_fix(found["api"]))
         return deny(safe_list_fix(found))
     except BaseException as e:  # prbot's die() raises SystemExit, and SystemExit(0) would end the hook as allow
         return fail_closed(payload, e)
 
 
+def api_fix(reasons):
+    """The denial for a request to GitHub's API made without gh (curl, wget, python, node, a script file)."""
+    return ("Calls to GitHub's API that send something must go through the Claude review bot, not the user's "
+            "token, so PR feedback never posts as the user. Use gh through prbot instead:\n"
+            f"  {shlex.quote(str(PRBOT))} gh {BOT} -- api <endpoint> -X POST -f body=...\n"
+            + "\n".join(f"- {r}" for r in reasons))
+
+
 def safe_list_fix(found):
     """The denial for a command off the safe list: why, and the prbot route for any gh call in it."""
-    lines = [f"- {r}" for r in found["reasons"]]
+    lines = [f"- {r}" for r in found["reasons"] + found.get("api", [])]
     lines += [f"- gh {shlex.join(a)} is not a gh read on the safe list" for a in found["gh"]]
     msg = ("The gh/git guard refused this command. A Bash command that names gh, git or prbot may only use the "
            "guard's safe list: gh reads (pr view/diff/list/checks, issue view/list, api GET), git reads and local "
