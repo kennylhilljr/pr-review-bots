@@ -253,7 +253,15 @@ through what it can read and knows is safe:
    (`git commit -m "$(cat <<'EOF' ...)"`, `gh pr create --body "$(...)"`); a
    gh read or a gh or git argument known only at run time is refused. A plain
    assignment such as `SHA=$(git rev-parse HEAD)` is fine, except to `PATH`,
-   `IFS`, `HOME` and `GH_`, `GIT_`, `LD_`, `DYLD_` or `BASH_` names.
+   `IFS`, `HOME` and `GH_`, `GIT_`, `LD_`, `DYLD_` or `BASH_` names. A
+   `GH_PAGER`, `PAGER` or `GIT_PAGER` the hook inherits counts too: if one is
+   set to anything other than `cat` or empty, every command that names gh, git
+   or prbot is refused until Claude Code is started with it set to `cat`, empty
+   or unset. With a non-empty `CDPATH` inherited, bash may resolve a relative
+   `cd` or `pushd` target through it, so a target that is not absolute and is
+   not `.`, `..` or a path starting with `./` or `../` leaves the directory
+   unknown, and a later `git commit`, `git push` or `scripts/check.sh` in the
+   same command is refused.
 4. Every command, whether or not it names gh, is checked for a request to
    GitHub's API that skips gh (`github_api` in `prbot`), once its text names
    `api.github.com`, `uploads.github.com`, an `api.<tenant>.ghe.com` host,
