@@ -298,7 +298,7 @@ Feedback writes go through `prbot gh codex`. Other `gh` calls reach the real `gh
 | `.claude/settings.json`, `.claude/hooks/check_edit.py` | Project Claude Code hooks: block key files, run the tests after code edits, flag dashes in docs. |
 | `tests/` | Unit tests, including fixtures shaped like real PRs. |
 | `scripts/check.sh` | Every check a PR must pass: tests, syntax, writing and secrets. |
-| [`docs/ci.md`](docs/ci.md) | What `scripts/check.sh` checks, and the CI workflow Kenny adds to run it on every PR. |
+| [`docs/ci.md`](docs/ci.md) | What `scripts/check.sh` checks, and the CI workflow that runs it on every PR. |
 | `docs/assets/` | The README header (SVG source and WebP). |
 | [`DESIGN.md`](DESIGN.md) | Why it works this way. |
 

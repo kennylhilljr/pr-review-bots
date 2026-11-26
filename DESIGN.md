@@ -632,9 +632,12 @@ dangling, extra or wrong-target link or a real folder shadowing a shared name.
 A checkout needs `git clone --recurse-submodules --shallow-submodules`, or
 `git submodule update --init --depth 1` after a plain clone.
 
-GitHub should run the same script on every PR. The worker bots can't write
-`.github/workflows/`, so [`docs/ci.md`](docs/ci.md) holds the workflow for
-Kenny to add, with the full list of checks and token thresholds.
+GitHub runs the same script on every PR and every push to `main` through
+`.github/workflows/ci.yml`, on Python 3.9 and 3.13 on `ubuntu-24.04`, with
+read-only permissions and no secrets. [`docs/ci.md`](docs/ci.md) holds a copy
+of that workflow (a test keeps the two equal), the full list of checks and the
+token thresholds. The worker bots can't write `.github/workflows/`, so a
+change to the workflow is a PR Kenny merges.
 
 ## What stays on Kenny's account
 

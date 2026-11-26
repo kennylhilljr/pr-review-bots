@@ -2273,6 +2273,8 @@ CODEX_SANDBOX = ["--ignore-user-config", "--ignore-rules", "-c", 'sandbox_mode="
 LEAK_PATTERNS = [
     ("a private key block", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
     ("a GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}")),
+    # a stateless installation token (ghs_APPID_JWT) can reach a "-" or "." before 30 word characters
+    ("a GitHub token", re.compile(r"\bghs_[0-9]+_[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("a GitHub token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
     ("an API key", re.compile(r"\bsk-(?:ant-|proj-)[A-Za-z0-9_-]{20,}")),
     ("an API key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),

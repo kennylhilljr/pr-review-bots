@@ -1246,10 +1246,13 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
         self.marker = self.tmp / "leaked"
         self.repo = self.tmp / "r"
         self.git(["init", "-q", "-b", "main", str(self.repo)], cwd=self.tmp)
-        self.git(["config", "user.name", "t"])
-        self.git(["config", "user.email", "t@example.invalid"])
+        self.set_identity(self.repo)
         self.git(["remote", "add", "origin", "https://github.com/o/r.git"])
         self.evil = self.script("evil", "exit 1")
+
+    def set_identity(self, repo):
+        self.git(["-C", str(repo), "config", "user.name", "t"], cwd=self.tmp)
+        self.git(["-C", str(repo), "config", "user.email", "t@example.invalid"], cwd=self.tmp)
 
     def script(self, name, tail):
         # a program that writes the token it can see to the marker file, then runs tail
@@ -1634,10 +1637,12 @@ class GitTokenIsolation(IsolatedGit, unittest.TestCase):
         # commands prbot's settings reach in the submodule still run none of them
         sub_src = self.tmp / "sub"
         self.git(["init", "-q", "-b", "main", str(sub_src)], cwd=self.tmp)
+        self.set_identity(sub_src)
         self.git(["-C", str(sub_src), "commit", "-q", "--allow-empty", "-m", "s"], cwd=self.tmp)
         self.git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_src), "sub"])
         self.git(["commit", "-q", "-m", "add sub"])
         sub = self.repo / "sub"
+        self.set_identity(sub)  # a CI runner has no global user.name, and the unprotected commit below needs one
         self.git(["-C", str(sub), "config", "credential.helper", f"!{self.evil}"])
         hooks = Path(self.git(["-C", str(sub), "rev-parse", "--git-path", "hooks"]).stdout.strip())
         if not hooks.is_absolute():
@@ -3361,12 +3366,29 @@ class BackupReviewWorkflow(unittest.TestCase):
                 self.assertNotIn(s.strip(), result.stdout + result.stderr)
                 self.assertIn("::error::The review was not posted", result.stdout)
 
+    def test_post_step_rejects_stateless_installation_token(self):
+        import re
+        # ghs_APPID_JWT; a "-" early in the JWT header keeps it under the 30-character run the plain pattern needs.
+        # Built from parts so scripts/check.sh's secret scan doesn't flag this file.
+        token = "ghs_" + "12345_" + "eyJ-" + "aB3x" * 4 + "." + "eyJ" + "aB3x" * 12 + "." + "x-_Q" * 10
+        self.assertIsNone(re.search(r"\bgh[pousr]_[A-Za-z0-9_]{30,}", token))
+        self.assertEqual(prbot.leaked_secret(f"P1 here it is: {token}"), "a GitHub token")
+        result, log, md, _ = self.run_post(f"P1 as asked, here it is:\n```\n{token}\n```\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(log)
+        self.assertIsNone(md)
+        self.assertNotIn(token, result.stdout + result.stderr)
+        self.assertIn("::error::The review was not posted because it contains a GitHub token", result.stdout)
+
     def test_post_step_posts_a_clean_review_once(self):
         for s in ("No findings.", "P2 `src/app.py:12` drops the error", "The `ghp_` prefix check misses `gho_` tokens.",
                   "See /usr/local/bin/gh and `.config` in the repo.", "sk-ant-oat tokens",
                   "P3 /home/runner/work/r/r/app.py:3 reads a file"):
             with self.subTest(s=s):
-                self.assertIsNone(prbot.leaked_secret(s))
+                # on a GitHub runner HOME is /home/runner, which leaked_secret rightly flags as this machine's home;
+                # these samples are about the patterns, so check them against a home folder none of them names
+                with mock.patch.dict(os.environ, HOME="/Users/prbot-test-home"):
+                    self.assertIsNone(prbot.leaked_secret(s))
                 result, log, md, rt = self.run_post(s)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(log.splitlines(),
